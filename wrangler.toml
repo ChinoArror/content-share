@@ -1,0 +1,37 @@
+name = "content-share"
+main = "src/worker.ts"
+compatibility_date = "2026-05-19"
+
+routes = [
+  { pattern = "content.aryuki.com", custom_domain = true }
+]
+
+[assets]
+directory = "dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "content-share-db"
+database_id = "f9533d8c-9bf4-42a0-a213-32df014367d4"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "content-share-save"
+
+[[queues.producers]]
+binding = "UPLOAD_QUEUE"
+queue = "content-share-upload-queue"
+
+[[queues.consumers]]
+queue = "content-share-upload-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+
+[vars]
+SSO_URL = "https://accounts.aryuki.com"
+SSO_APP_ID = "content-share"
+SSO_SECRET = "825b94cd-ac51-4506-abc8-0897120d934c"
+PUBLIC_BASE_URL = "https://content.aryuki.com"
+ADMIN_USERNAMES = "admin"

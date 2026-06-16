@@ -1,0 +1,14 @@
+HTTP/1.1 200 OK
+Date: Sun, 07 Jun 2026 15:50:04 GMT
+Content-Type: application/pdf
+Content-Length: 9688521
+Connection: keep-alive
+Cache-Control: public, max-age=300
+Content-Disposition: inline; filename*=UTF-8''%E5%8A%9B%E4%BC%98%E7%A7%80%E4%BD%9C%E6%96%87.pdf
+Speculation-Rules: "/cdn-cgi/speculation"
+Report-To: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=8VdR478fUutI9Kj7eSICvJc%2F8AbSovbp1NjsA1j08ke0hEMixJY%2BuZAaWsLv4AOHPzUywUQjyX2IWH6rF2qaMEB0mze2AFBBT1oeTPokV7%2F6OIzGSuxhxgv2gsO1muTbjK41PIXsstlaA1uLkZE3U4E%3D"}]}
+Nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+Server: cloudflare
+CF-RAY: a080cf6dff5cedb1-LAX
+alt-svc: h3=":443"; ma=86400
+

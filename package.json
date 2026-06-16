@@ -1,0 +1,32 @@
+{
+  "name": "content-share",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "vite build",
+    "deploy": "npm run build && npx wrangler deploy",
+    "db:apply": "npx wrangler d1 execute content-share-db --remote --file=./schema.sql",
+    "queue:create": "npx wrangler queues create content-share-upload-queue"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.5.0",
+    "lucide-react": "^0.468.0",
+    "marked": "^13.0.3",
+    "pdfjs-dist": "^6.0.227",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^5.4.19"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260515.0",
+    "@types/node": "^20.19.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^18.3.23",
+    "@types/react-dom": "^18.3.7",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.18.0"
+  }
+}
