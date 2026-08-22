@@ -76,6 +76,9 @@ describe('permission policy', () => {
     for (const sql of [migrationSql, schemaSql]) {
       expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS users_assign_default_permission_group');
       expect(sql).toContain('AFTER INSERT ON users');
+      expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS users_reject_null_permission_group');
+      expect(sql).toContain('BEFORE UPDATE OF permission_group_id ON users');
+      expect(sql).toContain("RAISE(ABORT, 'users must have a permission group')");
       expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_name');
       expect(sql).toContain('BEFORE UPDATE OF name ON permission_groups');
       expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_delete');

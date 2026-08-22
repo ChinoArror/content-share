@@ -63,6 +63,13 @@ BEGIN
   WHERE id = NEW.id AND permission_group_id IS NULL;
 END;
 
+CREATE TRIGGER IF NOT EXISTS users_reject_null_permission_group
+BEFORE UPDATE OF permission_group_id ON users
+WHEN NEW.permission_group_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'users must have a permission group');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_users_permission_group ON users(permission_group_id);
 
 ALTER TABLE contents ADD COLUMN text_size INTEGER NOT NULL DEFAULT 0;

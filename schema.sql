@@ -60,6 +60,13 @@ BEGIN
   WHERE id = NEW.id AND permission_group_id IS NULL;
 END;
 
+CREATE TRIGGER IF NOT EXISTS users_reject_null_permission_group
+BEFORE UPDATE OF permission_group_id ON users
+WHEN NEW.permission_group_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'users must have a permission group');
+END;
+
 CREATE TABLE IF NOT EXISTS contents (
   id TEXT PRIMARY KEY,
   owner_username TEXT NOT NULL,
