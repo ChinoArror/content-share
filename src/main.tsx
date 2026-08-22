@@ -25,6 +25,7 @@ import {
   permissionKeys,
   quotaGiBToBytes,
   type AdminPermissionKey,
+  withAllowedVisibility,
 } from './admin-display';
 import {
   ChevronDown,
@@ -135,6 +136,21 @@ function visibilityOptionsFor(permissions?: PermissionSet): Visibility[] {
 
 function token() {
   return localStorage.getItem('sso_token') || '';
+}
+
+function useBodyScrollLock(locked: boolean) {
+  useEffect(() => {
+    if (!locked) return;
+    const previousOverflow = document.body.style.overflow;
+    const previousPaddingRight = document.body.style.paddingRight;
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+    document.body.style.overflow = 'hidden';
+    if (scrollbarWidth > 0) document.body.style.paddingRight = `${scrollbarWidth}px`;
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.body.style.paddingRight = previousPaddingRight;
+    };
+  }, [locked]);
 }
 
 function uploadQueueDatabaseName(username: string): string {
@@ -524,8 +540,8 @@ function PublishText({ toast, permissions }: { toast: (s: string, k?: Toast['kin
     e.preventDefault();
     setBusy(true);
     try {
-      const visibility = normalizeVisibility(form.visibility, permissions.can_public_publish);
-      const res = await api<{ url: string }>('/api/contents/text', { method: 'POST', body: JSON.stringify({ ...form, visibility, format, expire_at: form.expire_at || null }) });
+      const payload = withAllowedVisibility({ ...form, format, expire_at: form.expire_at || null }, permissions.can_public_publish);
+      const res = await api<{ url: string }>('/api/contents/text', { method: 'POST', body: JSON.stringify(payload) });
       toast(language === 'en-US' ? `Created: ${res.url}` : `已创建：${res.url}`);
       setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0 });
     } catch (err) {
@@ -650,8 +666,10 @@ function drawQrWrappedText(ctx: CanvasRenderingContext2D, value: string, x: numb
 
 function QrShareModal({ item, close, toast }: { item: Content; close: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t, language } = useI18n();
+  useBodyScrollLock(true);
   const [background, setBackground] = useState(qrBackgrounds[0].src);
   const [customBackground, setCustomBackground] = useState('');
+  const [loadedBackgrounds, setLoadedBackgrounds] = useState<Set<string>>(() => new Set([qrBackgrounds[0].id]));
   const [cardUrl, setCardUrl] = useState('');
   const [busy, setBusy] = useState(true);
   const title = item.title || item.attachments?.[0]?.filename || item.slug;
@@ -728,6 +746,10 @@ function QrShareModal({ item, close, toast }: { item: Content; close: () => void
     setCustomBackground(URL.createObjectURL(file));
   }
 
+  function loadBackground(id: string) {
+    setLoadedBackgrounds((current) => current.has(id) ? current : new Set([...current, id]));
+  }
+
   return (
     <div className="modal qr-modal" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
       <section className="dialog qr-dialog" onMouseDown={(event) => event.stopPropagation()}>
@@ -737,7 +759,7 @@ function QrShareModal({ item, close, toast }: { item: Content; close: () => void
           <div className="qr-options">
             <strong>{t('qr.background')}</strong>
             <div className="qr-swatches">
-              {qrBackgrounds.map((option) => <button type="button" key={option.id} className={`qr-swatch${!customBackground && background === option.src ? ' selected' : ''}`} onClick={() => { setCustomBackground(''); setBackground(option.src); }} title={option.label} aria-label={option.label}><img src={option.src} alt="" /></button>)}
+              {qrBackgrounds.map((option) => <button type="button" key={option.id} className={`qr-swatch qr-swatch-${option.id}${!customBackground && background === option.src ? ' selected' : ''}`} onMouseEnter={() => loadBackground(option.id)} onFocus={() => loadBackground(option.id)} onClick={() => { loadBackground(option.id); setCustomBackground(''); setBackground(option.src); }} title={option.label} aria-label={option.label}>{loadedBackgrounds.has(option.id) ? <img loading="lazy" src={option.src} alt="" /> : <span>{option.label}</span>}</button>)}
               <label className={`qr-swatch qr-upload-swatch${customBackground ? ' selected' : ''}`} title={t('qr.custom')} aria-label={t('qr.custom')}><Upload size={18} /><input type="file" accept="image/*" onChange={(event) => chooseCustom(event.target.files?.[0])} /></label>
             </div>
             <div className="qr-copy"><strong>{title}</strong><span>{t('qr.tip')}</span></div>
@@ -867,8 +889,8 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
   async function legacyUpload() {
     const fd = new FormData();
     files.forEach((file) => fd.append('file', file));
-    const visibility = normalizeVisibility(form.visibility, permissions.can_public_publish);
-    Object.entries({ ...form, visibility, expire_at: form.expire_at || '' }).forEach(([key, value]) => fd.append(key, String(value)));
+    const payload = withAllowedVisibility({ ...form, expire_at: form.expire_at || '' }, permissions.can_public_publish);
+    Object.entries(payload).forEach(([key, value]) => fd.append(key, String(value)));
     const result = await new Promise<{ url: string }>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/contents/upload');
@@ -907,7 +929,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
       added = await queue.enqueue(files.map((file, index) => ({
         file,
         clientId: `${Date.now()}-${index}-${file.name}`,
-        metadata: { ...form, visibility: normalizeVisibility(form.visibility, permissions.can_public_publish), expire_at: form.expire_at || '' }
+        metadata: withAllowedVisibility({ ...form, expire_at: form.expire_at || '' }, permissions.can_public_publish)
       })));
       try {
         await queue.run();
@@ -1030,8 +1052,8 @@ function EditContent({ item, admin, permissions, close, done, toast }: { item: C
   }, [permissions?.can_public_publish]);
   async function save() {
     try {
-      const visibility = normalizeVisibility(form.visibility, permissions?.can_public_publish);
-      await api(`${admin ? '/api/admin/contents' : '/api/contents'}/${item.id}`, { method: 'PATCH', body: JSON.stringify({ ...form, visibility }) });
+      const payload = withAllowedVisibility(form, permissions?.can_public_publish);
+      await api(`${admin ? '/api/admin/contents' : '/api/contents'}/${item.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
       toast(language === 'en-US' ? 'Saved' : '已保存');
       done();
     } catch (err) {
@@ -2475,6 +2497,22 @@ function FaceTransferPublicPage({ toast }: { toast: (text: string, kind?: 'ok' |
   );
 }
 
+function SsoCallbackLoading({ toasts }: { toasts: Toast[] }) {
+  const { t } = useI18n();
+  return (
+    <div className="sso-loading-page" role="status" aria-live="polite">
+      <section className="sso-loading-card">
+        <div className="sso-loading-mark" aria-hidden="true"><Share2 size={22} /></div>
+        <h1>ShareWorker</h1>
+        <p>{t('sso.completing')}</p>
+        <div className="sso-loading-track" aria-hidden="true"><i /></div>
+        <div className="sso-loading-squares" aria-hidden="true"><i /><i /><i /><i /><i /></div>
+      </section>
+      <Toasts items={toasts} />
+    </div>
+  );
+}
+
 function App() {
   const { t } = useI18n();
   const { toasts, push } = useToast();
@@ -2499,7 +2537,6 @@ function App() {
     if (location.pathname === '/') {
       api<{ item: { landing_background?: any } }>('/api/public/settings').then((r) => setLandingBackground(r.item?.landing_background || null)).catch(() => {});
       if (token()) api<{ user: User; group: string; permissions: PermissionSet; storage: AccessProfile['storage'] }>('/api/me').then(async (r) => {
-        await deleteUploadDatabase('content-share-upload-queue');
         setUser(r.user);
         setProfile({ group: r.group, permissions: r.permissions, storage: r.storage });
       }).catch(() => setUser(null));
@@ -2509,7 +2546,7 @@ function App() {
   if (location.pathname.startsWith('/s/')) return <><ContentPreviewPage toast={push} /><Toasts items={toasts} /></>;
   if (location.pathname === '/docs') return <><ApiDocsPage /><Toasts items={toasts} /></>;
   if (location.pathname === '/face-transfer') return <><FaceTransferPublicPage toast={push} /><Toasts items={toasts} /></>;
-  if (location.pathname === '/sso-callback') return <div className="public-page"><section className="panel narrow">{t('sso.completing')}</section><Toasts items={toasts} /></div>;
+  if (location.pathname === '/sso-callback') return <SsoCallbackLoading toasts={toasts} />;
   if (!user || !profile) return <><LandingPage background={landingBackground} /><Toasts items={toasts} /></>;
   const permissions = profile.permissions || noPermissions;
   const titleMap: Record<string, string> = { text: t('nav.publishText'), file: t('nav.publishFile'), face: t('nav.faceTransfer'), mine: t('nav.myContent'), keys: t('nav.apiKeys'), settings: t('nav.settings'), admin: t('nav.admin') };

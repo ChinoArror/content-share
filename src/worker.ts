@@ -101,6 +101,7 @@ const UPLOAD_SIGNATURE_TTL_SECONDS = 5 * 60;
 const DOWNLOAD_SIGNATURE_TTL_SECONDS = 60;
 const MEDIA_TICKET_TTL_SECONDS = 10 * 60;
 const UPLOAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const UPLOAD_CLEANUP_CLAIM_MS = 10 * 60 * 1000;
 const LEGACY_UPLOAD_LIMIT = 100 * 1024 * 1024;
 const QUEUE_MAX_ATTEMPTS = 6;
 const MAX_PENDING_UPLOAD_SESSIONS_PER_USER = 50;
@@ -308,16 +309,30 @@ function partWindowLimit(value: unknown): number {
 
 async function touchUploadSession(env: Env, sessionId: string): Promise<void> {
   const timestamp = now();
-  await env.DB.batch([
+  const results = await env.DB.batch([
     env.DB.prepare(
-      `UPDATE upload_sessions SET last_activity_at=?1, updated_at=?1, expires_at=?2 WHERE id=?3 AND status IN (${RESUMABLE_SESSION_STATUSES})`
+      `UPDATE upload_sessions SET last_activity_at=?1, updated_at=?1, expires_at=?2
+       WHERE id=?3 AND status IN (${RESUMABLE_SESSION_STATUSES})
+         AND NOT EXISTS (
+           SELECT 1 FROM upload_cleanup_claims c
+           WHERE c.content_id=upload_sessions.content_id
+             AND julianday(c.expires_at) > julianday('now')
+         )`
     ).bind(timestamp, uploadSessionExpiresAt(), sessionId),
     env.DB.prepare(
       `UPDATE storage_reservations SET expires_at=?2, updated_at=?1
        WHERE content_id=(SELECT content_id FROM upload_sessions WHERE id=?3)
-         AND status='active' AND julianday(expires_at) > julianday('now')`
+         AND status='active' AND julianday(expires_at) > julianday('now')
+         AND NOT EXISTS (
+           SELECT 1 FROM upload_cleanup_claims c
+           WHERE c.content_id=storage_reservations.content_id
+             AND julianday(c.expires_at) > julianday('now')
+         )`
     ).bind(timestamp, reservationExpiresAt(), sessionId),
   ]);
+  if (Number(results[0]?.meta.changes || 0) !== 1) {
+    throw new HttpError(409, 'Upload cleanup is in progress', 'UPLOAD_CLEANUP_IN_PROGRESS');
+  }
 }
 
 async function findReusableUploadSessions(
@@ -775,13 +790,99 @@ async function touchReusableUploadSessions(env: Env, sessions: UploadSessionRow[
   const timestamp = now();
   const statements = sessions.map((session) => env.DB.prepare(
     `UPDATE upload_sessions SET last_activity_at=?1, updated_at=?1, expires_at=?2
-     WHERE id=?3 AND status IN (${RESUMABLE_SESSION_STATUSES})`
+     WHERE id=?3 AND status IN (${RESUMABLE_SESSION_STATUSES})
+       AND NOT EXISTS (
+         SELECT 1 FROM upload_cleanup_claims c
+         WHERE c.content_id=upload_sessions.content_id
+           AND julianday(c.expires_at) > julianday('now')
+       )`
   ).bind(timestamp, uploadSessionExpiresAt(), session.id));
   statements.push(env.DB.prepare(
     `UPDATE storage_reservations SET expires_at=?2, updated_at=?1
-     WHERE id=?3 AND status='active'`
+     WHERE id=?3 AND status='active'
+       AND NOT EXISTS (
+         SELECT 1 FROM upload_cleanup_claims c
+         WHERE c.content_id=storage_reservations.content_id
+           AND julianday(c.expires_at) > julianday('now')
+       )`
   ).bind(timestamp, reservationExpiresAt(), reservationId));
-  await env.DB.batch(statements);
+  const results = await env.DB.batch(statements);
+  if (results.slice(0, sessions.length).some((result) => Number(result.meta.changes || 0) !== 1)) {
+    throw new HttpError(409, 'Upload cleanup is in progress', 'UPLOAD_CLEANUP_IN_PROGRESS');
+  }
+}
+
+async function claimStaleUploadCleanup(env: Env, contentId: string, cutoff: string): Promise<string | null> {
+  const timestamp = now();
+  const claimToken = id('ucl');
+  const claimExpiresAt = new Date(Date.now() + UPLOAD_CLEANUP_CLAIM_MS).toISOString();
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO upload_cleanup_claims (content_id, claim_token, claimed_at, expires_at)
+       SELECT ?1, ?2, ?3, ?4
+       WHERE EXISTS (
+         SELECT 1 FROM storage_reservations r
+         WHERE r.content_id=?1 AND r.status='active'
+           AND julianday(r.expires_at) <= julianday(?3)
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM upload_sessions s
+         WHERE s.content_id=?1
+           AND s.status IN (${RESUMABLE_SESSION_STATUSES})
+           AND COALESCE(s.last_activity_at, s.updated_at, s.created_at) >= ?5
+       )
+       ON CONFLICT(content_id) DO UPDATE SET
+         claim_token=excluded.claim_token,
+         claimed_at=excluded.claimed_at,
+         expires_at=excluded.expires_at
+       WHERE julianday(upload_cleanup_claims.expires_at) <= julianday(?3)`
+    ).bind(contentId, claimToken, timestamp, claimExpiresAt, cutoff),
+    env.DB.prepare(
+      `UPDATE storage_reservations SET expires_at=?1, updated_at=?2
+       WHERE content_id=?3 AND status='active'
+         AND EXISTS (
+           SELECT 1 FROM upload_cleanup_claims c
+           WHERE c.content_id=?3 AND c.claim_token=?4
+         )`
+    ).bind(claimExpiresAt, timestamp, contentId, claimToken),
+  ]);
+  if (Number(results[0]?.meta.changes || 0) === 1 && Number(results[1]?.meta.changes || 0) === 1) {
+    return claimToken;
+  }
+  if (Number(results[0]?.meta.changes || 0) === 1) {
+    await env.DB.prepare('DELETE FROM upload_cleanup_claims WHERE content_id=?1 AND claim_token=?2').bind(contentId, claimToken).run();
+  }
+  return null;
+}
+
+async function cleanupUploadObjects(
+  env: Env,
+  input: {
+    sessions?: UploadSessionRow[];
+    multipartUploads?: R2MultipartUpload[];
+    objectKeys?: Iterable<string>;
+  }
+): Promise<void> {
+  const failures: string[] = [];
+  const aborts = [
+    ...(input.multipartUploads || []).map((upload) => () => upload.abort()),
+    ...(input.sessions || [])
+      .filter((session) => session.mode === 'multipart' && session.upload_id && !['completed', 'cancelled', 'expired'].includes(session.status))
+      .map((session) => () => env.BUCKET.resumeMultipartUpload(session.object_key, session.upload_id!).abort()),
+  ];
+  const abortResults = await Promise.allSettled(aborts.map((abort) => abort()));
+  abortResults.forEach((result, index) => {
+    if (result.status === 'rejected') failures.push(`abort:${index}`);
+  });
+
+  const objectKeys = [...new Set(input.objectKeys || [])];
+  const deleteResults = await Promise.allSettled(objectKeys.map((objectKey) => env.BUCKET.delete(objectKey)));
+  deleteResults.forEach((result, index) => {
+    if (result.status === 'rejected') failures.push(`delete:${index}`);
+  });
+  if (failures.length) {
+    throw new Error(`R2 upload cleanup failed (${failures.join(', ')})`);
+  }
 }
 
 async function rollbackUploadSetup(
@@ -790,16 +891,16 @@ async function rollbackUploadSetup(
   multipartUploads: R2MultipartUpload[] = [],
   objectKeys: string[] = []
 ): Promise<void> {
-  await Promise.allSettled(multipartUploads.map((upload) => upload.abort()));
-  await Promise.allSettled([...new Set(objectKeys)].map((objectKey) => env.BUCKET.delete(objectKey)));
+  await cleanupUploadObjects(env, { multipartUploads, objectKeys });
   const statements = [
     env.DB.prepare('DELETE FROM upload_parts WHERE session_id IN (SELECT id FROM upload_sessions WHERE content_id=?1)').bind(contentId),
     env.DB.prepare('DELETE FROM upload_sessions WHERE content_id=?1').bind(contentId),
     env.DB.prepare('DELETE FROM attachments WHERE content_id=?1').bind(contentId),
+    env.DB.prepare('DELETE FROM upload_cleanup_claims WHERE content_id=?1').bind(contentId),
     env.DB.prepare('DELETE FROM storage_reservations WHERE content_id=?1').bind(contentId),
     env.DB.prepare('DELETE FROM contents WHERE id=?1').bind(contentId),
   ];
-  for (const statement of statements) await statement.run().catch(() => undefined);
+  for (const statement of statements) await statement.run();
 }
 
 async function activateReservedContent(env: Env, contentId: string, finalTextSize: number, finalFileSize: number): Promise<void> {
@@ -860,7 +961,7 @@ async function createTextContent(env: Env, req: Request, owner: string, input: a
     await activateReservedContent(env, contentId, finalTextSize, 0);
     return json({ ok: true, url: `${publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
   } catch (error) {
-    await rollbackUploadSetup(env, contentId).catch(() => undefined);
+    await rollbackUploadSetup(env, contentId);
     throw error;
   }
 }
@@ -939,7 +1040,7 @@ async function createUploadContent(env: Env, req: Request, owner: string, form: 
     await env.UPLOAD_QUEUE.send({ type: 'finalize-upload', contentId, owner });
     return json({ ok: true, queued: true, url: `${publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
   } catch (error) {
-    await rollbackUploadSetup(env, contentId, [], objectKeys).catch(() => undefined);
+    await rollbackUploadSetup(env, contentId, [], objectKeys);
     throw error;
   }
 }
@@ -1155,7 +1256,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       files: plans
     }, 201);
   } catch (error) {
-    await rollbackUploadSetup(env, contentId, multipartUploads, objectKeys).catch(() => undefined);
+    await rollbackUploadSetup(env, contentId, multipartUploads, objectKeys);
     throw error;
   }
 }
@@ -1198,7 +1299,7 @@ async function refreshContentUploadState(env: Env, contentId: string): Promise<v
 }
 
 async function rejectUploadedObject(env: Env, session: UploadSessionRow): Promise<void> {
-  await env.BUCKET.delete(session.object_key).catch(() => undefined);
+  await cleanupUploadObjects(env, { objectKeys: [session.object_key] });
   const t = now();
   await env.DB.batch([
     env.DB.prepare('UPDATE upload_sessions SET status="failed", updated_at=?1, last_activity_at=?1 WHERE id=?2').bind(t, session.id),
@@ -1213,7 +1314,7 @@ async function finalizeUploadedSession(env: Env, sessionId: string): Promise<voi
   if (!session) return;
   if (['cancelled', 'expired'].includes(session.status)) return;
   if (session.status === 'completed') {
-    if (session.mode === 'single') await env.BUCKET.delete(session.object_key).catch(() => undefined);
+    if (session.mode === 'single') await cleanupUploadObjects(env, { objectKeys: [session.object_key] });
     await refreshContentUploadState(env, session.content_id);
     return;
   }
@@ -1251,7 +1352,7 @@ async function finalizeUploadedSession(env: Env, sessionId: string): Promise<voi
     env.DB.prepare('UPDATE attachments SET status="active", object_key=?1, size=?2, content_type=?3, etag=?4, completed_at=?5 WHERE id=?6')
       .bind(objectKey, object.size, session.content_type, objectEtag, t, session.attachment_id)
   ]);
-  if (session.mode === 'single') await env.BUCKET.delete(session.object_key).catch(() => undefined);
+  if (session.mode === 'single') await cleanupUploadObjects(env, { objectKeys: [session.object_key] });
   await refreshContentUploadState(env, session.content_id);
 }
 
@@ -1287,14 +1388,11 @@ async function markQueueMessageFailed(env: Env, body: UploadMessage | R2EventMes
   const attachments = (await env.DB.prepare('SELECT object_key FROM attachments WHERE content_id=?1').bind(contentId).all<{ object_key: string }>()).results || [];
   const t = now();
   const message = error instanceof Error ? error.message.slice(0, 500) : 'Queue processing failed';
-  await Promise.allSettled(sessions
-    .filter((item) => item.mode === 'multipart' && item.upload_id && !['completed', 'cancelled', 'expired'].includes(item.status))
-    .map((item) => env.BUCKET.resumeMultipartUpload(item.object_key, item.upload_id!).abort()));
   const objectKeys = new Set([
     ...sessions.map((item) => item.object_key),
     ...attachments.map((item) => item.object_key),
   ]);
-  await Promise.allSettled([...objectKeys].map((objectKey) => env.BUCKET.delete(objectKey)));
+  await cleanupUploadObjects(env, { sessions, objectKeys });
   await env.DB.batch([
     env.DB.prepare('DELETE FROM upload_parts WHERE session_id IN (SELECT id FROM upload_sessions WHERE content_id=?1)').bind(contentId),
     env.DB.prepare('UPDATE upload_sessions SET status="failed", updated_at=?1, last_activity_at=?1 WHERE content_id=?2 AND status NOT IN ("cancelled","expired")').bind(t, contentId),
@@ -1369,16 +1467,20 @@ async function createApiKey(env: Env, user: User, input: any): Promise<Response>
 
 async function permanentDelete(env: Env, contentId: string): Promise<void> {
   const { results } = await env.DB.prepare('SELECT object_key FROM attachments WHERE content_id = ?').bind(contentId).all<{ object_key: string }>();
-  const sessions = (await env.DB.prepare('SELECT object_key, upload_id, mode, status FROM upload_sessions WHERE content_id=?1').bind(contentId).all<any>()).results || [];
-  await Promise.allSettled(sessions
-    .filter((session) => session.mode === 'multipart' && session.upload_id && !['completed', 'cancelled', 'expired'].includes(session.status))
-    .map((session) => env.BUCKET.resumeMultipartUpload(session.object_key, session.upload_id).abort()));
-  for (const row of results || []) await env.BUCKET.delete(row.object_key);
+  const sessions = (await env.DB.prepare('SELECT * FROM upload_sessions WHERE content_id=?1').bind(contentId).all<UploadSessionRow>()).results || [];
+  await cleanupUploadObjects(env, {
+    sessions,
+    objectKeys: [
+      ...sessions.map((session) => session.object_key),
+      ...(results || []).map((row) => row.object_key),
+    ],
+  });
   await env.DB.prepare('DELETE FROM upload_parts WHERE session_id IN (SELECT id FROM upload_sessions WHERE content_id=?1)').bind(contentId).run();
   await env.DB.prepare('DELETE FROM upload_sessions WHERE content_id=?1').bind(contentId).run();
   await env.DB.prepare('DELETE FROM attachments WHERE content_id = ?').bind(contentId).run();
   await env.DB.prepare('DELETE FROM content_notes WHERE content_id = ?').bind(contentId).run();
   await env.DB.prepare('DELETE FROM access_logs WHERE content_id = ?').bind(contentId).run();
+  await env.DB.prepare('DELETE FROM upload_cleanup_claims WHERE content_id = ?').bind(contentId).run();
   await env.DB.prepare('DELETE FROM storage_reservations WHERE content_id = ?').bind(contentId).run();
   await env.DB.prepare('DELETE FROM contents WHERE id = ?').bind(contentId).run();
 }
@@ -1396,26 +1498,49 @@ async function cleanupStaleUploadSessions(env: Env): Promise<number> {
     const sessions = (await env.DB.prepare(
       'SELECT * FROM upload_sessions WHERE content_id=?1'
     ).bind(contentId).all<UploadSessionRow>()).results || [];
+    const hasRecentSibling = sessions.some((session) =>
+      ['pending', 'uploading', 'completing'].includes(session.status) && !isUploadSessionStale(session)
+    );
+    if (hasRecentSibling) continue;
+    const claimToken = await claimStaleUploadCleanup(env, contentId, cutoff);
+    if (!claimToken) continue;
     const attachments = (await env.DB.prepare(
       'SELECT object_key FROM attachments WHERE content_id=?1'
     ).bind(contentId).all<{ object_key: string }>()).results || [];
-    await Promise.allSettled(sessions
-      .filter((session) => session.mode === 'multipart' && session.upload_id && !['completed', 'cancelled', 'expired'].includes(session.status))
-      .map((session) => env.BUCKET.resumeMultipartUpload(session.object_key, session.upload_id!).abort()));
     const objectKeys = new Set([
       ...sessions.map((session) => session.object_key),
       ...attachments.map((attachment) => attachment.object_key),
     ]);
-    await Promise.allSettled([...objectKeys].map((objectKey) => env.BUCKET.delete(objectKey)));
+    try {
+      await cleanupUploadObjects(env, { sessions, objectKeys });
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: 'stale_upload_cleanup_failed',
+        content_id: contentId,
+        message: error instanceof Error ? error.message : 'R2 cleanup failed',
+      }));
+      continue;
+    }
     const timestamp = now();
-    await env.DB.batch([
-      env.DB.prepare('DELETE FROM upload_parts WHERE session_id IN (SELECT id FROM upload_sessions WHERE content_id=?1)').bind(contentId),
-      env.DB.prepare('UPDATE upload_sessions SET status="expired", updated_at=?1, last_activity_at=?1 WHERE content_id=?2 AND status NOT IN ("cancelled","expired")').bind(timestamp, contentId),
-      env.DB.prepare('UPDATE attachments SET status="failed" WHERE content_id=?1').bind(contentId),
-      env.DB.prepare('UPDATE contents SET status="expired", text_content=NULL, forced_expired_at=?1, updated_at=?1 WHERE id=?2 AND status="processing"').bind(timestamp, contentId),
-      env.DB.prepare("UPDATE storage_reservations SET status='expired', released_at=?1, updated_at=?1 WHERE content_id=?2 AND status='active'").bind(timestamp, contentId)
+    const cleanup = await env.DB.batch([
+      env.DB.prepare(
+        'DELETE FROM upload_parts WHERE session_id IN (SELECT id FROM upload_sessions WHERE content_id=?1) AND EXISTS (SELECT 1 FROM upload_cleanup_claims WHERE content_id=?1 AND claim_token=?2)'
+      ).bind(contentId, claimToken),
+      env.DB.prepare(
+        'UPDATE upload_sessions SET status="expired", updated_at=?1, last_activity_at=?1 WHERE content_id=?2 AND status NOT IN ("cancelled","expired") AND EXISTS (SELECT 1 FROM upload_cleanup_claims WHERE content_id=?2 AND claim_token=?3)'
+      ).bind(timestamp, contentId, claimToken),
+      env.DB.prepare(
+        'UPDATE attachments SET status="failed" WHERE content_id=?1 AND EXISTS (SELECT 1 FROM upload_cleanup_claims WHERE content_id=?1 AND claim_token=?2)'
+      ).bind(contentId, claimToken),
+      env.DB.prepare(
+        'UPDATE contents SET status="expired", text_content=NULL, forced_expired_at=?1, updated_at=?1 WHERE id=?2 AND status="processing" AND EXISTS (SELECT 1 FROM upload_cleanup_claims WHERE content_id=?2 AND claim_token=?3)'
+      ).bind(timestamp, contentId, claimToken),
+      env.DB.prepare(
+        "UPDATE storage_reservations SET status='expired', released_at=?1, updated_at=?1 WHERE content_id=?2 AND status='active' AND EXISTS (SELECT 1 FROM upload_cleanup_claims WHERE content_id=?2 AND claim_token=?3)"
+      ).bind(timestamp, contentId, claimToken),
+      env.DB.prepare('DELETE FROM upload_cleanup_claims WHERE content_id=?1 AND claim_token=?2').bind(contentId, claimToken),
     ]);
-    cleaned += 1;
+    if (Number(cleanup[4]?.meta.changes || 0) === 1 && Number(cleanup[5]?.meta.changes || 0) === 1) cleaned += 1;
   }
   return cleaned;
 }
@@ -1573,6 +1698,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
 
     if ((action === '' || action === 'status') && method === 'GET') {
       const { results } = await env.DB.prepare('SELECT part_number, etag, size, completed_at FROM upload_parts WHERE session_id=?1 ORDER BY part_number ASC').bind(session.id).all();
+      const contentState = await env.DB.prepare('SELECT status FROM contents WHERE id=?1 AND owner_username=?2').bind(session.content_id, owner).first<{ status: string }>();
       return json({
         ok: true,
         item: {
@@ -1583,6 +1709,9 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
           size: session.size,
           mode: session.mode,
           status: session.status,
+          session_status: session.status,
+          content_status: contentState?.status ?? null,
+          content_active: contentState?.status === 'active',
           expected_parts: session.expected_parts,
           completed_parts: session.completed_parts,
           uploaded_bytes: session.uploaded_bytes,
@@ -1649,8 +1778,16 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     }
 
     if (action === 'complete' && method === 'POST') {
+      const contentState = await env.DB.prepare('SELECT status FROM contents WHERE id=?1 AND owner_username=?2').bind(session.content_id, owner).first<{ status: string }>();
       if (session.status === 'completed') {
-        return json({ ok: true, queued: false, status_url: `${uploadBase}/${session.id}/status` });
+        return json({
+          ok: true,
+          queued: contentState?.status !== 'active',
+          session_status: session.status,
+          content_status: contentState?.status ?? null,
+          content_active: contentState?.status === 'active',
+          status_url: `${uploadBase}/${session.id}/status`,
+        });
       }
       await ensureUploadSessionReservation(env, session);
       await touchUploadSession(env, session.id);
@@ -1665,7 +1802,14 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
         }
         await env.UPLOAD_QUEUE.send({ type: 'finalize-upload', sessionId: session.id });
       }
-      return json({ ok: true, queued: true, status_url: `${uploadBase}/${session.id}/status` });
+      return json({
+        ok: true,
+        queued: true,
+        session_status: session.status,
+        content_status: contentState?.status ?? null,
+        content_active: contentState?.status === 'active',
+        status_url: `${uploadBase}/${session.id}/status`,
+      });
     }
 
     if (action === 'renew' && method === 'POST') {
@@ -1680,9 +1824,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     }
 
     if (!action && method === 'DELETE') {
-      if (session.mode === 'multipart' && session.upload_id) {
-        await env.BUCKET.resumeMultipartUpload(session.object_key, session.upload_id).abort().catch(() => undefined);
-      }
+      await cleanupUploadObjects(env, { sessions: [session], objectKeys: [session.object_key] });
       const t = now();
       await env.DB.batch([
         env.DB.prepare('UPDATE upload_sessions SET status="cancelled", updated_at=?1, last_activity_at=?1 WHERE id=?2').bind(t, session.id),
@@ -1920,8 +2062,8 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
         const object = await env.BUCKET.head(att.object_key);
         const validObject = object && object.size === Number(att.size) && (!normalizeEtag(att.etag) || normalizeEtag(object.httpEtag) === normalizeEtag(att.etag));
         if (!validObject) {
-          await env.BUCKET.delete(att.object_key).catch(() => undefined);
           if (session) await rejectUploadedObject(env, session);
+          else await cleanupUploadObjects(env, { objectKeys: [att.object_key] });
           throw new HttpError(409, 'Attachment integrity validation failed');
         }
         directUrl = await signedDownloadUrl(env, att.object_key);
@@ -2519,7 +2661,17 @@ export default {
           attempts: msg.attempts,
           message: error instanceof Error ? error.message : 'Unknown queue error'
         }));
-        if (msg.attempts >= QUEUE_MAX_ATTEMPTS) await markQueueMessageFailed(env, msg.body, error);
+        if (msg.attempts >= QUEUE_MAX_ATTEMPTS) {
+          try {
+            await markQueueMessageFailed(env, msg.body, error);
+          } catch (cleanupError) {
+            console.error(JSON.stringify({
+              event: 'upload_queue_cleanup_failed',
+              attempts: msg.attempts,
+              message: cleanupError instanceof Error ? cleanupError.message : 'R2 cleanup failed',
+            }));
+          }
+        }
         msg.retry();
       }
     }

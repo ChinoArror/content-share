@@ -284,8 +284,9 @@ describe('Worker quota reservations and upload lifecycle', () => {
   });
 
   it('reserves legacy text and file bytes while leaving final sizes for Queue activation', async () => {
-    const db = recordingDb();
-    const current = runtime(db);
+    const timeline: string[] = [];
+    const db = recordingDb({ timeline });
+    const current = runtime(db, { timeline });
     const form = new FormData();
     form.set('visibility', 'private');
     form.set('content', 'é');
@@ -294,9 +295,13 @@ describe('Worker quota reservations and upload lifecycle', () => {
     const response = await worker.fetch(formRequest('/api/contents/upload', form), current.env, { waitUntil() {} } as unknown as ExecutionContext);
 
     expect(response.status).toBe(200);
+    const placeholder = db.executed.find((item) => item.sql.startsWith('INSERT INTO contents'))!;
     const reservation = db.executed.find((item) => item.sql.includes('INSERT INTO storage_reservations'))!;
+    expect(reservation.values.slice(1, 4)).toEqual(['alice', placeholder.values[0], 5]);
     expect(reservation.values[3]).toBe(5);
     expect(db.executed.filter((item) => item.sql.includes('UPDATE contents SET file_size'))).toEqual([]);
+    expect(timeline.findIndex((entry) => entry.includes('db:run:INSERT INTO storage_reservations')))
+      .toBeLessThan(timeline.findIndex((entry) => entry.startsWith('r2:put:')));
     expect(current.send).toHaveBeenCalledOnce();
   });
 
@@ -352,9 +357,13 @@ describe('Worker quota reservations and upload lifecycle', () => {
     expect(body.files[0].parts.map((part) => part.part_number)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(body.files[0]).toMatchObject({ next_part_number: 9, has_more_parts: true });
     expect(db.executed.filter((item) => item.sql.includes('INSERT INTO storage_reservations'))).toHaveLength(1);
-    expect(db.executed.find((item) => item.sql.includes('INSERT INTO storage_reservations'))?.values[3]).toBe(5 * GiB + 2);
+    const placeholder = db.executed.find((item) => item.sql.startsWith('INSERT INTO contents'))!;
+    const reservation = db.executed.find((item) => item.sql.includes('INSERT INTO storage_reservations'))!;
+    expect(reservation.values.slice(1, 4)).toEqual(['alice', placeholder.values[0], 5 * GiB + 2]);
     expect(db.prepared.some((item) => item.sql.includes('COALESCE(SUM(size), 0) bytes'))).toBe(false);
     expect(timeline.findIndex((entry) => entry.startsWith('db:run:INSERT INTO contents')))
+      .toBeLessThan(timeline.findIndex((entry) => entry.startsWith('r2:create-multipart')));
+    expect(timeline.findIndex((entry) => entry.includes('db:run:INSERT INTO storage_reservations')))
       .toBeLessThan(timeline.findIndex((entry) => entry.startsWith('r2:create-multipart')));
   });
 
@@ -460,8 +469,64 @@ describe('Worker quota reservations and upload lifecycle', () => {
     const body = await response.json() as { item: { parts: Array<{ part_number: number }>; next_part_number: number; has_more_parts: boolean } };
     expect(body.item.parts.map((part) => part.part_number)).toEqual([2, 4, 5, 6, 7, 8, 9, 10]);
     expect(body.item).toMatchObject({ next_part_number: 11, has_more_parts: true });
-    expect(db.executed.some((item) => item.sql.includes('id = ?1 AND owner_username = ?2'))).toBe(true);
-    expect(db.executed.filter((item) => item.sql.includes('INSERT INTO storage_reservations'))).toHaveLength(1);
+    const ownedSession = db.executed.find((item) => item.sql.startsWith('SELECT * FROM upload_sessions WHERE id = ?1 AND owner_username'))!;
+    expect(ownedSession.values).toEqual(['upl_parts', 'alice']);
+    const apiKey = db.executed.find((item) => item.sql.startsWith('SELECT * FROM api_keys WHERE key_hash'));
+    if (cli) {
+      expect(apiKey?.values).toHaveLength(1);
+      expect(apiKey?.values[0]).toMatch(/^[a-f0-9]{64}$/);
+    } else {
+      expect(apiKey).toBeUndefined();
+    }
+    const reservation = db.executed.find((item) => item.sql.includes('INSERT INTO storage_reservations'))!;
+    expect(reservation.values.slice(1, 4)).toEqual(['alice', 'cnt_1', session.size + 2]);
+  });
+
+  it('reports finalized session state separately from pending content activation', async () => {
+    const session = sessionRow({ status: 'completed', completed_parts: 1, uploaded_bytes: 5 });
+    const db = recordingDb({
+      first: (sql) => {
+        if (sql.startsWith('SELECT * FROM upload_sessions WHERE id = ?1 AND owner_username')) return session;
+        if (sql.startsWith('SELECT status FROM contents WHERE id=?1 AND owner_username=?2')) return { status: 'processing' };
+        return undefined;
+      },
+    });
+
+    const { response } = await invoke(db, '/api/uploads/upl_1/status');
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      item: {
+        status: 'completed',
+        content_status: 'processing',
+        content_active: false,
+      },
+    });
+    const contentState = db.executed.find((item) => item.sql.startsWith('SELECT status FROM contents WHERE id=?1 AND owner_username=?2'))!;
+    expect(contentState.values).toEqual(['cnt_1', 'alice']);
+  });
+
+  it('keeps a finalized complete response queued until content activation', async () => {
+    const session = sessionRow({ status: 'completed', completed_parts: 1, uploaded_bytes: 5 });
+    const db = recordingDb({
+      first: (sql) => {
+        if (sql.startsWith('SELECT * FROM upload_sessions WHERE id = ?1 AND owner_username')) return session;
+        if (sql.startsWith('SELECT status FROM contents WHERE id=?1 AND owner_username=?2')) return { status: 'processing' };
+        return undefined;
+      },
+    });
+
+    const { response } = await invoke(db, '/api/uploads/upl_1/complete', { method: 'POST', body: '{}' });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      queued: true,
+      session_status: 'completed',
+      content_status: 'processing',
+      content_active: false,
+    });
+    const contentState = db.executed.find((item) => item.sql.startsWith('SELECT status FROM contents WHERE id=?1 AND owner_username=?2'))!;
+    expect(contentState.values).toEqual(['cnt_1', 'alice']);
   });
 
   it('renews from the first missing part after the requested cursor and clamps the window', async () => {
@@ -510,6 +575,121 @@ describe('Worker quota reservations and upload lifecycle', () => {
     expect(heartbeat[1].values[1]).toBe(new Date(NOW + 30 * 60 * 1000).toISOString());
   });
 
+  it('rejects a heartbeat when an active cleanup claim owns the content group', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const session = sessionRow();
+    const db = recordingDb({
+      first: (sql) => sql.startsWith('SELECT * FROM upload_sessions WHERE id = ?1 AND owner_username') ? session : undefined,
+      batch: (items) => items.some((item) => item.sql.includes('UPDATE upload_sessions SET last_activity_at'))
+        ? [0, 0]
+        : undefined,
+    });
+
+    const { response } = await invoke(db, '/api/uploads/upl_1/heartbeat', {
+      method: 'POST',
+      body: JSON.stringify({ fingerprint: session.file_fingerprint }),
+    });
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ code: 'UPLOAD_CLEANUP_IN_PROGRESS' });
+    const heartbeat = db.batches.find((batch) => batch.some((item) => item.sql.includes('UPDATE upload_sessions SET last_activity_at')))!;
+    expect(heartbeat[0].sql).toContain('NOT EXISTS');
+    expect(heartbeat[0].sql).toContain('upload_cleanup_claims');
+    expect(heartbeat[0].values).toEqual([
+      new Date(NOW).toISOString(),
+      new Date(NOW + 24 * 60 * 60 * 1000).toISOString(),
+      'upl_1',
+    ]);
+    expect(heartbeat[1].sql).toContain('upload_cleanup_claims');
+  });
+
+  it('does not clean a content group when any non-terminal sibling is recently active', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const stale = sessionRow({
+      mode: 'multipart',
+      upload_id: 'multipart_stale',
+      last_activity_at: new Date(NOW - 31 * 60 * 1000).toISOString(),
+      updated_at: new Date(NOW - 31 * 60 * 1000).toISOString(),
+    });
+    const activeSibling = sessionRow({
+      id: 'upl_active',
+      attachment_id: 'att_active',
+      object_key: 'attachments/alice/cnt_1/att_active',
+      mode: 'multipart',
+      upload_id: 'multipart_active',
+      last_activity_at: new Date(NOW - 2 * 60 * 1000).toISOString(),
+      updated_at: new Date(NOW - 2 * 60 * 1000).toISOString(),
+    });
+    const db = recordingDb({
+      all: (sql) => {
+        if (sql.includes('COALESCE(last_activity_at')) return [stale];
+        if (sql.startsWith('SELECT * FROM upload_sessions WHERE content_id')) return [stale, activeSibling];
+        if (sql.startsWith('SELECT object_key FROM attachments WHERE content_id')) {
+          return [{ object_key: stale.object_key }, { object_key: activeSibling.object_key }];
+        }
+        return undefined;
+      },
+    });
+    const current = runtime(db);
+    const pending: Promise<unknown>[] = [];
+
+    worker.scheduled!({} as ScheduledController, current.env, {
+      waitUntil(value: Promise<unknown>) { pending.push(value); },
+    } as unknown as ExecutionContext);
+    await Promise.all(pending);
+
+    expect(current.resumedAbort).not.toHaveBeenCalled();
+    expect(current.bucket.delete).not.toHaveBeenCalled();
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes('status="expired"')))).toBe(false);
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes("status='expired'")))).toBe(false);
+  });
+
+  it('does not clean when a concurrent heartbeat wins the conditional cleanup claim', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const stale = sessionRow({
+      mode: 'multipart',
+      upload_id: 'multipart_stale',
+      last_activity_at: new Date(NOW - 31 * 60 * 1000).toISOString(),
+      updated_at: new Date(NOW - 31 * 60 * 1000).toISOString(),
+    });
+    const cutoff = new Date(NOW - 30 * 60 * 1000).toISOString();
+    const db = recordingDb({
+      all: (sql) => {
+        if (sql.includes('COALESCE(last_activity_at')) return [stale];
+        if (sql.startsWith('SELECT * FROM upload_sessions WHERE content_id')) return [stale];
+        if (sql.startsWith('SELECT object_key FROM attachments WHERE content_id')) return [{ object_key: stale.object_key }];
+        return undefined;
+      },
+      batch: (items) => items.some((item) => item.sql.includes('INSERT INTO upload_cleanup_claims'))
+        ? [0, 0]
+        : undefined,
+    });
+    const current = runtime(db);
+    const pending: Promise<unknown>[] = [];
+
+    worker.scheduled!({} as ScheduledController, current.env, {
+      waitUntil(value: Promise<unknown>) { pending.push(value); },
+    } as unknown as ExecutionContext);
+    await Promise.all(pending);
+
+    const claim = db.batches.find((batch) => batch.some((item) => item.sql.includes('INSERT INTO upload_cleanup_claims')))![0];
+    expect(claim.sql).toContain("julianday(r.expires_at) <= julianday(?3)");
+    expect(claim.sql).toContain('NOT EXISTS');
+    expect(claim.sql).toContain('last_activity_at');
+    expect(claim.values).toEqual([
+      'cnt_1',
+      expect.stringMatching(/^ucl_/),
+      new Date(NOW).toISOString(),
+      new Date(NOW + 10 * 60 * 1000).toISOString(),
+      cutoff,
+    ]);
+    expect(current.resumedAbort).not.toHaveBeenCalled();
+    expect(current.bucket.delete).not.toHaveBeenCalled();
+  });
+
   it('aborts and removes stale upload state before expiring the reservation', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
@@ -556,9 +736,47 @@ describe('Worker quota reservations and upload lifecycle', () => {
     expect(sqlIndex(cleanup, 'DELETE FROM upload_parts')).toBeLessThan(sqlIndex(cleanup, 'UPDATE storage_reservations'));
     expect(sqlIndex(cleanup, 'UPDATE upload_sessions SET status="expired"')).toBeLessThan(sqlIndex(cleanup, 'UPDATE storage_reservations'));
     expect(cleanup.some((item) => item.sql.includes('text_content=NULL'))).toBe(true);
-    const reservationBatchIndex = timeline.findIndex((entry) => entry.includes('UPDATE storage_reservations'));
+    const reservationBatchIndex = timeline.findIndex((entry) => entry.includes("SET status='expired'"));
     expect(timeline.findIndex((entry) => entry === 'r2:resumed-abort')).toBeLessThan(reservationBatchIndex);
     expect(timeline.findIndex((entry) => entry.startsWith('r2:delete:'))).toBeLessThan(reservationBatchIndex);
+  });
+
+  it('retains stale metadata and reservation accounting when R2 cleanup fails', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const stale = sessionRow({
+      mode: 'multipart',
+      upload_id: 'multipart_stale',
+      last_activity_at: new Date(NOW - 31 * 60 * 1000).toISOString(),
+      updated_at: new Date(NOW - 31 * 60 * 1000).toISOString(),
+    });
+    const abort = vi.fn(async () => { throw new Error('R2 abort failed'); });
+    const db = recordingDb({
+      all: (sql) => {
+        if (sql.includes('COALESCE(last_activity_at')) return [stale];
+        if (sql.startsWith('SELECT * FROM upload_sessions WHERE content_id')) return [stale];
+        if (sql.startsWith('SELECT object_key FROM attachments WHERE content_id')) return [{ object_key: stale.object_key }];
+        return undefined;
+      },
+    });
+    const current = runtime(db, {
+      bucket: {
+        resumeMultipartUpload: vi.fn(() => ({ abort })),
+      },
+    });
+    const pending: Promise<unknown>[] = [];
+
+    worker.scheduled!({} as ScheduledController, current.env, {
+      waitUntil(value: Promise<unknown>) { pending.push(value); },
+    } as unknown as ExecutionContext);
+    await Promise.all(pending);
+
+    expect(abort).toHaveBeenCalledOnce();
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes('UPDATE contents SET status="expired"')))).toBe(false);
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes("SET status='expired'")))).toBe(false);
+    const claim = db.batches.find((batch) => batch.some((item) => item.sql.includes('INSERT INTO upload_cleanup_claims')));
+    expect(claim?.[1].sql).toContain('UPDATE storage_reservations SET expires_at');
+    expect(db.executed.some((item) => item.sql.startsWith('DELETE FROM upload_cleanup_claims'))).toBe(false);
   });
 
   it('sets final text/file sizes and releases the reservation in the direct Queue activation batch', async () => {
@@ -688,6 +906,92 @@ describe('Worker quota reservations and upload lifecycle', () => {
     expect(message.retry).toHaveBeenCalledOnce();
   });
 
+  it('keeps terminal Queue metadata and reservation when finalized-object cleanup fails', async () => {
+    const completedSession = sessionRow({
+      status: 'completed',
+      mode: 'multipart',
+      upload_id: 'multipart_completed',
+      object_key: 'attachments/alice/cnt_1/att_1',
+      completed_parts: 1,
+      uploaded_bytes: 5,
+      etag: 'etag',
+    });
+    const db = recordingDb({
+      activationState: { owner_username: 'alice', expected: 1, completed: 1, failed: 0, total_size: 5, text_content: '' },
+      first: (sql) => {
+        if (sql.startsWith('SELECT * FROM upload_sessions WHERE id=?1')) return completedSession;
+        if (sql.startsWith('SELECT id, bytes, expires_at FROM storage_reservations')) {
+          return { id: 'res_cnt_1', bytes: 5, expires_at: new Date(NOW + 60_000).toISOString() };
+        }
+        if (sql.startsWith('SELECT status FROM contents WHERE id=?1')) return { status: 'processing' };
+        return undefined;
+      },
+      all: (sql) => {
+        if (sql.startsWith('SELECT * FROM upload_sessions WHERE content_id=?1')) return [completedSession];
+        if (sql.startsWith('SELECT object_key FROM attachments WHERE content_id=?1')) {
+          return [{ object_key: completedSession.object_key }];
+        }
+        return undefined;
+      },
+      batch: (items) => {
+        if (items.some((item) => item.sql.includes('SET status="active"') && item.sql.includes('text_size'))) {
+          throw new Error('activation transaction failed');
+        }
+      },
+    });
+    const remove = vi.fn(async () => { throw new Error('R2 delete failed'); });
+    const current = runtime(db, { bucket: { delete: remove } });
+    const message = queueMessage({ type: 'finalize-upload', sessionId: 'upl_1' }, 6);
+
+    await expect(worker.queue!(queueBatch([message]), current.env)).resolves.toBeUndefined();
+
+    expect(remove).toHaveBeenCalledWith(completedSession.object_key);
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes('upload_queue_failed')))).toBe(false);
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes("SET status='expired'")))).toBe(false);
+    expect(message.ack).not.toHaveBeenCalled();
+    expect(message.retry).toHaveBeenCalledOnce();
+  });
+
+  it('does not reject upload metadata when integrity cleanup cannot delete the object', async () => {
+    const session = sessionRow();
+    const db = recordingDb({
+      first: (sql) => {
+        if (sql.startsWith('SELECT * FROM upload_sessions WHERE id = ?1 AND owner_username')) return session;
+        if (sql.startsWith('SELECT id, bytes, expires_at FROM storage_reservations')) {
+          return { id: 'res_cnt_1', bytes: session.size, expires_at: new Date(NOW + 60_000).toISOString() };
+        }
+        return undefined;
+      },
+    });
+    const remove = vi.fn(async () => { throw new Error('R2 delete failed'); });
+    const { response } = await invoke(db, '/api/uploads/upl_1/complete', { method: 'POST', body: '{}' }, {
+      bucket: {
+        head: vi.fn(async () => ({ size: session.size - 1, httpEtag: 'bad' })),
+        delete: remove,
+      },
+    });
+
+    expect(response.status).toBe(500);
+    expect(remove).toHaveBeenCalledWith(session.object_key);
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes('UPDATE contents SET status="expired"')))).toBe(false);
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes("SET status='expired'")))).toBe(false);
+  });
+
+  it('does not cancel multipart metadata when its R2 abort fails', async () => {
+    const session = sessionRow({ mode: 'multipart', upload_id: 'multipart_cancel' });
+    const db = recordingDb({
+      first: (sql) => sql.startsWith('SELECT * FROM upload_sessions WHERE id = ?1 AND owner_username') ? session : undefined,
+    });
+    const abort = vi.fn(async () => { throw new Error('R2 abort failed'); });
+    const { response } = await invoke(db, '/api/uploads/upl_1', { method: 'DELETE' }, {
+      bucket: { resumeMultipartUpload: vi.fn(() => ({ abort })) },
+    });
+
+    expect(response.status).toBe(500);
+    expect(abort).toHaveBeenCalledOnce();
+    expect(db.batches.some((batch) => batch.some((item) => item.sql.includes('status="cancelled"')))).toBe(false);
+  });
+
   it('aborts multipart setup and deletes rows in FK-safe order after a direct setup failure', async () => {
     const timeline: string[] = [];
     const db = recordingDb({
@@ -715,5 +1019,46 @@ describe('Worker quota reservations and upload lifecycle', () => {
     expect(sqlIndex(cleanup, 'DELETE FROM storage_reservations')).toBeLessThan(sqlIndex(cleanup, 'DELETE FROM contents'));
     expect(timeline.findIndex((entry) => entry === 'r2:multipart-abort'))
       .toBeLessThan(timeline.findIndex((entry) => entry.includes('DELETE FROM storage_reservations')));
+  });
+
+  it('retains setup metadata and quota when multipart rollback cannot abort R2', async () => {
+    const timeline: string[] = [];
+    const abort = vi.fn(async () => {
+      timeline.push('r2:multipart-abort-failed');
+      throw new Error('R2 abort failed');
+    });
+    const db = recordingDb({
+      timeline,
+      batch: (items) => {
+        if (items.some((item) => item.sql.startsWith('INSERT INTO attachments'))) throw new Error('D1 setup failed');
+      },
+    });
+    const current = runtime(db, {
+      timeline,
+      bucket: {
+        createMultipartUpload: vi.fn(async (key: string) => {
+          timeline.push(`r2:create-multipart:${key}`);
+          return { key, uploadId: 'multipart_rollback', abort };
+        }),
+      },
+    });
+
+    const response = await worker.fetch(request('/api/uploads/initiate', {
+      method: 'POST',
+      body: JSON.stringify({
+        visibility: 'private',
+        files: [{ name: 'rollback-failure.bin', size: 20 * MiB, fingerprint: 'e'.repeat(64) }],
+      }),
+    }), current.env, { waitUntil() {} } as unknown as ExecutionContext);
+
+    expect(response.status).toBe(500);
+    expect(abort).toHaveBeenCalledOnce();
+    expect(db.executed.some((item) => item.sql.startsWith('DELETE FROM upload_sessions'))).toBe(false);
+    expect(db.executed.some((item) => item.sql.startsWith('DELETE FROM storage_reservations'))).toBe(false);
+    expect(db.executed.some((item) => item.sql.startsWith('DELETE FROM contents'))).toBe(false);
+    const reservation = db.executed.find((item) => item.sql.includes('INSERT INTO storage_reservations'))!;
+    expect(reservation.values.slice(0, 4)).toEqual([expect.stringMatching(/^res_cnt_/), 'alice', expect.stringMatching(/^cnt_/), 20 * MiB]);
+    expect(timeline.findIndex((entry) => entry.includes('INSERT INTO storage_reservations')))
+      .toBeLessThan(timeline.findIndex((entry) => entry.startsWith('r2:create-multipart:')));
   });
 });

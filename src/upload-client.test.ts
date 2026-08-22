@@ -153,7 +153,7 @@ describe('BrowserUploadQueue', () => {
       api: apiFrom((request) => {
         requests.push(request);
         if (request.path === '/api/uploads/initiate') return { files: [plan] };
-        if (request.path.endsWith('/status')) return { ok: true, item: { status: 'completed', completed_parts: 1, parts: [] } };
+        if (request.path.endsWith('/status')) return { ok: true, item: { status: 'completed', content_status: 'active', completed_parts: 1, parts: [] } };
         return { ok: true };
       }),
       xhrFactory: () => new FakeXhr({ etag: '"single-etag"' }),
@@ -240,7 +240,7 @@ describe('BrowserUploadQueue', () => {
           };
         }
         if (request.path.endsWith('/status')) {
-          return { item: { status: 'completed', completed_parts: 1, parts: [] } };
+          return { item: { status: 'completed', content_status: 'active', completed_parts: 1, parts: [] } };
         }
         return { ok: true };
       }),
@@ -316,7 +316,7 @@ describe('BrowserUploadQueue', () => {
       api: apiFrom((request) => {
         requests.push(request);
         if (request.path === '/api/uploads/initiate') return { files: [plan] };
-        if (request.path.endsWith('/status')) return { ok: true, item: { status: 'completed', completed_parts: 3, parts: [] } };
+        if (request.path.endsWith('/status')) return { ok: true, item: { status: 'completed', content_status: 'active', completed_parts: 3, parts: [] } };
         return { ok: true };
       }),
       xhrFactory: () => {
@@ -377,7 +377,7 @@ describe('BrowserUploadQueue', () => {
             }
           };
         }
-        if (request.path.endsWith('/status')) return { item: { status: 'completed', completed_parts: 4, parts: [] } };
+        if (request.path.endsWith('/status')) return { item: { status: 'completed', content_status: 'active', completed_parts: 4, parts: [] } };
         return { ok: true };
       }),
       xhrFactory: () => {
@@ -463,7 +463,7 @@ describe('BrowserUploadQueue', () => {
                 { part_number: 1, etag: 'etag-1', size: 1 },
                 { part_number: 3, etag: 'etag-3', size: 1 }
               ] } }
-            : { item: { status: 'completed', completed_parts: 4, parts: [] } };
+            : { item: { status: 'completed', content_status: 'active', completed_parts: 4, parts: [] } };
         }
         return { ok: true };
       }),
@@ -518,7 +518,7 @@ describe('BrowserUploadQueue', () => {
     const queue = new BrowserUploadQueue({
       api: apiFrom((request) => {
         if (request.path === '/api/uploads/initiate') return { files: [plan] };
-        if (request.path.endsWith('/status')) return { item: { status: 'completed', completed_parts: 4, parts: [] } };
+        if (request.path.endsWith('/status')) return { item: { status: 'completed', content_status: 'active', completed_parts: 4, parts: [] } };
         return { ok: true };
       }),
       xhrFactory: () => {
@@ -547,7 +547,7 @@ describe('BrowserUploadQueue', () => {
       api: apiFrom((request) => request.path === '/api/uploads/initiate'
         ? { files: [{ client_id: 'client-c', session_id: 'session-c', attachment_id: 'attachment-c', mode: 'single', size: 1, upload_url: 'https://signed.example/retry', headers: {} }] }
         : request.path.endsWith('/status')
-          ? { ok: true, item: { status: 'completed', completed_parts: 1, parts: [] } }
+          ? { ok: true, item: { status: 'completed', content_status: 'active', completed_parts: 1, parts: [] } }
         : { ok: true }),
       xhrFactory: () => new FakeXhr({ networkError: attempt++ === 0 }),
       sleep: async (milliseconds) => { sleeps.push(milliseconds); }
@@ -647,7 +647,7 @@ describe('BrowserUploadQueue', () => {
           statusChecks += 1;
           return statusChecks === 1
             ? { item: { status: 'uploading', completed_parts: 1, parts: [{ part_number: 1, etag: 'etag-1', size: 1 }] } }
-            : { item: { status: 'completed', completed_parts: 4, parts: [] } };
+            : { item: { status: 'completed', content_status: 'active', completed_parts: 4, parts: [] } };
         }
         return { ok: true };
       }),
@@ -677,16 +677,28 @@ describe('BrowserUploadQueue', () => {
     expect((complete?.body as { parts: Array<{ part_number: number }> }).parts.map((part) => part.part_number)).toEqual([1, 2, 3, 4]);
   });
 
-  it('does not finish until Queue validation reports the session completed', async () => {
+  it('does not finish until finalized session content becomes active', async () => {
     let statusChecks = 0;
+    let retainedBlobWhileProcessing = false;
+    const persistence = new MemoryPersistence();
     const queue = new BrowserUploadQueue({
+      persistence,
       api: apiFrom((request) => {
         if (request.path === '/api/uploads/initiate') {
           return { files: [{ client_id: 'client-f', session_id: 'session-f', attachment_id: 'attachment-f', mode: 'single', size: 1, upload_url: 'https://signed.example/finalize', headers: {} }] };
         }
         if (request.path.endsWith('/status')) {
           statusChecks += 1;
-          return { ok: true, item: { status: statusChecks === 1 ? 'uploading' : 'completed', completed_parts: statusChecks === 1 ? 0 : 1, parts: [] } };
+          if (statusChecks === 2) retainedBlobWhileProcessing = 'file_blob' in persistence.recordsForTest()[0];
+          return {
+            ok: true,
+            item: {
+              status: 'completed',
+              content_status: statusChecks === 1 ? 'processing' : 'active',
+              completed_parts: 1,
+              parts: [],
+            },
+          };
         }
         return { ok: true };
       }),
@@ -698,7 +710,59 @@ describe('BrowserUploadQueue', () => {
     await queue.run();
 
     expect(statusChecks).toBe(2);
+    expect(retainedBlobWhileProcessing).toBe(true);
     expect(queue.getTasks()[0].status).toBe('complete');
+    expect(persistence.recordsForTest()[0]).not.toHaveProperty('file_blob');
+  });
+
+  it('restores finalized processing content without clearing its durable file', async () => {
+    const persistence = new MemoryPersistence();
+    const file = makeFile('activation-pending.bin', 1);
+    await persistence.save({
+      id: 'task-activation',
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      last_modified: file.lastModified,
+      client_id: 'client-activation',
+      session_id: 'session-activation',
+      attachment_id: 'attachment-activation',
+      mode: 'single',
+      status: 'uploading',
+      completed_parts: [],
+      progress: { loaded: 1, total: 1 },
+      file_blob: file,
+    });
+    let statusChecks = 0;
+    const queue = new BrowserUploadQueue({
+      persistence,
+      sleep: async () => undefined,
+      api: apiFrom((request) => {
+        if (request.path.endsWith('/status')) {
+          statusChecks += 1;
+          return {
+            item: {
+              status: 'completed',
+              content_status: statusChecks === 1 ? 'processing' : 'active',
+              completed_parts: 1,
+              parts: [],
+            },
+          };
+        }
+        return { ok: true };
+      }),
+    });
+
+    const restored = await queue.restore();
+
+    expect(restored.tasks[0]).toMatchObject({ status: 'paused', needsFileReselection: false });
+    expect(persistence.recordsForTest()[0]).toHaveProperty('file_blob');
+
+    await queue.run();
+
+    expect(statusChecks).toBe(2);
+    expect(queue.getTasks()[0].status).toBe('complete');
+    expect(persistence.recordsForTest()[0]).not.toHaveProperty('file_blob');
   });
 
   it('restores a locally persisted File when IndexedDB supports structured cloning it', async () => {
@@ -740,7 +804,7 @@ describe('BrowserUploadQueue', () => {
           initiated += 1;
           return { files: [{ client_id: 'client-early', session_id: 'session-early', attachment_id: 'attachment-early', mode: 'single', size: 2, upload_url: 'https://signed.example/early', headers: {} }] };
         }
-        if (request.path.endsWith('/status')) return { item: { status: 'completed', completed_parts: 1, parts: [] } };
+        if (request.path.endsWith('/status')) return { item: { status: 'completed', content_status: 'active', completed_parts: 1, parts: [] } };
         return { ok: true };
       })
     });
@@ -775,7 +839,7 @@ describe('BrowserUploadQueue', () => {
         if (request.path.endsWith('/renew')) return { item: { session_id: 'session-ready', attachment_id: 'attachment-ready', mode: 'multipart', size: 8, parts: [] } };
         if (request.path.endsWith('/status')) {
           statusChecks += 1;
-          return { item: { status: statusChecks === 1 ? 'uploading' : 'completed', completed_parts: 2, parts } };
+          return { item: { status: statusChecks === 1 ? 'uploading' : 'completed', content_status: statusChecks === 1 ? 'processing' : 'active', completed_parts: 2, parts } };
         }
         return { ok: true };
       })
@@ -796,7 +860,7 @@ describe('BrowserUploadQueue', () => {
         if (request.path === '/api/uploads/initiate') return {
           files: [{ client_id: 'client-fingerprint', session_id: 'session-fingerprint', attachment_id: 'attachment-fingerprint', mode: 'single', size: 4, upload_url: 'https://signed.example/fingerprint', headers: {} }]
         };
-        if (request.path.endsWith('/status')) return { ok: true, item: { status: 'completed', completed_parts: 1, parts: [] } };
+        if (request.path.endsWith('/status')) return { ok: true, item: { status: 'completed', content_status: 'active', completed_parts: 1, parts: [] } };
         return { ok: true };
       }),
       xhrFactory: () => new FakeXhr({ etag: 'fingerprint-etag' })

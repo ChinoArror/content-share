@@ -82,6 +82,7 @@ export interface UploadTask {
   completedParts: CompletedUploadPart[];
   progress: UploadProgress;
   needsFileReselection: boolean;
+  awaitingActivation?: boolean;
   error?: string;
   errorCode?: string;
   errorDetails?: Record<string, unknown>;
@@ -132,6 +133,9 @@ interface InitiateResponse {
 
 interface UploadStatusResponse {
   status?: string;
+  session_status?: string;
+  content_status?: string;
+  content_active?: boolean;
   completed_parts?: number;
   parts?: CompletedUploadPart[];
 }
@@ -328,16 +332,19 @@ export class BrowserUploadQueue {
             task.completedParts = normalizeCompletedParts([...task.completedParts, ...status.parts]);
             this.updateProgress(task);
           }
-          if (status.status === 'completed' || status.status === 'active') {
+          if (contentIsActive(status)) {
             task.status = 'complete';
             task.needsFileReselection = false;
+            task.awaitingActivation = false;
+          } else if (sessionIsFinalized(status)) {
+            task.awaitingActivation = true;
           }
         } catch (error) {
           assignTaskError(task, error);
         }
       }
       if (task.status !== 'complete') {
-        task.needsFileReselection = !task.file;
+        task.needsFileReselection = task.awaitingActivation ? false : !task.file;
         task.status = task.sessionId || !task.file ? 'paused' : 'queued';
       }
       await this.persist(task);
@@ -381,7 +388,9 @@ export class BrowserUploadQueue {
 
   private async runInternal(): Promise<void> {
     await this.initiateQueuedTasks();
-    const runnable = [...this.tasks.values()].filter((task) => task.file && !task.needsFileReselection && task.status !== 'complete');
+    const runnable = [...this.tasks.values()].filter((task) =>
+      (task.awaitingActivation || task.file) && !task.needsFileReselection && task.status !== 'complete'
+    );
     await runWithConcurrency(runnable, this.maxConcurrentFiles, async (task) => {
       try {
         await this.uploadTask(task);
@@ -442,6 +451,22 @@ export class BrowserUploadQueue {
   }
 
   private async uploadTask(task: TaskState): Promise<void> {
+    if (task.awaitingActivation) {
+      task.status = 'uploading';
+      task.error = undefined;
+      task.errorCode = undefined;
+      task.errorDetails = undefined;
+      await this.persist(task);
+      this.notify(task);
+      await this.waitForServerCompletion(task);
+      task.awaitingActivation = false;
+      task.status = 'complete';
+      task.needsFileReselection = false;
+      task.plan = undefined;
+      await this.persist(task);
+      this.notify(task);
+      return;
+    }
     if (!task.file) throw new Error('File must be selected before upload can resume');
     if (!task.plan) await this.renewPlan(task);
     task.status = 'uploading';
@@ -458,7 +483,11 @@ export class BrowserUploadQueue {
       await this.uploadMultipart(task);
       await this.complete(task, task.completedParts);
     }
+    task.awaitingActivation = true;
+    await this.persist(task);
+    this.notify(task);
     await this.waitForServerCompletion(task);
+    task.awaitingActivation = false;
     task.status = 'complete';
     task.needsFileReselection = false;
     task.plan = undefined;
@@ -574,9 +603,11 @@ export class BrowserUploadQueue {
         path: `/api/uploads/${encodeURIComponent(task.sessionId)}/status`
       });
       const status = unwrapItem(response);
-      if (status.status === 'completed' || status.status === 'active') return;
-      if (status.status === 'failed' || status.status === 'cancelled' || status.status === 'expired') {
-        throw new Error(`Upload validation failed: ${status.status}`);
+      if (contentIsActive(status)) return;
+      const terminalStatus = [status.session_status, status.status, status.content_status]
+        .find((candidate) => candidate === 'failed' || candidate === 'cancelled' || candidate === 'expired');
+      if (terminalStatus) {
+        throw new Error(`Upload validation failed: ${terminalStatus}`);
       }
       await this.sleep(1000);
     }
@@ -669,6 +700,7 @@ export class BrowserUploadQueue {
       error_details: task.errorDetails,
       completed_parts: task.completedParts,
       progress: task.progress,
+      awaiting_activation: task.awaitingActivation === true,
       metadata: task.metadata,
       updated_at: this.clock()
     };
@@ -768,11 +800,20 @@ function deserializeTask(record: Record<string, unknown>): TaskState | null {
     errorDetails: isRecord(record.error_details) ? record.error_details : undefined,
     completedParts: completed,
     progress,
-    needsFileReselection: !file,
+    needsFileReselection: record.awaiting_activation === true ? false : !file,
+    awaitingActivation: record.awaiting_activation === true,
     file,
     metadata: isRecord(record.metadata) ? record.metadata : undefined,
     partialPartBytes: new Map()
   };
+}
+
+function contentIsActive(status: UploadStatusResponse): boolean {
+  return status.content_active === true || status.content_status === 'active' || status.status === 'active';
+}
+
+function sessionIsFinalized(status: UploadStatusResponse): boolean {
+  return status.session_status === 'completed' || status.status === 'completed';
 }
 
 async function fingerprintForFile(file: File): Promise<string> {

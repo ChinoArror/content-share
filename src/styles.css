@@ -276,6 +276,7 @@ code, .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .compact-btn { min-height: 36px; padding: 0 10px; white-space: nowrap; }
 .admin-key-actions { display: inline-flex; align-items: center; justify-content: flex-start; gap: 4px; min-width: 0; }
 .admin-key-actions .icon { width: 36px; min-height: 36px; }
+.admin-row .admin-key-actions { overflow: visible; }
 .copy-value-btn { width: 34px; min-height: 34px; }
 .admin-audit-value { min-width: 0; display: inline-flex; align-items: center; gap: 4px; max-width: 100%; }
 .admin-audit-value > span, .admin-audit-value > code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -316,6 +317,22 @@ code, .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .login section:not(.landing-hero), .narrow { width: min(520px, 100%); }
 .login h1 { font-size: 44px; margin: 0 0 12px; }
 .login p { color: var(--muted); line-height: 1.6; }
+.sso-loading-page { min-height: 100dvh; display: grid; place-items: center; padding: 24px; background: var(--bg); }
+.sso-loading-card { width: min(420px, 100%); padding: 34px 30px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: 0 18px 50px rgba(17, 24, 20, .12); text-align: center; }
+.sso-loading-mark { width: 52px; height: 52px; margin: 0 auto 16px; display: grid; place-items: center; border-radius: 14px; color: #fff; background: var(--primary); animation: sso-mark-pulse 1.5s ease-in-out infinite; }
+.sso-loading-card h1 { margin: 0; font-size: 26px; }
+.sso-loading-card p { margin: 8px 0 20px; }
+.sso-loading-track { height: 8px; overflow: hidden; border-radius: 999px; background: var(--soft); }
+.sso-loading-track i { display: block; width: 38%; height: 100%; border-radius: inherit; background: var(--accent); animation: sso-track-slide 1.25s ease-in-out infinite; }
+.sso-loading-squares { display: flex; justify-content: center; gap: 6px; margin-top: 18px; }
+.sso-loading-squares i { width: 8px; height: 8px; border-radius: 2px; background: var(--primary); animation: sso-square-bounce 1s ease-in-out infinite; }
+.sso-loading-squares i:nth-child(2) { animation-delay: .12s; }
+.sso-loading-squares i:nth-child(3) { animation-delay: .24s; }
+.sso-loading-squares i:nth-child(4) { animation-delay: .36s; }
+.sso-loading-squares i:nth-child(5) { animation-delay: .48s; }
+@keyframes sso-mark-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+@keyframes sso-track-slide { 0% { transform: translateX(-120%); } 50%, 70% { transform: translateX(155%); } 100% { transform: translateX(280%); } }
+@keyframes sso-square-bounce { 0%, 100% { transform: translateY(0); opacity: .45; } 50% { transform: translateY(-6px); opacity: 1; } }
 .landing { position: relative; overflow: hidden; background: #eef1ed; }
 .landing-language { position: absolute; top: 24px; right: 24px; z-index: 3; }
 .landing.with-bg::before { content: ""; position: absolute; inset: 0; background-image: var(--landing-bg); background-size: cover; background-position: center; opacity: var(--landing-opacity); }
@@ -467,6 +484,10 @@ code, .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .qr-swatches { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .qr-swatch { width: 100%; aspect-ratio: 1.35; min-height: 54px; padding: 0; border-radius: 7px; overflow: hidden; background: var(--soft); }
 .qr-swatch img { width: 100%; height: 100%; display: block; object-fit: cover; }
+.qr-swatch > span { display: grid; place-items: center; width: 100%; height: 100%; color: var(--muted); font-size: 12px; font-weight: 700; }
+.qr-swatch-collage > span { background: linear-gradient(135deg, #d6e8de, #f4c9a5 52%, #657a72); color: #26362f; }
+.qr-swatch-minimal > span { background: linear-gradient(135deg, #f7f3ea, #e7e4dc); color: #5d625e; }
+.qr-swatch-punk > span { background: linear-gradient(135deg, #1c2c25, #bd3822 58%, #edc64a); color: #fff; }
 .qr-swatch.selected { border: 2px solid var(--primary); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 16%, transparent); }
 .qr-upload-swatch { display: grid; place-items: center; color: var(--muted); border-style: dashed; cursor: pointer; }
 .qr-upload-swatch input { display: none; }
@@ -565,6 +586,7 @@ iframe.received-preview { object-fit: initial; }
   .admin-tools { grid-template-columns: minmax(0, 1fr) auto auto; }
   .admin-row { grid-template-columns: 42px repeat(4, minmax(0, 1fr)); }
   .admin-row.no-action { grid-template-columns: 42px repeat(4, minmax(0, 1fr)); }
+  .admin-row.has-action { grid-template-columns: 42px minmax(140px, 1.2fr) minmax(120px, 1fr) minmax(140px, 1.2fr) minmax(100px, 1fr) minmax(120px, auto); }
   .admin-row span:not(.admin-key-actions):nth-of-type(n+5), .admin-row.admin-head strong:nth-of-type(n+5) { display: none; }
   .admin-detail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .landing-hero, .background-grid { grid-template-columns: 1fr; }
@@ -578,6 +600,7 @@ iframe.received-preview { object-fit: initial; }
 }
 
 @media (max-width: 560px) {
+  input, textarea, select { font-size: 16px; }
   .topbar h1 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 18px; }
   .topbar h1::before { height: 15px; margin-right: 7px; }
   .topbar { gap: 8px; }
@@ -622,6 +645,8 @@ iframe.received-preview { object-fit: initial; }
   .admin-tools > button svg { flex: 0 0 auto; }
   .admin-row { grid-template-columns: 38px minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 1fr); gap: 8px; padding: 0 8px; }
   .admin-row.no-action { grid-template-columns: 38px minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 1fr); }
+  .admin-row.has-action { grid-template-columns: 38px minmax(140px, 1.2fr) minmax(120px, 1fr) minmax(140px, 1.2fr) minmax(120px, auto); }
+  .admin-row.has-action .admin-key-actions { overflow: visible; }
   .admin-row span:not(.admin-key-actions):nth-of-type(n+4), .admin-row.admin-head strong:nth-of-type(n+4), .admin-row .compact-btn { display: none; }
   .admin-detail { grid-template-columns: 1fr; }
   .upload-float { right: 14px; bottom: 14px; }

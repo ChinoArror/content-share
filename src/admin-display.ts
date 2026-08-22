@@ -33,6 +33,10 @@ export function normalizeVisibility(value: unknown, canPublic?: boolean): AdminV
   return options.includes(value as AdminVisibility) ? value as AdminVisibility : options[options.length - 1];
 }
 
+export function withAllowedVisibility<T extends Record<string, unknown>>(payload: T, canPublic?: boolean): T & { visibility: AdminVisibility } {
+  return { ...payload, visibility: normalizeVisibility(payload.visibility, canPublic) };
+}
+
 const GIB = 1024 ** 3;
 
 export function quotaGiBToBytes(value: unknown): number | null {
