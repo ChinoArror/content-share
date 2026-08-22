@@ -75,8 +75,18 @@ describe('worker permission store', () => {
     expect(reservation).toBe('res_1');
     expect(db.sql.filter((sql) => sql.includes('INSERT INTO storage_reservations'))).toHaveLength(1);
     expect(db.sql[0]).toContain('p.can_upload = 1');
-    expect(db.sql[0]).toContain('COALESCE(SUM(c.file_size + c.text_size), 0)');
     expect(db.sql[0]).toContain("r.status = 'active'");
+  });
+
+  it('coalesces both nullable content byte columns in the reservation gate', async () => {
+    const db = recordingDb({ changes: 1 });
+
+    await reserveStorage(db, {
+      id: 'res_1', username: 'alice', contentId: 'cnt_1', bytes: 1024, expiresAt: '2026-08-22T00:30:00.000Z',
+    });
+
+    expect(db.sql[0]).toContain('SUM(COALESCE(c.file_size, 0) + COALESCE(c.text_size, 0))');
+    expect(db.sql[0]).not.toContain('SUM(c.file_size + c.text_size)');
   });
 
   it('does not create a reservation for a zero-byte payload', async () => {

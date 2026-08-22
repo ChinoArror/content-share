@@ -99,7 +99,7 @@ export async function reserveStorage(db: D1Database, input: StorageReservationIn
       WHERE u.username = ?2
         AND p.can_upload = 1
         AND p.quota_bytes >=
-          (SELECT COALESCE(SUM(c.file_size + c.text_size), 0) FROM contents c WHERE c.owner_username = ?2) +
+          (SELECT COALESCE(SUM(COALESCE(c.file_size, 0) + COALESCE(c.text_size, 0)), 0) FROM contents c WHERE c.owner_username = ?2) +
           (SELECT COALESCE(SUM(r.bytes), 0) FROM storage_reservations r
             WHERE r.owner_username = ?2
               AND r.status = 'active'
