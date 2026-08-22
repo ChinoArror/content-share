@@ -44,6 +44,47 @@ class MemoryPersistence implements UploadPersistence {
   }
 }
 
+class BlobQuotaPersistence implements UploadPersistence {
+  private readonly records = new Map<string, Record<string, unknown>>();
+  private readonly attempts: boolean[] = [];
+  private readonly removed: string[] = [];
+  private rejectBlobWrites = true;
+
+  async loadAll() {
+    return [...this.records.values()];
+  }
+
+  async save(record: Record<string, unknown>) {
+    const hasFileBlob = 'file_blob' in record;
+    this.attempts.push(hasFileBlob);
+    if (hasFileBlob && this.rejectBlobWrites) {
+      throw new DOMException('Upload file could not be saved because IndexedDB quota was exceeded', 'QuotaExceededError');
+    }
+    this.records.set(String(record.id), structuredClone(record));
+  }
+
+  async remove(id: string) {
+    this.removed.push(id);
+    this.records.delete(id);
+  }
+
+  allowBlobWrites() {
+    this.rejectBlobWrites = false;
+  }
+
+  attemptsForTest() {
+    return [...this.attempts];
+  }
+
+  recordsForTest() {
+    return [...this.records.values()];
+  }
+
+  removedForTest() {
+    return [...this.removed];
+  }
+}
+
 class FakeXhr implements XhrLike {
   status = 0;
   response: unknown = null;
@@ -175,6 +216,64 @@ describe('BrowserUploadQueue', () => {
       error_details: details,
       file_blob: expect.any(Blob)
     });
+    expect(persistence.removedForTest()).toEqual([]);
+  });
+
+  it('surfaces blob persistence failure without writing metadata-only state and keeps the in-memory file', async () => {
+    const persistence = new BlobQuotaPersistence();
+    const file = makeFile('quota-limited.bin', 4);
+    const uploadedBodies: XMLHttpRequestBodyInit[] = [];
+    const queue = new BrowserUploadQueue({
+      persistence,
+      api: apiFrom((request) => {
+        if (request.path === '/api/uploads/initiate') {
+          return {
+            files: [{
+              client_id: 'client-quota-limited',
+              session_id: 'session-quota-limited',
+              attachment_id: 'attachment-quota-limited',
+              mode: 'single',
+              size: file.size,
+              upload_url: 'https://signed.example/quota-limited',
+              headers: {}
+            }]
+          };
+        }
+        if (request.path.endsWith('/status')) {
+          return { item: { status: 'completed', completed_parts: 1, parts: [] } };
+        }
+        return { ok: true };
+      }),
+      xhrFactory: () => {
+        const xhr = new FakeXhr({ etag: 'quota-limited-etag' });
+        const originalSend = xhr.send.bind(xhr);
+        xhr.send = (body) => {
+          uploadedBodies.push(body);
+          originalSend(body);
+        };
+        return xhr;
+      }
+    });
+
+    await expect(queue.enqueue([{ file, clientId: 'client-quota-limited' }])).rejects.toMatchObject({
+      name: 'QuotaExceededError',
+      message: 'Upload file could not be saved because IndexedDB quota was exceeded'
+    });
+
+    expect(persistence.attemptsForTest()).toEqual([true]);
+    expect(persistence.recordsForTest()).toEqual([]);
+    expect(persistence.removedForTest()).toEqual([]);
+    expect(queue.getTasks()[0]).toMatchObject({
+      clientId: 'client-quota-limited',
+      status: 'queued',
+      needsFileReselection: false
+    });
+
+    persistence.allowBlobWrites();
+    await queue.run();
+
+    expect(uploadedBodies).toEqual([file]);
+    expect(queue.getTasks()[0].status).toBe('complete');
     expect(persistence.removedForTest()).toEqual([]);
   });
 
@@ -492,6 +591,90 @@ describe('BrowserUploadQueue', () => {
     expect(restored.needsFileReselection).toEqual(['task-d']);
     expect(restored.tasks[0]).toMatchObject({ id: 'task-d', status: 'paused', needsFileReselection: true, progress: { loaded: 4, total: 8 } });
     expect(JSON.stringify(persistence.recordsForTest())).not.toContain('signed.example');
+  });
+
+  it('unions stale status parts with durable completions and never reuploads them', async () => {
+    const persistence = new MemoryPersistence();
+    const file = makeFile('stale-status.bin', 4);
+    await persistence.save({
+      id: 'task-stale-status',
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      last_modified: file.lastModified,
+      client_id: 'client-stale-status',
+      session_id: 'session-stale-status',
+      attachment_id: 'attachment-stale-status',
+      mode: 'multipart',
+      status: 'uploading',
+      completed_parts: [
+        { part_number: 1, etag: 'etag-1', size: 1 },
+        { part_number: 3, etag: 'etag-3', size: 1 }
+      ],
+      progress: { loaded: 2, total: file.size },
+      file_blob: file
+    });
+    const requests: ApiRequestOptions[] = [];
+    const uploadedUrls: string[] = [];
+    let statusChecks = 0;
+    const queue = new BrowserUploadQueue({
+      persistence,
+      api: apiFrom((request) => {
+        requests.push(request);
+        if (request.path.endsWith('/renew')) {
+          return {
+            item: {
+              client_id: 'client-stale-status',
+              session_id: 'session-stale-status',
+              attachment_id: 'attachment-stale-status',
+              mode: 'multipart',
+              size: file.size,
+              parts: [2, 3, 4].map((partNumber) => ({
+                part_number: partNumber,
+                start: partNumber - 1,
+                end: partNumber,
+                size: 1,
+                url: `https://signed.example/stale-${partNumber}`,
+                headers: {}
+              })),
+              completed_parts: [{ part_number: 1, etag: 'etag-1', size: 1 }],
+              next_part_number: null,
+              has_more_parts: false
+            }
+          };
+        }
+        if (request.path.endsWith('/status')) {
+          statusChecks += 1;
+          return statusChecks === 1
+            ? { item: { status: 'uploading', completed_parts: 1, parts: [{ part_number: 1, etag: 'etag-1', size: 1 }] } }
+            : { item: { status: 'completed', completed_parts: 4, parts: [] } };
+        }
+        return { ok: true };
+      }),
+      xhrFactory: () => {
+        const xhr = new FakeXhr({ etag: 'uploaded-etag' });
+        const originalOpen = xhr.open.bind(xhr);
+        xhr.open = (method, url) => {
+          uploadedUrls.push(url);
+          originalOpen(method, url);
+        };
+        return xhr;
+      }
+    });
+
+    const restored = await queue.restore();
+
+    expect(restored.tasks[0].completedParts.map((part) => part.part_number)).toEqual([1, 3]);
+    expect(restored.tasks[0].progress).toEqual({ loaded: 2, total: 4 });
+
+    await queue.run();
+
+    expect(uploadedUrls.sort()).toEqual([
+      'https://signed.example/stale-2',
+      'https://signed.example/stale-4'
+    ]);
+    const complete = requests.find((request) => request.path.endsWith('/complete'));
+    expect((complete?.body as { parts: Array<{ part_number: number }> }).parts.map((part) => part.part_number)).toEqual([1, 2, 3, 4]);
   });
 
   it('does not finish until Queue validation reports the session completed', async () => {

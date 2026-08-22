@@ -106,3 +106,27 @@ Result: exit `0`; Git emitted only the checkout's LF-to-CRLF notices.
 - The current Worker still signs all multipart parts and does not yet expose the `/parts` endpoint. Task 4B must integrate `buildPartWindow` before this becomes an end-to-end windowed upload protocol.
 - Existing Worker and UI messages still mention the old 100 MiB limit. They were intentionally left untouched because Worker quota lifecycle and UI localization are outside the exact 4A scope.
 - Vite continues to emit the pre-existing generated chunk-size warning, and Vitest continues to emit the pre-existing React Babel/esbuild deprecation notices.
+
+## Fix Round 1
+
+### Restore Completion Union
+
+- Added a stale-status regression with durable completed parts 1 and 3 while `GET /status` reports only part 1.
+- RED: `npx vitest run src/upload-client.test.ts -t "unions stale status parts"` exited `1`; restore returned `[1]` instead of `[1, 3]`.
+- Changed `restore()` to normalize the union of persisted completed parts and `status.parts`, matching renew-plan merge behavior.
+- GREEN: the same targeted command exited `0`. The regression then renewed with signed URLs for parts 2, 3, and 4, uploaded only parts 2 and 4, and completed with parts `[1, 2, 3, 4]`.
+
+### Blob Persistence Failure
+
+- Added a quota-failure persistence double that rejects records containing `file_blob` while accepting metadata-only records.
+- RED: `npx vitest run src/upload-client.test.ts -t "surfaces blob persistence failure"` exited `1` because `enqueue()` resolved after the rejected blob save; the fallback had silently written metadata-only state.
+- Removed the catch-and-retry branch from `persist()`. A failed atomic save now surfaces its original persistence error without mutating the task or retrying without `file_blob`.
+- GREEN: the same targeted command exited `0`. It verifies one blob-bearing save attempt, no durable metadata-only record, no removal, an in-memory queued task that does not require reselection, and successful upload of the same `File` after writes become available.
+
+### Fix Verification
+
+- `npx vitest run src/transfer-policy.test.ts src/upload-client.test.ts src/upload-resume.test.ts`: exit `0`; 3 files and 33 tests passed.
+- `npm test`: exit `0`; 12 files and 101 tests passed.
+- `npx tsc --noEmit`: exit `0` with no diagnostics.
+- `npm run build`: exit `0`; Vite transformed 1688 modules and completed the production build in 17.65 seconds.
+- Existing Vitest React Babel/esbuild deprecation notices and the Vite chunk-size warning remain unchanged.

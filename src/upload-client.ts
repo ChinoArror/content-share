@@ -325,7 +325,7 @@ export class BrowserUploadQueue {
           });
           const status = unwrapItem(statusResponse);
           if (Array.isArray(status.parts)) {
-            task.completedParts = normalizeCompletedParts(status.parts);
+            task.completedParts = normalizeCompletedParts([...task.completedParts, ...status.parts]);
             this.updateProgress(task);
           }
           if (status.status === 'completed' || status.status === 'active') {
@@ -673,13 +673,7 @@ export class BrowserUploadQueue {
       updated_at: this.clock()
     };
     if (task.file && task.status !== 'complete') record.file_blob = task.file;
-    try {
-      await this.persistence.save(record);
-    } catch (error) {
-      if (!('file_blob' in record)) throw error;
-      delete record.file_blob;
-      await this.persistence.save(record);
-    }
+    await this.persistence.save(record);
   }
 
   private snapshot(task: TaskState): UploadTask {
