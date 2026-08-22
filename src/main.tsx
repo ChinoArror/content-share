@@ -17,7 +17,15 @@ import { mimeTypeForArchivePath, previewKind, type PreviewKind } from './preview
 import { extractZipEntries, normalizeZipEntryName, selectZipHtmlEntry } from './zip-preview';
 import { MAX_UPLOAD_SIZE } from './transfer-policy';
 import { getInitialLanguage, I18nProvider, LanguageSwitcher, translate, useI18n } from './i18n';
-import { compactAuditValue, permissionKeys, type AdminPermissionKey } from './admin-display';
+import {
+  adminKeyActions,
+  allowedVisibilityOptions,
+  compactAuditValue,
+  normalizeVisibility,
+  permissionKeys,
+  quotaGiBToBytes,
+  type AdminPermissionKey,
+} from './admin-display';
 import {
   ChevronDown,
   ChevronRight,
@@ -113,8 +121,6 @@ type ShareNote = {
 const SSO_URL = 'https://accounts.aryuki.com';
 const APP_ID = 'content-share';
 const BASE_URL = 'https://content.aryuki.com';
-const visibilityOptions: Visibility[] = ['public', 'internal', 'private'];
-
 const noPermissions: PermissionSet = {
   can_public_publish: false,
   can_api: false,
@@ -124,8 +130,7 @@ const noPermissions: PermissionSet = {
 };
 
 function visibilityOptionsFor(permissions?: PermissionSet): Visibility[] {
-  if (!permissions || !permissions.can_public_publish) return ['internal', 'private'];
-  return visibilityOptions;
+  return allowedVisibilityOptions(permissions?.can_public_publish);
 }
 
 function token() {
@@ -337,7 +342,7 @@ function Field({ label, children, className = '' }: { label: string; children: R
 function VisibilitySegment({ value, onChange, permissions }: { value: Visibility; onChange: (v: Visibility) => void; permissions?: PermissionSet }) {
   const { t } = useI18n();
   const options = visibilityOptionsFor(permissions);
-  const displayValue = options.includes(value) ? value : options[options.length - 1];
+  const displayValue = normalizeVisibility(value, permissions?.can_public_publish);
   const index = options.findIndex((item) => item === displayValue);
   return (
     <div className="visibility-segment" role="radiogroup" aria-label={t('visibility.label')}>
@@ -505,17 +510,24 @@ function PublishText({ toast, permissions }: { toast: (s: string, k?: Toast['kin
   const { t, language } = useI18n();
   const [format, setFormat] = useState<'markdown' | 'plain'>('plain');
   const [mobileTab, setMobileTab] = useState<'pure' | 'preview'>('pure');
-  const [form, setForm] = useState({ title: '', content: '', remark: '', slug: '', password: '', visibility: 'public' as Visibility, expire_at: '', max_views: 0 });
+  const [form, setForm] = useState(() => ({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0 }));
   const [busy, setBusy] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const preview = useMemo(() => renderTextHtml(format, form.content), [format, form.content]);
+  useEffect(() => {
+    setForm((current) => {
+      const visibility = normalizeVisibility(current.visibility, permissions.can_public_publish);
+      return visibility === current.visibility ? current : { ...current, visibility };
+    });
+  }, [permissions.can_public_publish]);
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
     try {
-      const res = await api<{ url: string }>('/api/contents/text', { method: 'POST', body: JSON.stringify({ ...form, format, expire_at: form.expire_at || null }) });
+      const visibility = normalizeVisibility(form.visibility, permissions.can_public_publish);
+      const res = await api<{ url: string }>('/api/contents/text', { method: 'POST', body: JSON.stringify({ ...form, visibility, format, expire_at: form.expire_at || null }) });
       toast(language === 'en-US' ? `Created: ${res.url}` : `已创建：${res.url}`);
-      setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: 'public', expire_at: '', max_views: 0 });
+      setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0 });
     } catch (err) {
       toast(localizedError(err, t), 'error');
     } finally {
@@ -740,7 +752,7 @@ function QrShareModal({ item, close, toast }: { item: Content; close: () => void
 function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: Toast['kind']) => void; username: string; permissions: PermissionSet }) {
   const { t, language } = useI18n();
   const [files, setFiles] = useState<File[]>([]);
-  const [form, setForm] = useState({ title: '', content: '', remark: '', slug: '', password: '', visibility: 'public' as Visibility, expire_at: '', max_views: 0, format: 'markdown' });
+  const [form, setForm] = useState(() => ({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, format: 'markdown' }));
   const [busy, setBusy] = useState(false);
   const [recent, setRecent] = useState<Content[]>([]);
   const [uploadTasks, setUploadTasks] = useState<UploadTask[]>([]);
@@ -748,6 +760,12 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
   const queueRef = useRef<BrowserUploadQueue | null>(null);
   const sampleRef = useRef({ at: Date.now(), loaded: 0, speed: 0 });
   const load = () => api<{ items: Content[] }>('/api/contents?type=file').then((r) => setRecent(r.items)).catch((e) => toast(e.message, 'error'));
+  useEffect(() => {
+    setForm((current) => {
+      const visibility = normalizeVisibility(current.visibility, permissions.can_public_publish);
+      return visibility === current.visibility ? current : { ...current, visibility };
+    });
+  }, [permissions.can_public_publish]);
 
   function syncUploadProgress(changed?: UploadTask) {
     const tasks = queueRef.current?.getTasks() || (changed ? [changed] : []);
@@ -849,7 +867,8 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
   async function legacyUpload() {
     const fd = new FormData();
     files.forEach((file) => fd.append('file', file));
-    Object.entries({ ...form, expire_at: form.expire_at || '' }).forEach(([key, value]) => fd.append(key, String(value)));
+    const visibility = normalizeVisibility(form.visibility, permissions.can_public_publish);
+    Object.entries({ ...form, visibility, expire_at: form.expire_at || '' }).forEach(([key, value]) => fd.append(key, String(value)));
     const result = await new Promise<{ url: string }>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/contents/upload');
@@ -888,7 +907,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
       added = await queue.enqueue(files.map((file, index) => ({
         file,
         clientId: `${Date.now()}-${index}-${file.name}`,
-        metadata: { ...form, expire_at: form.expire_at || '' }
+        metadata: { ...form, visibility: normalizeVisibility(form.visibility, permissions.can_public_publish), expire_at: form.expire_at || '' }
       })));
       try {
         await queue.run();
@@ -912,7 +931,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
       await clearCompletedTasks();
       toast(language === 'en-US' ? 'File transfer complete; the background queue is confirming the content.' : '文件传输完成，后台正在确认内容状态');
       setFiles([]);
-      setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: 'public', expire_at: '', max_views: 0, format: 'markdown' });
+      setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, format: 'markdown' });
       window.setTimeout(() => void load(), 700);
     } catch (err) {
       const message = localizedError(err, t);
@@ -1002,10 +1021,17 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
 
 function EditContent({ item, admin, permissions, close, done, toast }: { item: Content; admin: boolean; permissions?: PermissionSet; close: () => void; done: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t, language } = useI18n();
-  const [form, setForm] = useState({ title: item.title, remark: item.remark || '', visibility: item.visibility, expire_at: item.expire_at || '', max_views: item.max_views, text_content: item.text_content || '', format: item.format });
+  const [form, setForm] = useState(() => ({ title: item.title, remark: item.remark || '', visibility: normalizeVisibility(item.visibility, permissions?.can_public_publish), expire_at: item.expire_at || '', max_views: item.max_views, text_content: item.text_content || '', format: item.format }));
+  useEffect(() => {
+    setForm((current) => {
+      const visibility = normalizeVisibility(current.visibility, permissions?.can_public_publish);
+      return visibility === current.visibility ? current : { ...current, visibility };
+    });
+  }, [permissions?.can_public_publish]);
   async function save() {
     try {
-      await api(`${admin ? '/api/admin/contents' : '/api/contents'}/${item.id}`, { method: 'PATCH', body: JSON.stringify(form) });
+      const visibility = normalizeVisibility(form.visibility, permissions?.can_public_publish);
+      await api(`${admin ? '/api/admin/contents' : '/api/contents'}/${item.id}`, { method: 'PATCH', body: JSON.stringify({ ...form, visibility }) });
       toast(language === 'en-US' ? 'Saved' : '已保存');
       done();
     } catch (err) {
@@ -1104,13 +1130,26 @@ function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
   );
 }
 
-function UserSettings({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
+function UserSettings({ toast, profile }: { toast: (s: string, k?: Toast['kind']) => void; profile: AccessProfile }) {
   const { t, language } = useI18n();
-  const [form, setForm] = useState<any>({ default_visibility: 'public', default_expire_days: 0, default_max_views: 0, default_format: 'markdown', default_endpoint: BASE_URL, default_slug_mode: 'random' });
-  useEffect(() => { api<{ item: any }>('/api/settings/cli').then((r) => r.item && setForm(r.item)).catch((e) => toast(e.message, 'error')); }, []);
+  const permissions = profile.permissions;
+  const [form, setForm] = useState<any>(() => ({ default_visibility: normalizeVisibility('public', permissions.can_public_publish), default_expire_days: 0, default_max_views: 0, default_format: 'markdown', default_endpoint: BASE_URL, default_slug_mode: 'random' }));
+  useEffect(() => {
+    if (!permissions.can_api) return;
+    api<{ item: any }>('/api/settings/cli')
+      .then((r) => r.item && setForm({ ...r.item, default_visibility: normalizeVisibility(r.item.default_visibility, permissions.can_public_publish) }))
+      .catch((e) => toast(e.message, 'error'));
+  }, [permissions.can_api, permissions.can_public_publish]);
+  useEffect(() => {
+    setForm((current: any) => {
+      const default_visibility = normalizeVisibility(current.default_visibility, permissions.can_public_publish);
+      return default_visibility === current.default_visibility ? current : { ...current, default_visibility };
+    });
+  }, [permissions.can_public_publish]);
   async function save() {
     try {
-      await api('/api/settings/cli', { method: 'PATCH', body: JSON.stringify(form) });
+      const default_visibility = normalizeVisibility(form.default_visibility, permissions.can_public_publish);
+      await api('/api/settings/cli', { method: 'PATCH', body: JSON.stringify({ ...form, default_visibility }) });
       toast(language === 'en-US' ? 'User settings saved' : '用户设置已保存');
     } catch (err) {
       toast((err as Error).message, 'error');
@@ -1120,6 +1159,16 @@ function UserSettings({ toast, permissions }: { toast: (s: string, k?: Toast['ki
   -H "Authorization: Bearer YOUR_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{"title":"note","content":"# hello","format":"${form.default_format}","visibility":"${form.default_visibility}","max_views":${form.default_max_views}}'`;
+  if (!permissions.can_api) {
+    return <section className="panel">
+      <div className="panel-head"><h2>{t('nav.settings')}</h2></div>
+      <p className="muted">{t('settings.apiDisabled')}</p>
+      <div className="settings-grid">
+        <div><span>{t('admin.permissionGroup')}</span><strong>{profile.group}</strong></div>
+        <div><span>{t('admin.usedStorage')}</span><strong>{fmtBytes(profile.storage.used_bytes)} / {fmtBytes(profile.storage.quota_bytes)}</strong></div>
+      </div>
+    </section>;
+  }
   return (
     <section className="panel">
       <div className="options-grid">
@@ -1455,7 +1504,8 @@ function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind'])
   }
   async function save() {
     if (!draft || !draft.name.trim()) return toast(language === 'en-US' ? 'Group name is required' : '请输入权限组名称', 'error');
-    const quota = Math.max(0, Number(draft.quota_gib) || 0) * 1024 ** 3;
+    const quota = quotaGiBToBytes(draft.quota_gib);
+    if (quota === null) return toast(t('admin.invalidQuota'), 'error');
     const body = { name: draft.name.trim(), is_default: Boolean(draft.is_default), can_public_publish: Boolean(draft.can_public_publish), can_api: Boolean(draft.can_api), can_internal_access: Boolean(draft.can_internal_access), can_upload: Boolean(draft.can_upload), can_comment: Boolean(draft.can_comment), quota_bytes: quota };
     try {
       await api(draft.id ? `/api/admin/permission-groups/${encodeURIComponent(draft.id)}` : '/api/admin/permission-groups', { method: draft.id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
@@ -1570,7 +1620,11 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
                 {expanded[index] ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
               </button>
               {columns.map((key) => <span key={key}><AdminCell keyName={key} value={key === 'key_prefix' ? `${row.key_prefix || '-'}...${row.key_suffix || ''}` : row[key]} /></span>)}
-              {showAction && <span className="admin-key-actions"><button className="icon" onClick={() => void keyAction(row, 'rotate')} aria-label={t('admin.rotateKey')} title={t('admin.rotateKey')}><RotateCw size={15} /></button>{row.locked_at ? <button className="icon" onClick={() => void keyAction(row, 'unlock')} aria-label={t('admin.unlockKey')} title={t('admin.unlockKey')}><Unlock size={15} /></button> : <button className="icon" onClick={() => void keyAction(row, 'lock')} aria-label={t('admin.lockKey')} title={t('admin.lockKey')}><Lock size={15} /></button>}<button className="icon danger" onClick={() => void keyAction(row, 'revoke')} aria-label={t('admin.revokeKey')} title={t('admin.revokeKey')}><Trash2 size={15} /></button></span>}
+              {showAction && <span className="admin-key-actions">{adminKeyActions(Boolean(row.locked_at)).map((action) => {
+                const Icon = action === 'rotate' ? RotateCw : action === 'lock' ? Lock : action === 'unlock' ? Unlock : Trash2;
+                const labelKey = action === 'rotate' ? 'admin.rotateKey' : action === 'lock' ? 'admin.lockKey' : action === 'unlock' ? 'admin.unlockKey' : 'admin.revokeKey';
+                return <button type="button" className={`icon${action === 'revoke' ? ' danger' : ''}`} key={action} onClick={() => void keyAction(row, action)} aria-label={t(labelKey)} title={t(labelKey)}><Icon size={15} /></button>;
+              })}</span>}
             </div>
             {expanded[index] && (
               <div className="admin-detail">
@@ -2471,7 +2525,7 @@ function App() {
           {page === 'face' && <FaceTransfer toast={push} />}
           {page === 'mine' && <MyContents toast={push} permissions={permissions} />}
           {page === 'keys' && <ApiKeys toast={push} />}
-          {page === 'settings' && <UserSettings toast={push} permissions={permissions} />}
+          {page === 'settings' && <UserSettings toast={push} profile={profile} />}
           {page === 'admin' && user.role === 'admin' && <AdminPanel toast={push} permissions={permissions} />}
         </div>
       </main>

@@ -20,3 +20,32 @@ export const permissionKeys = [
 ] as const;
 
 export type AdminPermissionKey = typeof permissionKeys[number];
+
+export type AdminVisibility = 'public' | 'internal' | 'private';
+const allVisibilityOptions: AdminVisibility[] = ['public', 'internal', 'private'];
+
+export function allowedVisibilityOptions(canPublic?: boolean): AdminVisibility[] {
+  return canPublic === false ? ['internal', 'private'] : allVisibilityOptions;
+}
+
+export function normalizeVisibility(value: unknown, canPublic?: boolean): AdminVisibility {
+  const options = allowedVisibilityOptions(canPublic);
+  return options.includes(value as AdminVisibility) ? value as AdminVisibility : options[options.length - 1];
+}
+
+const GIB = 1024 ** 3;
+
+export function quotaGiBToBytes(value: unknown): number | null {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  const gib = Number(text);
+  if (!Number.isFinite(gib) || gib < 0) return null;
+  const bytes = Math.floor(gib * GIB);
+  return Number.isSafeInteger(bytes) ? bytes : null;
+}
+
+export type AdminKeyAction = 'rotate' | 'lock' | 'unlock' | 'revoke';
+
+export function adminKeyActions(locked: boolean): AdminKeyAction[] {
+  return locked ? ['rotate', 'unlock', 'revoke'] : ['rotate', 'lock', 'revoke'];
+}

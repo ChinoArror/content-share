@@ -19,6 +19,8 @@ describe('i18n', () => {
   it('translates and interpolates messages', () => {
     expect(translate('en-US', 'nav.publishText')).toBe('Publish text');
     expect(translate('zh-CN', 'nav.publishText')).toBe('发布文本');
+    expect(translate('en-US', 'admin.permissionGroup')).toBe('Permission group');
+    expect(translate('zh-CN', 'admin.permissionGroup')).toBe('权限组');
     expect(translate('en-US', 'upload.remaining', { count: 3 })).toBe('3 files remaining');
     expect(translate('en-US', 'missing.key')).toBe('missing.key');
   });

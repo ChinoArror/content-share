@@ -275,7 +275,8 @@ code, .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .expand-btn { width: 36px; min-height: 36px; padding: 0; border-radius: 8px; }
 .compact-btn { min-height: 36px; padding: 0 10px; white-space: nowrap; }
 .admin-key-actions { display: inline-flex; align-items: center; justify-content: flex-start; gap: 4px; min-width: 0; }
-.admin-key-actions .icon, .copy-value-btn { width: 34px; min-height: 34px; }
+.admin-key-actions .icon { width: 36px; min-height: 36px; }
+.copy-value-btn { width: 34px; min-height: 34px; }
 .admin-audit-value { min-width: 0; display: inline-flex; align-items: center; gap: 4px; max-width: 100%; }
 .admin-audit-value > span, .admin-audit-value > code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .admin-audit-value .copy-value-btn { flex: 0 0 34px; }
@@ -564,7 +565,7 @@ iframe.received-preview { object-fit: initial; }
   .admin-tools { grid-template-columns: minmax(0, 1fr) auto auto; }
   .admin-row { grid-template-columns: 42px repeat(4, minmax(0, 1fr)); }
   .admin-row.no-action { grid-template-columns: 42px repeat(4, minmax(0, 1fr)); }
-  .admin-row span:nth-of-type(n+5), .admin-row.admin-head strong:nth-of-type(n+5) { display: none; }
+  .admin-row span:not(.admin-key-actions):nth-of-type(n+5), .admin-row.admin-head strong:nth-of-type(n+5) { display: none; }
   .admin-detail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .landing-hero, .background-grid { grid-template-columns: 1fr; }
   .landing-console { justify-self: stretch; }
@@ -621,7 +622,7 @@ iframe.received-preview { object-fit: initial; }
   .admin-tools > button svg { flex: 0 0 auto; }
   .admin-row { grid-template-columns: 38px minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 1fr); gap: 8px; padding: 0 8px; }
   .admin-row.no-action { grid-template-columns: 38px minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 1fr); }
-  .admin-row span:nth-of-type(n+4), .admin-row.admin-head strong:nth-of-type(n+4), .admin-row .compact-btn { display: none; }
+  .admin-row span:not(.admin-key-actions):nth-of-type(n+4), .admin-row.admin-head strong:nth-of-type(n+4), .admin-row .compact-btn { display: none; }
   .admin-detail { grid-template-columns: 1fr; }
   .upload-float { right: 14px; bottom: 14px; }
   .attachment-head { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px; width: 100%; }
