@@ -6,19 +6,30 @@
   "scripts": {
     "dev": "wrangler dev",
     "build": "vite build",
+    "test": "vitest run",
+    "test:fountain": "node scripts/fountain-self-check.mjs",
     "deploy": "npm run build && npx wrangler deploy",
-    "db:apply": "npx wrangler d1 execute content-share-db --remote --file=./schema.sql",
-    "queue:create": "npx wrangler queues create content-share-upload-queue"
+    "db:apply": "npx wrangler d1 migrations apply content-share-db --remote",
+    "db:migrate": "npx wrangler d1 migrations apply content-share-db --remote",
+    "queue:create": "npx wrangler queues create content-share-upload-queue",
+    "queue:dlq:create": "npx wrangler queues create content-share-upload-dlq",
+    "r2:cors": "npx wrangler r2 bucket cors set content-share-save --file=./r2-cors.json",
+    "r2:local-uploads": "npx wrangler r2 bucket local-uploads enable content-share-save",
+    "r2:notify": "npx wrangler r2 bucket notification create content-share-save --event-type object-create --queue content-share-upload-queue --prefix attachments/",
+    "r2:lifecycle": "npx wrangler r2 bucket lifecycle add content-share-save abort-incomplete-direct-uploads attachments --abort-multipart-days 1 --force",
+    "r2:staging-lifecycle": "npx wrangler r2 bucket lifecycle add content-share-save expire-abandoned-single-uploads upload-staging --expire-days 1 --force"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^4.5.0",
+    "@raptorqr/core": "^0.1.1",
+    "aws4fetch": "^1.0.20",
+    "dompurify": "^3.4.13",
+    "fflate": "^0.8.3",
     "lucide-react": "^0.468.0",
     "marked": "^13.0.3",
-    "pdfjs-dist": "^6.0.227",
+    "pdfjs-dist": "^6.2.108",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "vite": "^5.4.19"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260515.0",
@@ -26,7 +37,10 @@
     "@types/qrcode": "^1.5.5",
     "@types/react": "^18.3.23",
     "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
     "typescript": "^5.8.3",
+    "vite": "^5.4.21",
+    "vitest": "^4.1.10",
     "wrangler": "^4.18.0"
   }
 }

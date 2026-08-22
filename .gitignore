@@ -3,17 +3,25 @@
 node_modules/
 dist/
 .wrangler/
+.playwright-cli/
 .vite/
 .cache/
 coverage/
+worker-configuration.d.ts
 
 output/
+output-*
 *.png
 *.jpg
 *.jpeg
 *.webp
 *.gif
 *.log
+# Keep shipped UI assets while ignoring generated screenshots/output above.
+!src/assets/
+!src/assets/*.png
+headers-preview*.txt
+preview*.bin
 
 .env
 .env.*

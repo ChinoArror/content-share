@@ -1,264 +1,202 @@
-# ShareWorker / content-share
+[中文说明](./readme_zh.md) | Language: English
 
-Cloudflare Workers 上运行的内容发布与分享 WebApp。前端 SPA 由 Workers Assets 提供，后端 API、权限判断、R2 文件读写、D1 结构化数据和 Queue 上传收尾都在同一个 Worker 中完成。
+# Content Share
 
-生产域名：`https://content.aryuki.com`
+Content Share is a Cloudflare Workers based content publishing and file sharing app for `content.aryuki.com`. The frontend is served by Workers Assets, the backend runs in the same Worker, structured data is stored in Cloudflare D1, files are stored only in Cloudflare R2, and upload activation is coordinated through Cloudflare Queues.
 
-## 架构
+## Features
 
-- Worker 名称：`content-share`
-- 前端：React + Vite，构建后由 Cloudflare Workers Assets 托管
-- 后端：Cloudflare Worker 原生 Fetch handler
-- 登录：auth-center SSO，仅网页端 JWT 可访问网页/API 管理接口
-- 用户识别：auth-center JWT 中的 `username`，后端结合 `role` / `ADMIN_USERNAMES` 判断 admin
-- 数据库：Cloudflare D1，绑定 `DB`
-- 文件存储：Cloudflare R2，绑定 `BUCKET`，bucket `content-share-save`
-- 上传队列：Cloudflare Queues，绑定 `UPLOAD_QUEUE`，queue `content-share-upload-queue`
+- Auth-center SSO only. The Worker verifies auth-center JWTs and identifies users by `username`.
+- Role handling is enforced in the Worker. `ADMIN_USERNAMES` and JWT role decide admin access.
+- Content types: text, file, and mixed text plus attachments.
+- Text formats: plain text and Markdown with a toolbar and live preview.
+- Visibility: `public`, `internal`, and `private`.
+- Access controls: optional password, optional expiry time, optional max views, soft delete, forced expiry, and admin preview without normal view increments.
+- Public share pages can be viewed without login. Internal/private content still requires Worker-side permission checks.
+- Online preview for common file types: images, audio, video, text, PDF through PDF.js, Office documents through Office web embedding when public, and direct HTML pages in a sandboxed iframe with source-code and fullscreen controls.
+- ZIP archives remain download-first. On the preview page, viewers can explicitly try to open an archive's `index.html` or another HTML entry; archive-relative assets are temporarily mapped to Blob URLs and archives without a usable page show a clear download message.
+- Browser uploads use short-lived, object-scoped R2 URLs: files through 16 MiB use one PUT, larger files use resumable 8 MiB multipart uploads with IndexedDB queue persistence and real byte progress.
+- Resumable uploads use a SHA-256 file identity fingerprint made from metadata plus the first and last 1 MiB. The Worker resumes only an owner-scoped matching unfinished session, refreshes `last_activity_at` with progress heartbeats, and cleans multipart/staging remnants after 30 minutes without activity.
+- Preview remains behind Worker permission and Range checks. New direct-upload attachments download through a 60-second read-only R2 URL after Worker authorization; legacy objects safely fall back to Worker streaming.
+- Comments for public/internal content. Logged-in viewers can comment and choose public/private visibility. The publisher can delete any comment after confirmation.
+- Private content uses a publisher-only memo panel.
+- API Keys are for CLI upload endpoints only, never web login or admin access.
+- Full API reference is published at [`https://content.aryuki.com/docs`](https://content.aryuki.com/docs) and is rendered from `ApiDocs.md`.
+- User avatar comes from auth-center `avatar_url` when available, with a local default fallback.
+- Responsive desktop/mobile UI, collapsible mobile sidebar, click-outside close for menus, and a configurable landing-page background stored under `background/` in R2.
+- The fixed UI supports Chinese and English switching from the top-right control. The selection is stored in browser `localStorage`; content titles, filenames, and user-authored text are not translated.
+- Face-to-face file transfer at `/face-transfer`: the sender creates locally shuffled RaptorQ Fountain Code QR loops with adjustable frame timing, while the receiver scans, reconstructs, previews, and saves the file locally without uploading it to the Worker or R2.
 
-## 初始化与部署
+## Cloudflare Resources
 
-先创建 Queue，再应用 D1 表结构，最后构建并部署：
+Required bindings in `wrangler.toml`:
+
+- Worker name: `content-share`
+- Custom domain: `content.aryuki.com`
+- D1 database binding: `DB`
+- R2 bucket binding: `BUCKET`
+- Queue producer/consumer binding: `UPLOAD_QUEUE`
+- Workers Assets binding: `ASSETS`
+
+Important environment variables:
+
+- `SSO_URL=https://accounts.aryuki.com`
+- `SSO_APP_ID=content-share`
+- `PUBLIC_BASE_URL=https://content.aryuki.com`
+- `ADMIN_USERNAMES=admin`
+- `R2_ACCOUNT_ID=...`
+- `R2_BUCKET_NAME=content-share-save`
+
+The following values must be Worker Secrets, never plaintext variables or committed files:
+
+- `MEDIA_TICKET_SECRET`
+- `R2_UPLOAD_ACCESS_KEY_ID`
+- `R2_UPLOAD_SECRET_ACCESS_KEY`
+- `R2_DOWNLOAD_ACCESS_KEY_ID`
+- `R2_DOWNLOAD_SECRET_ACCESS_KEY`
+
+For the R2 S3 credentials, open R2 Overview > Manage API Tokens and create bucket-scoped R2 credentials for `content-share-save`. The recommended production setup uses an R2 Account API token with Object Read & Write for upload signing and a separate R2 Account API token with Object Read for download signing. Copy the generated **Access Key ID** and **Secret Access Key** fields, not the generic Cloudflare API token, Account ID, or token ID. The Access Key ID must be the R2 S3 key accepted by the endpoint (32 alphanumeric characters). Never put these values in `wrangler.toml`, the frontend, or Git.
+
+## Database
+
+Apply the D1 migration baseline before the first deploy and rerun it for later upgrades:
+
+```bash
+npm run db:apply
+```
+
+`db:apply` and `db:migrate` are aliases for the same migration command. `schema.sql` is a readable snapshot; production setup is tracked only through `migrations/`.
+
+The schema includes:
+
+- `users`
+- `contents`
+- `attachments`
+- `access_logs`
+- `api_keys`
+- `api_key_usage_logs`
+- `user_cli_settings`
+- `admin_actions`
+- `system_settings`
+- `content_notes`
+- `upload_sessions`
+- `upload_parts`
+
+## Deploy
+
+Recommended order:
 
 ```bash
 npm install
-npx wrangler queues create content-share-upload-queue
-npx wrangler d1 execute content-share-db --remote --file=./schema.sql
+npm run queue:create
+npm run queue:dlq:create
+npm run db:migrate
+npm run r2:cors
+npm run r2:local-uploads
+npm run r2:lifecycle
+npm run r2:staging-lifecycle
+npm run r2:notify
 npm run build
 npx wrangler deploy
 ```
 
-`wrangler.toml` 已配置自定义域：
+The R2 setup commands require an account session or API token with R2 write permission. Create separate bucket-scoped Object Read/Write credentials for upload signing and Object Read credentials for download signing, then enter them with interactive `wrangler secret put` commands. Never pass secret values on the command line.
 
-```toml
-routes = [
-  { pattern = "content.aryuki.com", custom_domain = true }
-]
+```bash
+npx wrangler secret put R2_UPLOAD_ACCESS_KEY_ID
+npx wrangler secret put R2_UPLOAD_SECRET_ACCESS_KEY
+npx wrangler secret put R2_DOWNLOAD_ACCESS_KEY_ID
+npx wrangler secret put R2_DOWNLOAD_SECRET_ACCESS_KEY
 ```
 
-## auth-center SSO
+Useful checks:
 
-登录入口使用：
-
-```text
-https://accounts.aryuki.com/?client_id=content-share&redirect=https%3A%2F%2Fcontent.aryuki.com%2Fsso-callback
+```bash
+npx tsc --noEmit
+npm run build
 ```
 
-后端不会用 App Secret 本地验签，而是调用：
+## CLI Upload
 
-```text
-GET https://accounts.aryuki.com/api/verify?app_id=content-share
-Authorization: Bearer <JWT>
-```
-
-网页端所有受保护 API 都要求 auth-center JWT。API Key 只允许访问 `/api/cli/*`，不能登录网页端，不能访问用户/API/Admin 管理接口。
-
-## 核心 API
-
-网页端：
-
-- `POST /api/sso-callback`
-- `GET /api/me`
-- `GET /api/contents`
-- `POST /api/contents/text`
-- `POST /api/contents/upload`
-- `GET /api/contents/:id`
-- `PATCH /api/contents/:id`
-- `POST /api/contents/:id/delete`
-- `POST /api/contents/:id/expire`
-- `POST /api/contents/:id/restore`
-- `GET /api/share/:slug`
-- `GET /api/attachments/:id/download`
-
-API Key：
-
-- `GET /api/api-keys`
-- `POST /api/api-keys`
-- `POST /api/api-keys/:id/rotate`
-- `POST /api/api-keys/:id/revoke`
-
-CLI 上传：
-
-- `POST /api/cli/upload-text`
-- `POST /api/cli/upload-file`
-- `POST /api/cli/upload-mixed`
-
-Admin：
-
-- `GET /api/admin/dashboard`
-- `GET /api/admin/contents`
-- `GET /api/admin/contents/:id`
-- `PATCH /api/admin/contents/:id`
-- `POST /api/admin/contents/:id/delete`
-- `DELETE /api/admin/contents/:id/permanent`
-- `POST /api/admin/contents/:id/expire`
-- `POST /api/admin/contents/:id/restore`
-- `GET /api/admin/users`
-- `GET /api/admin/access-logs`
-- `GET /api/admin/api-keys`
-- `GET /api/admin/settings`
-
-## CLI 上传示例
-
-认证方式统一为：
+API Key authentication uses:
 
 ```text
 Authorization: Bearer <API_KEY>
 ```
 
-### curl 上传 Markdown 文本
+API Keys may call only:
+
+- `POST /api/cli/upload-text`
+- `POST /api/cli/upload-file`
+- `POST /api/cli/upload-mixed`
+- `POST /api/cli/uploads/initiate`
+- `POST /api/cli/uploads/:session_id/heartbeat`
+- `GET|POST|DELETE /api/cli/uploads/:session_id/...`
+
+The legacy endpoints are the simplest CLI integration. For large files or clients that must resume after interruption, use the accelerated upload-session API documented in [ApiDocs.md](./ApiDocs.md): files up to 16 MiB use one signed PUT, larger files use resumable 8 MiB R2 multipart parts, and Queue validates the upload before activation. Include a lowercase 64-character SHA-256 `fingerprint` for each file to enable strong resume matching; the browser client derives it from metadata plus the first and last 1 MiB. A matching session is reusable for 30 minutes after its last progress or heartbeat, and the Worker’s scheduled cleanup removes only sessions inactive for longer than 30 minutes. The signed upload URL lasts 5 minutes; a completed download may use a read-only R2 URL lasting 60 seconds.
+
+File MIME type is optional. When a client does not send a useful MIME type, the Worker detects it from the filename extension. Unknown extensions are stored safely and the share page asks the viewer to download. The legacy CLI endpoints accept up to 20 files per request and limit each file to 100 MiB; unfinished direct sessions are limited to 50 sessions and 500 MiB per user.
+
+### curl: upload text
 
 ```bash
 curl -X POST "https://content.aryuki.com/api/cli/upload-text" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "title": "My Note",
-    "content": "# Hello\n\nThis is a markdown note.",
+    "title": "note title",
+    "content": "# hello",
     "format": "markdown",
     "visibility": "public",
-    "slug": "my-note",
+    "slug": "",
     "password": "",
     "expire_at": null,
     "max_views": 0,
-    "remark": "uploaded from cli"
+    "remark": "from cli"
   }'
 ```
 
-### curl 上传文件
-
-```bash
-curl -X POST "https://content.aryuki.com/api/cli/upload-file" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -F "file=@./report.pdf" \
-  -F "title=Report" \
-  -F "visibility=private" \
-  -F "max_views=0"
-```
-
-### curl 上传文字 + 附件
-
-```bash
-curl -X POST "https://content.aryuki.com/api/cli/upload-mixed" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -F "content=# Report
-See attachment." \
-  -F "format=markdown" \
-  -F "file=@./report.pdf" \
-  -F "title=Report with Attachment" \
-  -F "visibility=public" \
-  -F "expire_at=2026-12-31T23:59:59Z" \
-  -F "max_views=0" \
-  -F "remark=uploaded from cli"
-```
-
-### PowerShell 上传文本
-
-```powershell
-$headers = @{
-  Authorization = "Bearer YOUR_API_KEY"
-}
-
-$body = @{
-  title = "PowerShell Note"
-  content = "# Hello from PowerShell"
-  format = "markdown"
-  visibility = "public"
-  expire_at = $null
-  max_views = 0
-  remark = "uploaded from powershell"
-} | ConvertTo-Json
-
-Invoke-RestMethod `
-  -Uri "https://content.aryuki.com/api/cli/upload-text" `
-  -Method Post `
-  -Headers $headers `
-  -ContentType "application/json" `
-  -Body $body
-```
-
-### PowerShell 上传文件
+### PowerShell: upload file
 
 ```powershell
 $headers = @{ Authorization = "Bearer YOUR_API_KEY" }
 $form = @{
   file = Get-Item ".\report.pdf"
-  title = "Report"
+  title = "report"
   visibility = "public"
   max_views = "0"
 }
-
-Invoke-RestMethod `
+Invoke-RestMethod -Method Post `
   -Uri "https://content.aryuki.com/api/cli/upload-file" `
-  -Method Post `
   -Headers $headers `
   -Form $form
 ```
 
-### Node.js 上传文本
-
-```js
-const res = await fetch("https://content.aryuki.com/api/cli/upload-text", {
-  method: "POST",
-  headers: {
-    "Authorization": "Bearer YOUR_API_KEY",
-    "Content-Type": "application/json"
-  },
-  body: JSON.stringify({
-    title: "Node Note",
-    content: "# Hello from Node.js",
-    format: "markdown",
-    visibility: "public",
-    expire_at: null,
-    max_views: 0,
-    remark: "uploaded from node"
-  })
-});
-
-console.log(await res.json());
-```
-
-### Node.js 上传文件
+### Node.js: upload mixed content
 
 ```js
 import { readFile } from "node:fs/promises";
 
 const form = new FormData();
-form.append("file", new Blob([await readFile("./report.pdf")]), "report.pdf");
-form.append("title", "Report");
-form.append("visibility", "public");
-form.append("max_views", "0");
+form.set("title", "mixed note");
+form.set("content", "Markdown body");
+form.set("format", "markdown");
+form.set("visibility", "public");
+form.set("max_views", "0");
+form.append("file[]", new Blob([await readFile("./image.png")]), "image.png");
 
-const res = await fetch("https://content.aryuki.com/api/cli/upload-file", {
+const res = await fetch("https://content.aryuki.com/api/cli/upload-mixed", {
   method: "POST",
-  headers: { "Authorization": "Bearer YOUR_API_KEY" },
+  headers: { Authorization: "Bearer YOUR_API_KEY" },
   body: form
 });
 
 console.log(await res.json());
 ```
 
-返回格式：
+## Development Notes
 
-```json
-{
-  "ok": true,
-  "url": "https://content.aryuki.com/s/abc123",
-  "slug": "abc123",
-  "content_id": "cnt_xxx"
-}
-```
-
-参数说明：
-
-- `visibility`: `public` / `internal` / `private`
-- `expire_at`: ISO 时间字符串，`null` 或空值表示永久
-- `max_views`: `0` 表示无限制
-- `format`: `markdown` / `plain`
-
-## 本地验证
-
-```bash
-npm run build
-npx tsc --noEmit
-npx wrangler deploy --dry-run
-```
+- Do not add S3, WebDAV, mount management, mount explorer, or multi-storage configuration. This app stores files only in R2.
+- Do not add frontend-only permission checks. All sensitive decisions must happen in `src/worker.ts`.
+- Do not add buttons without a real API behind them.
+- Build artifacts, `.design/`, screenshots, local output, dependencies, and Wrangler cache are ignored by `.gitignore`.
