@@ -4,6 +4,7 @@ import { issueMediaTicket, verifyMediaTicket } from './media-ticket';
 import { isUploadSessionReusable, isUploadSessionStale, UPLOAD_INACTIVITY_MS } from './upload-resume';
 import { previewKind } from './preview-policy';
 import { ensureUserGroup, loadUserAccessProfile } from './worker-permissions';
+import { PERMISSION_KEYS, PolicyError, type PermissionKey, type UserAccessProfile } from './permission-policy';
 
 type Env = {
   DB: D1Database;
@@ -353,11 +354,54 @@ async function readJson<T>(req: Request): Promise<T> {
 
 class HttpError extends Error {
   status: number;
+  code?: string;
+  details?: Record<string, unknown>;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string, details?: Record<string, unknown>) {
     super(message);
     this.status = status;
+    this.code = code;
+    this.details = details;
   }
+}
+
+const PERMISSION_ERRORS: Record<PermissionKey, { code: string; message: string }> = {
+  can_public_publish: { code: 'PUBLIC_PUBLISH_PERMISSION_REQUIRED', message: 'Public publish permission required' },
+  can_api: { code: 'API_PERMISSION_REQUIRED', message: 'API permission required' },
+  can_internal_access: { code: 'INTERNAL_ACCESS_PERMISSION_REQUIRED', message: 'Internal access permission required' },
+  can_upload: { code: 'STORAGE_PERMISSION_REQUIRED', message: 'Storage permission required' },
+  can_comment: { code: 'COMMENT_PERMISSION_REQUIRED', message: 'Comment permission required' },
+};
+
+function requirePermission(profile: UserAccessProfile, permission: PermissionKey): void {
+  if (profile.permissions[permission]) return;
+  const error = PERMISSION_ERRORS[permission];
+  throw new HttpError(403, error.message, error.code);
+}
+
+function requireStorageCreation(profile: UserAccessProfile): void {
+  if (profile.quota_bytes <= 0) {
+    throw new HttpError(403, PERMISSION_ERRORS.can_upload.message, PERMISSION_ERRORS.can_upload.code);
+  }
+  requirePermission(profile, 'can_upload');
+}
+
+function requireVisibility(profile: UserAccessProfile, visibility: string): void {
+  if (visibility === 'public') requirePermission(profile, 'can_public_publish');
+  if (visibility === 'internal') requirePermission(profile, 'can_internal_access');
+}
+
+async function requireCreationAccess(env: Env, owner: string, visibility: string): Promise<UserAccessProfile> {
+  const profile = await loadUserAccessProfile(env.DB, owner);
+  requireStorageCreation(profile);
+  requireVisibility(profile, visibility);
+  return profile;
+}
+
+async function assertInternalShareAccess(env: Env, row: any, user: User | null): Promise<void> {
+  if (row.visibility !== 'internal') return;
+  if (!user) throw new HttpError(401, 'Login required', 'LOGIN_REQUIRED');
+  requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_internal_access');
 }
 
 async function verifySso(req: Request, env: Env, tokenOverride?: string): Promise<User> {
@@ -538,12 +582,15 @@ async function listContentNotes(env: Env, row: any, user: User | null): Promise<
   return noteTree(results || []);
 }
 
-async function adminAction(env: Env, admin: User, action: string, targetType: string, targetId: string, detail?: unknown): Promise<void> {
-  await env.DB.prepare(
+function adminActionStatement(env: Env, admin: User, action: string, targetType: string, targetId: string, detail?: unknown): D1PreparedStatement {
+  return env.DB.prepare(
     'INSERT INTO admin_actions (id, admin_username, action, target_type, target_id, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)'
   )
-    .bind(id('adm'), admin.username, action, targetType, targetId, detail ? JSON.stringify(detail) : null, now())
-    .run();
+    .bind(id('adm'), admin.username, action, targetType, targetId, detail ? JSON.stringify(detail) : null, now());
+}
+
+async function adminAction(env: Env, admin: User, action: string, targetType: string, targetId: string, detail?: unknown): Promise<void> {
+  await adminActionStatement(env, admin, action, targetType, targetId, detail).run();
 }
 
 async function contentWithAttachments(db: D1Database, contentId: string): Promise<any> {
@@ -592,7 +639,7 @@ async function assertShareAccess(env: Env, req: Request, row: any, user: User | 
     await logAccess(env, req, { contentId: row.id, slug: row.slug, username: user?.username, action: 'denied' });
     throw new HttpError(423, 'Password required or incorrect');
   }
-  if (row.visibility === 'internal' && !user) throw new HttpError(401, 'Login required');
+  await assertInternalShareAccess(env, row, user);
   if (row.visibility === 'private' && user?.username !== row.owner_username && !(user?.role === 'admin' && adminPreview)) {
     throw new HttpError(403, 'Private content');
   }
@@ -610,6 +657,7 @@ async function authorizeShareRequest(
     ? await verifyMediaTicket(env.MEDIA_TICKET_SECRET, ticketValue, contentTicketKey(row.id))
     : null;
   if (ticket && ticket.policyVersion === row.updated_at) {
+    await assertInternalShareAccess(env, row, user);
     const adminPreview = ticket.adminPreview;
     if (row.status === 'processing') throw new HttpError(409, 'Upload is still processing');
     if (row.status === 'deleted' && !adminPreview) throw new HttpError(410, 'Content was deleted');
@@ -624,6 +672,7 @@ async function authorizeShareRequest(
 async function createTextContent(env: Env, req: Request, owner: string, input: any, source: 'web' | 'cli'): Promise<Response> {
   const t = now();
   const visibility = ALLOWED_VISIBILITY.has(input.visibility) ? input.visibility : 'public';
+  await requireCreationAccess(env, owner, visibility);
   const format = ALLOWED_FORMAT.has(input.format) ? input.format : 'plain';
   const slug = await uniqueSlug(env.DB, input.slug);
   const contentId = id('cnt');
@@ -679,6 +728,7 @@ async function createUploadContent(env: Env, req: Request, owner: string, form: 
   const type = mixed || contentText ? 'mixed' : 'file';
   const visibilityRaw = textField(form.get('visibility'));
   const visibility = ALLOWED_VISIBILITY.has(visibilityRaw) ? visibilityRaw : 'public';
+  await requireCreationAccess(env, owner, visibility);
   const formatRaw = textField(form.get('format'));
   const format = ALLOWED_FORMAT.has(formatRaw) ? formatRaw : 'plain';
   const slug = await uniqueSlug(env.DB, textField(form.get('slug')));
@@ -757,7 +807,6 @@ async function directUploadPlan(env: Env, session: UploadSessionRow) {
 }
 
 async function createDirectUploadContent(env: Env, req: Request, owner: string, input: any, source: 'web' | 'cli'): Promise<Response> {
-  if (!directUploadConfigured(env)) throw new HttpError(503, 'Direct R2 upload is not configured');
   const requestedFiles = Array.isArray(input.files) ? input.files as DirectUploadFile[] : [];
   if (!requestedFiles.length) throw new HttpError(400, 'At least one file is required');
   if (requestedFiles.length > 20) throw new HttpError(400, 'A maximum of 20 files can be uploaded at once');
@@ -765,6 +814,9 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
     ? requestedFiles[0].metadata
     : {};
   const settings = { ...firstFileMetadata, ...input };
+  const visibility = ALLOWED_VISIBILITY.has(settings.visibility) ? settings.visibility : 'public';
+  await requireCreationAccess(env, owner, visibility);
+  if (!directUploadConfigured(env)) throw new HttpError(503, 'Direct R2 upload is not configured');
 
   const files = await Promise.all(requestedFiles.map(async (file) => {
     const name = normalizeUploadFilename(String(file.name || ''));
@@ -813,7 +865,6 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
     throw new HttpError(429, 'Unfinished uploads exceed the 500 MiB per-user limit');
   }
   const contentText = typeof settings.content === 'string' ? settings.content.trim() : '';
-  const visibility = ALLOWED_VISIBILITY.has(settings.visibility) ? settings.visibility : 'public';
   const format = ALLOWED_FORMAT.has(settings.format) ? settings.format : 'plain';
   const slug = await uniqueSlug(env.DB, settings.slug);
   const contentId = id('cnt');
@@ -1035,13 +1086,25 @@ async function markQueueMessageFailed(env: Env, body: UploadMessage | R2EventMes
 
 async function apiKeyAuth(env: Env, req: Request): Promise<{ id: string; owner: string }> {
   const key = bearer(req);
-  if (!key) throw new HttpError(401, 'Missing API Key');
+  if (!key) throw new HttpError(401, 'Missing API Key', 'API_KEY_REQUIRED');
   const hash = await keyHash(key);
   const row = await env.DB.prepare('SELECT * FROM api_keys WHERE key_hash = ?').bind(hash).first<any>();
-  if (!row || row.status === 'revoked') throw new HttpError(401, 'Invalid API Key');
-  if (row.expire_at && Date.parse(row.expire_at) <= Date.now()) {
+  if (!row) throw new HttpError(401, 'Invalid API Key', 'INVALID_API_KEY');
+  if (row.status === 'revoked') throw new HttpError(401, 'API Key revoked', 'API_KEY_REVOKED');
+  if (row.status === 'expired' || (row.expire_at && Date.parse(row.expire_at) <= Date.now())) {
     await env.DB.prepare('UPDATE api_keys SET status = "expired" WHERE id = ?').bind(row.id).run();
-    throw new HttpError(401, 'API Key expired');
+    throw new HttpError(401, 'API Key expired', 'API_KEY_EXPIRED');
+  }
+  if (row.locked_at) {
+    throw new HttpError(403, 'API Key locked', 'API_KEY_LOCKED', { reason: row.lock_reason || null });
+  }
+  const profile = await loadUserAccessProfile(env.DB, row.owner_username);
+  if (!profile.permissions.can_api) {
+    const t = now();
+    await env.DB.prepare(
+      'UPDATE api_keys SET locked_at=?1, lock_reason="api_permission_removed", locked_by="system" WHERE id=?2 AND locked_at IS NULL AND status="active"'
+    ).bind(t, row.id).run();
+    requirePermission(profile, 'can_api');
   }
   const t = now();
   await env.DB.prepare('UPDATE api_keys SET last_used_at = ?1, usage_count = usage_count + 1 WHERE id = ?2').bind(t, row.id).run();
@@ -1053,17 +1116,33 @@ async function apiKeyAuth(env: Env, req: Request): Promise<{ id: string; owner: 
   return { id: row.id, owner: row.owner_username };
 }
 
-async function createApiKey(env: Env, user: User, input: any): Promise<Response> {
+async function newApiKey(env: Env, owner: string, input: any) {
   const rawBytes = new Uint8Array(32);
   crypto.getRandomValues(rawBytes);
   const raw = `csk_${base64Url(rawBytes)}`;
   const apiKeyId = id('key');
-  await env.DB.prepare(
+  const item = {
+    id: apiKeyId,
+    remark: input.remark || '',
+    key_prefix: raw.slice(0, 10),
+    key_suffix: raw.slice(-4),
+    status: 'active',
+    expire_at: input.expire_at || null,
+    locked_at: null,
+    lock_reason: null,
+    locked_by: null,
+  };
+  const statement = env.DB.prepare(
     'INSERT INTO api_keys (id, owner_username, remark, key_hash, key_prefix, key_suffix, status, expire_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, "active", ?7, ?8)'
   )
-    .bind(apiKeyId, user.username, nullableText(input.remark), await keyHash(raw), raw.slice(0, 10), raw.slice(-4), nullableText(input.expire_at), now())
-    .run();
-  return json({ ok: true, key: raw, item: { id: apiKeyId, remark: input.remark || '', key_prefix: raw.slice(0, 10), key_suffix: raw.slice(-4), status: 'active', expire_at: input.expire_at || null } });
+    .bind(apiKeyId, owner, nullableText(input.remark), await keyHash(raw), raw.slice(0, 10), raw.slice(-4), nullableText(input.expire_at), now());
+  return { raw, item, statement };
+}
+
+async function createApiKey(env: Env, user: User, input: any): Promise<Response> {
+  const created = await newApiKey(env, user.username, input);
+  await created.statement.run();
+  return json({ ok: true, key: created.raw, item: created.item });
 }
 
 async function permanentDelete(env: Env, contentId: string): Promise<void> {
@@ -1131,6 +1210,62 @@ async function setSystemSetting(db: D1Database, key: string, value: unknown, use
   )
     .bind(key, JSON.stringify(value), now(), user?.username || null)
     .run();
+}
+
+type PermissionGroupRow = {
+  id: string;
+  name: string;
+  is_system: number;
+  is_default: number;
+  quota_bytes: number;
+} & Record<PermissionKey, number>;
+
+function permissionGroupInput(body: any, current?: PermissionGroupRow): Omit<PermissionGroupRow, 'id' | 'is_system'> {
+  const name = body.name === undefined ? current?.name || '' : String(body.name).trim();
+  if (!name || name.length > 64) throw new HttpError(400, 'Permission group name must be 1 to 64 characters', 'INVALID_PERMISSION_GROUP');
+  for (const key of PERMISSION_KEYS) {
+    if (body[key] !== undefined && typeof body[key] !== 'boolean') {
+      throw new HttpError(400, `${key} must be a boolean`, 'INVALID_PERMISSION_GROUP');
+    }
+  }
+  if (body.is_default !== undefined && typeof body.is_default !== 'boolean') {
+    throw new HttpError(400, 'is_default must be a boolean', 'INVALID_PERMISSION_GROUP');
+  }
+  const quota = body.quota_bytes === undefined ? Number(current?.quota_bytes || 0) : Number(body.quota_bytes);
+  if (!Number.isSafeInteger(quota) || quota < 0) {
+    throw new HttpError(400, 'quota_bytes must be a non-negative safe integer', 'INVALID_PERMISSION_GROUP');
+  }
+  return {
+    name,
+    is_default: body.is_default === undefined ? Number(current?.is_default || 0) : Number(body.is_default),
+    can_public_publish: body.can_public_publish === undefined ? Number(current?.can_public_publish || 0) : Number(body.can_public_publish),
+    can_api: body.can_api === undefined ? Number(current?.can_api || 0) : Number(body.can_api),
+    can_internal_access: body.can_internal_access === undefined ? Number(current?.can_internal_access || 0) : Number(body.can_internal_access),
+    can_upload: body.can_upload === undefined ? Number(current?.can_upload || 0) : Number(body.can_upload),
+    quota_bytes: quota,
+    can_comment: body.can_comment === undefined ? Number(current?.can_comment || 0) : Number(body.can_comment),
+  };
+}
+
+function publicPermissionGroup(row: PermissionGroupRow | (Omit<PermissionGroupRow, 'id' | 'is_system'> & { id: string; is_system: number })) {
+  return {
+    ...row,
+    is_system: Boolean(row.is_system),
+    is_default: Boolean(row.is_default),
+    ...Object.fromEntries(PERMISSION_KEYS.map((key) => [key, Boolean(row[key])])),
+  };
+}
+
+function lockUserApiKeysStatement(env: Env, username: string, actor: string, reason: string, timestamp: string): D1PreparedStatement {
+  return env.DB.prepare(
+    'UPDATE api_keys SET locked_at=?1, lock_reason=?2, locked_by=?3 WHERE owner_username=?4 AND status="active" AND locked_at IS NULL'
+  ).bind(timestamp, reason, actor, username);
+}
+
+function lockGroupApiKeysStatement(env: Env, groupId: string, actor: string, reason: string, timestamp: string): D1PreparedStatement {
+  return env.DB.prepare(
+    'UPDATE api_keys SET locked_at=?1, lock_reason=?2, locked_by=?3 WHERE status="active" AND locked_at IS NULL AND owner_username IN (SELECT username FROM users WHERE permission_group_id=?4)'
+  ).bind(timestamp, reason, actor, groupId);
 }
 
 async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1320,6 +1455,8 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (!action && method === 'GET') return json({ ok: true, item: await contentWithAttachments(env.DB, contentId) });
     if (!action && method === 'PATCH') {
       const body = await readJson<any>(req);
+      if (body.visibility === 'public') requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_public_publish');
+      if (body.visibility === 'internal') requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_internal_access');
       const password = typeof body.password === 'string' && body.password ? await hashWithSalt(body.password) : { hash: row.password_hash, salt: row.password_salt };
       await env.DB.prepare(
         'UPDATE contents SET title=?1, remark=?2, visibility=?3, expire_at=?4, max_views=?5, format=?6, text_content=?7, password_hash=?8, password_salt=?9, updated_at=?10 WHERE id=?11'
@@ -1396,6 +1533,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (text.length > 2000) throw new HttpError(400, 'Comment body is too long');
     const mode = row.visibility === 'private' ? 'memo' : 'comment';
     if (mode === 'memo' && user.username !== row.owner_username) throw new HttpError(403, 'Memo is only writable by the owner');
+    requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_comment');
     const visibility = mode === 'memo' ? 'private' : body.visibility === 'private' ? 'private' : 'public';
     const parentId = mode === 'comment' && typeof body.parent_id === 'string' && body.parent_id.trim() ? body.parent_id.trim() : null;
     if (parentId) {
@@ -1462,6 +1600,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     const verifiedTicket = suppliedTicket ? await verifyMediaTicket(env.MEDIA_TICKET_SECRET, suppliedTicket, att.id) : null;
     const existingTicket = verifiedTicket?.policyVersion === row.updated_at ? verifiedTicket : null;
     if (existingTicket) {
+      await assertInternalShareAccess(env, row, user);
       adminPreview = existingTicket.adminPreview;
       if (row.status === 'processing') throw new HttpError(409, 'Upload is still processing');
       if (row.status === 'deleted' && !adminPreview) throw new HttpError(410, 'Content was deleted');
@@ -1512,6 +1651,8 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     let adminPreview = false;
     let actor: string | undefined;
     if (ticket) {
+      if (row.visibility === 'internal') user = await optionalUser(req, env);
+      await assertInternalShareAccess(env, row, user);
       adminPreview = ticket.adminPreview;
       actor = ticket.actor;
       if (row.status === 'processing') throw new HttpError(409, 'Upload is still processing');
@@ -1610,21 +1751,26 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (path === '/api/api-keys' && method === 'GET') {
     const user = await verifySso(req, env);
+    requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_api');
     const { results } = await env.DB.prepare(
-      'SELECT id, remark, key_prefix, key_suffix, status, expire_at, last_used_at, usage_count, created_at FROM api_keys WHERE owner_username = ? ORDER BY created_at DESC'
+      'SELECT id, remark, key_prefix, key_suffix, status, expire_at, last_used_at, usage_count, created_at, locked_at, lock_reason, locked_by FROM api_keys WHERE owner_username = ? ORDER BY created_at DESC'
     )
       .bind(user.username)
       .all();
     return json({ ok: true, items: results || [] });
   }
   if (path === '/api/api-keys' && method === 'POST') {
-    return createApiKey(env, await verifySso(req, env), await readJson(req));
+    const user = await verifySso(req, env);
+    requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_api');
+    return createApiKey(env, user, await readJson(req));
   }
   const keyMatch = path.match(/^\/api\/api-keys\/([^/]+)\/(rotate|revoke)$/);
   if (keyMatch && method === 'POST') {
     const user = await verifySso(req, env);
+    requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_api');
     const row = await env.DB.prepare('SELECT * FROM api_keys WHERE id = ? AND owner_username = ?').bind(keyMatch[1], user.username).first<any>();
     if (!row) throw new HttpError(404, 'API Key not found');
+    if (row.locked_at && keyMatch[2] === 'rotate') throw new HttpError(403, 'API Key locked', 'API_KEY_LOCKED');
     await env.DB.prepare('UPDATE api_keys SET status="revoked", revoked_at=?1 WHERE id=?2').bind(now(), row.id).run();
     if (keyMatch[2] === 'rotate') return createApiKey(env, user, { remark: `${row.remark || 'rotated key'} (rotated)`, expire_at: row.expire_at });
     return json({ ok: true });
@@ -1632,12 +1778,18 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (path === '/api/settings/cli' && method === 'GET') {
     const user = await verifySso(req, env);
+    requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_api');
     const item = await env.DB.prepare('SELECT * FROM user_cli_settings WHERE username = ?').bind(user.username).first();
     return json({ ok: true, item });
   }
   if (path === '/api/settings/cli' && method === 'PATCH') {
     const user = await verifySso(req, env);
     const body = await readJson<any>(req);
+    const profile = await loadUserAccessProfile(env.DB, user.username);
+    requirePermission(profile, 'can_api');
+    if ((ALLOWED_VISIBILITY.has(body.default_visibility) ? body.default_visibility : 'public') === 'public') {
+      requirePermission(profile, 'can_public_publish');
+    }
     await env.DB.prepare(
       'INSERT INTO user_cli_settings (username, default_visibility, default_expire_days, default_max_views, default_format, default_endpoint, default_slug_mode, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ' +
         'ON CONFLICT(username) DO UPDATE SET default_visibility=excluded.default_visibility, default_expire_days=excluded.default_expire_days, default_max_views=excluded.default_max_views, default_format=excluded.default_format, default_endpoint=excluded.default_endpoint, default_slug_mode=excluded.default_slug_mode, updated_at=excluded.updated_at'
@@ -1688,6 +1840,165 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     return json({ ok: true, summary: { ...summary, ...access }, topUsers, typeDist, statusDist, trend });
   }
 
+  if (path === '/api/admin/permission-groups' && method === 'GET') {
+    const admin = await verifySso(req, env);
+    requireAdmin(admin);
+    const { results } = await env.DB.prepare('SELECT * FROM permission_groups ORDER BY is_system DESC, name ASC').all<PermissionGroupRow>();
+    return json({ ok: true, items: (results || []).map(publicPermissionGroup) });
+  }
+
+  if (path === '/api/admin/permission-groups' && method === 'POST') {
+    const admin = await verifySso(req, env);
+    requireAdmin(admin);
+    const body = await readJson<any>(req);
+    const next = permissionGroupInput(body);
+    const existing = await env.DB.prepare('SELECT id FROM permission_groups WHERE name=?1').bind(next.name).first<{ id: string }>();
+    if (existing) throw new HttpError(409, 'Permission group name already exists', 'PERMISSION_GROUP_NAME_EXISTS');
+    const groupId = id('grp');
+    const t = now();
+    const statements: D1PreparedStatement[] = [];
+    if (next.is_default) statements.push(env.DB.prepare('UPDATE permission_groups SET is_default=0, updated_at=?1 WHERE is_default=1').bind(t));
+    statements.push(
+      env.DB.prepare(
+        'INSERT INTO permission_groups (id, name, is_system, is_default, can_public_publish, can_api, can_internal_access, can_upload, quota_bytes, can_comment, created_at, updated_at) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)'
+      ).bind(groupId, next.name, next.is_default, next.can_public_publish, next.can_api, next.can_internal_access, next.can_upload, next.quota_bytes, next.can_comment, t),
+      adminActionStatement(env, admin, 'create_permission_group', 'permission_group', groupId, next),
+    );
+    await env.DB.batch(statements);
+    return json({ ok: true, item: publicPermissionGroup({ id: groupId, is_system: 0, ...next }) }, 201);
+  }
+
+  const adminPermissionGroupMatch = path.match(/^\/api\/admin\/permission-groups\/([^/]+)$/);
+  if (adminPermissionGroupMatch) {
+    const admin = await verifySso(req, env);
+    requireAdmin(admin);
+    const groupId = decodeURIComponent(adminPermissionGroupMatch[1]);
+    const current = await env.DB.prepare('SELECT * FROM permission_groups WHERE id=?1').bind(groupId).first<PermissionGroupRow>();
+    if (!current) throw new HttpError(404, 'Permission group not found', 'PERMISSION_GROUP_NOT_FOUND');
+
+    if (method === 'PATCH') {
+      const body = await readJson<any>(req);
+      if (current.is_system && body.name !== undefined && String(body.name).trim() !== current.name) {
+        throw new HttpError(409, 'System permission group names cannot be changed', 'SYSTEM_PERMISSION_GROUP_IMMUTABLE');
+      }
+      const next = permissionGroupInput(body, current);
+      if (next.name !== current.name) {
+        const duplicate = await env.DB.prepare('SELECT id FROM permission_groups WHERE name=?1 AND id<>?2').bind(next.name, groupId).first<{ id: string }>();
+        if (duplicate) throw new HttpError(409, 'Permission group name already exists', 'PERMISSION_GROUP_NAME_EXISTS');
+      }
+      if (current.is_default && body.is_default === false) {
+        throw new HttpError(409, 'A default permission group is required', 'DEFAULT_PERMISSION_GROUP_REQUIRED');
+      }
+      const t = now();
+      const statements: D1PreparedStatement[] = [];
+      if (next.is_default && !current.is_default) {
+        statements.push(env.DB.prepare('UPDATE permission_groups SET is_default=0, updated_at=?1 WHERE is_default=1 AND id<>?2').bind(t, groupId));
+      }
+      statements.push(env.DB.prepare(
+        'UPDATE permission_groups SET name=?1, is_default=?2, can_public_publish=?3, can_api=?4, can_internal_access=?5, can_upload=?6, quota_bytes=?7, can_comment=?8, updated_at=?9 WHERE id=?10'
+      ).bind(next.name, next.is_default, next.can_public_publish, next.can_api, next.can_internal_access, next.can_upload, next.quota_bytes, next.can_comment, t, groupId));
+      if (current.can_api && !next.can_api) {
+        statements.push(lockGroupApiKeysStatement(env, groupId, admin.username, 'permission_group_api_removed', t));
+      }
+      statements.push(adminActionStatement(env, admin, 'update_permission_group', 'permission_group', groupId, next));
+      await env.DB.batch(statements);
+      return json({ ok: true, item: publicPermissionGroup({ id: groupId, is_system: current.is_system, ...next }) });
+    }
+
+    if (method === 'DELETE') {
+      if (current.is_system) throw new HttpError(409, 'System permission groups cannot be deleted', 'SYSTEM_PERMISSION_GROUP_IMMUTABLE');
+      const body = await readJson<any>(req);
+      const replacementId = typeof body.replacement_group_id === 'string' ? body.replacement_group_id.trim() : '';
+      if (!replacementId || replacementId === groupId) {
+        throw new HttpError(400, 'A different replacement_group_id is required', 'REPLACEMENT_PERMISSION_GROUP_REQUIRED');
+      }
+      const replacement = await env.DB.prepare('SELECT * FROM permission_groups WHERE id=?1').bind(replacementId).first<PermissionGroupRow>();
+      if (!replacement) throw new HttpError(404, 'Replacement permission group not found', 'PERMISSION_GROUP_NOT_FOUND');
+      const t = now();
+      const statements: D1PreparedStatement[] = [];
+      if (!replacement.can_api) statements.push(lockGroupApiKeysStatement(env, groupId, admin.username, 'permission_group_reassigned_without_api', t));
+      statements.push(env.DB.prepare('UPDATE users SET permission_group_id=?1, updated_at=?2 WHERE permission_group_id=?3').bind(replacementId, t, groupId));
+      if (current.is_default) {
+        statements.push(
+          env.DB.prepare('UPDATE permission_groups SET is_default=0, updated_at=?1 WHERE id=?2').bind(t, groupId),
+          env.DB.prepare('UPDATE permission_groups SET is_default=1, updated_at=?1 WHERE id=?2').bind(t, replacementId),
+        );
+      }
+      statements.push(
+        env.DB.prepare('DELETE FROM permission_groups WHERE id=?1').bind(groupId),
+        adminActionStatement(env, admin, 'delete_permission_group', 'permission_group', groupId, { replacement_group_id: replacementId }),
+      );
+      await env.DB.batch(statements);
+      return json({ ok: true, replacement_group_id: replacementId });
+    }
+  }
+
+  const adminUserGroupMatch = path.match(/^\/api\/admin\/users\/([^/]+)\/group$/);
+  if (adminUserGroupMatch && method === 'PATCH') {
+    const admin = await verifySso(req, env);
+    requireAdmin(admin);
+    const username = decodeURIComponent(adminUserGroupMatch[1]);
+    const body = await readJson<any>(req);
+    const groupId = typeof body.group_id === 'string' ? body.group_id.trim() : '';
+    if (!groupId) throw new HttpError(400, 'group_id is required', 'PERMISSION_GROUP_REQUIRED');
+    const targetUser = await env.DB.prepare('SELECT username FROM users WHERE username=?1').bind(username).first<{ username: string }>();
+    if (!targetUser) throw new HttpError(404, 'User not found', 'USER_NOT_FOUND');
+    const group = await env.DB.prepare('SELECT * FROM permission_groups WHERE id=?1').bind(groupId).first<PermissionGroupRow>();
+    if (!group) throw new HttpError(404, 'Permission group not found', 'PERMISSION_GROUP_NOT_FOUND');
+    const t = now();
+    const statements: D1PreparedStatement[] = [
+      env.DB.prepare('UPDATE users SET permission_group_id=?1, updated_at=?2 WHERE username=?3').bind(groupId, t, username),
+    ];
+    if (!group.can_api) statements.push(lockUserApiKeysStatement(env, username, admin.username, 'user_reassigned_without_api', t));
+    statements.push(adminActionStatement(env, admin, 'assign_user_permission_group', 'user', username, { group_id: groupId }));
+    await env.DB.batch(statements);
+    return json({ ok: true, username, group: publicPermissionGroup(group) });
+  }
+
+  const adminApiKeyActionMatch = path.match(/^\/api\/admin\/api-keys\/([^/]+)\/(rotate|lock|unlock|revoke)$/);
+  if (adminApiKeyActionMatch && method === 'POST') {
+    const admin = await verifySso(req, env);
+    requireAdmin(admin);
+    const keyId = decodeURIComponent(adminApiKeyActionMatch[1]);
+    const action = adminApiKeyActionMatch[2];
+    const row = await env.DB.prepare('SELECT * FROM api_keys WHERE id=?1').bind(keyId).first<any>();
+    if (!row) throw new HttpError(404, 'API Key not found', 'API_KEY_NOT_FOUND');
+    const t = now();
+    if (row.status === 'revoked') throw new HttpError(409, 'API Key is revoked', 'API_KEY_REVOKED');
+    if (row.status === 'expired' || (row.expire_at && Date.parse(row.expire_at) <= Date.now())) {
+      throw new HttpError(409, 'API Key expired', 'API_KEY_EXPIRED');
+    }
+    if (action === 'unlock') {
+      requirePermission(await loadUserAccessProfile(env.DB, row.owner_username), 'can_api');
+      await env.DB.batch([
+        env.DB.prepare('UPDATE api_keys SET locked_at=NULL, lock_reason=NULL, locked_by=NULL WHERE id=?1 AND status="active"').bind(keyId),
+        adminActionStatement(env, admin, 'unlock_api_key', 'api_key', keyId, { owner_username: row.owner_username }),
+      ]);
+      return json({ ok: true });
+    }
+    if (action === 'rotate') {
+      const created = await newApiKey(env, row.owner_username, { remark: row.remark, expire_at: row.expire_at });
+      await env.DB.batch([
+        env.DB.prepare('UPDATE api_keys SET status="revoked", revoked_at=?1 WHERE id=?2').bind(t, keyId),
+        created.statement,
+        adminActionStatement(env, admin, 'rotate_api_key', 'api_key', keyId, { owner_username: row.owner_username, replacement_key_id: created.item.id }),
+      ]);
+      return json({ ok: true, key: created.raw, item: created.item });
+    }
+    if (action === 'lock') {
+      await env.DB.batch([
+        env.DB.prepare('UPDATE api_keys SET locked_at=COALESCE(locked_at, ?1), lock_reason=COALESCE(lock_reason, "admin_lock"), locked_by=COALESCE(locked_by, ?2) WHERE id=?3 AND status="active"').bind(t, admin.username, keyId),
+        adminActionStatement(env, admin, 'lock_api_key', 'api_key', keyId, { owner_username: row.owner_username }),
+      ]);
+      return json({ ok: true });
+    }
+    await env.DB.batch([
+      env.DB.prepare('UPDATE api_keys SET status="revoked", revoked_at=?1 WHERE id=?2').bind(t, keyId),
+      adminActionStatement(env, admin, 'revoke_api_key', 'api_key', keyId, { owner_username: row.owner_username }),
+    ]);
+    return json({ ok: true });
+  }
+
   if (path === '/api/admin/contents' && method === 'GET') {
     const admin = await verifySso(req, env);
     requireAdmin(admin);
@@ -1729,6 +2040,8 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (!action && method === 'GET') return json({ ok: true, item: await contentWithAttachments(env.DB, contentId) });
     if (!action && method === 'PATCH') {
       const body = await readJson<any>(req);
+      if (body.visibility === 'public') requirePermission(await loadUserAccessProfile(env.DB, admin.username), 'can_public_publish');
+      if (body.visibility === 'internal') requirePermission(await loadUserAccessProfile(env.DB, admin.username), 'can_internal_access');
       await env.DB.prepare('UPDATE contents SET visibility=COALESCE(?1, visibility), expire_at=?2, max_views=COALESCE(?3, max_views), updated_at=?4 WHERE id=?5')
         .bind(ALLOWED_VISIBILITY.has(body.visibility) ? body.visibility : null, body.expire_at === undefined ? null : nullableText(body.expire_at), body.max_views === undefined ? null : numberField(body.max_views), now(), contentId)
         .run();
@@ -1764,7 +2077,48 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     const admin = await verifySso(req, env);
     requireAdmin(admin);
     const { results } = await env.DB.prepare(
-      'SELECT u.username, u.role, COUNT(c.id) total_count, SUM(c.type="text") text_count, SUM(c.type="file") file_count, SUM(c.type="mixed") mixed_count, SUM(c.visibility="public") public_count, SUM(c.visibility="internal") internal_count, SUM(c.visibility="private") private_count, SUM(c.status="expired") expired_count, SUM(c.status="deleted") deleted_count, COALESCE(SUM(c.file_size),0) total_file_size, COALESCE(SUM(c.view_count),0) total_views, MAX(c.created_at) last_publish_at FROM users u LEFT JOIN contents c ON c.owner_username = u.username GROUP BY u.username, u.role ORDER BY total_count DESC'
+      `WITH content_stats AS (
+        SELECT owner_username,
+          COUNT(id) total_count,
+          SUM(type="text") text_count,
+          SUM(type="file") file_count,
+          SUM(type="mixed") mixed_count,
+          SUM(visibility="public") public_count,
+          SUM(visibility="internal") internal_count,
+          SUM(visibility="private") private_count,
+          SUM(status="expired") expired_count,
+          SUM(status="deleted") deleted_count,
+          COALESCE(SUM(file_size), 0) total_file_size,
+          COALESCE(SUM(COALESCE(file_size, 0) + COALESCE(text_size, 0)), 0) used_bytes,
+          COALESCE(SUM(view_count), 0) total_views,
+          MAX(created_at) last_publish_at
+        FROM contents
+        GROUP BY owner_username
+      )
+      SELECT u.username, u.role, u.permission_group_id,
+        p.name permission_group_name,
+        p.can_public_publish, p.can_api, p.can_internal_access, p.can_upload, p.can_comment, p.quota_bytes,
+        COALESCE(s.total_count, 0) total_count,
+        COALESCE(s.text_count, 0) text_count,
+        COALESCE(s.file_count, 0) file_count,
+        COALESCE(s.mixed_count, 0) mixed_count,
+        COALESCE(s.public_count, 0) public_count,
+        COALESCE(s.internal_count, 0) internal_count,
+        COALESCE(s.private_count, 0) private_count,
+        COALESCE(s.expired_count, 0) expired_count,
+        COALESCE(s.deleted_count, 0) deleted_count,
+        COALESCE(s.total_file_size, 0) total_file_size,
+        COALESCE(s.used_bytes, 0) used_bytes,
+        COALESCE((
+          SELECT SUM(r.bytes) FROM storage_reservations r
+          WHERE r.owner_username=u.username AND r.status="active" AND julianday(r.expires_at) > julianday("now")
+        ), 0) reserved_bytes,
+        COALESCE(s.total_views, 0) total_views,
+        s.last_publish_at
+      FROM users u
+      JOIN permission_groups p ON p.id=u.permission_group_id
+      LEFT JOIN content_stats s ON s.owner_username=u.username
+      ORDER BY total_count DESC`
     ).all();
     return json({ ok: true, items: results || [] });
   }
@@ -1777,7 +2131,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
   if (path === '/api/admin/api-keys' && method === 'GET') {
     const admin = await verifySso(req, env);
     requireAdmin(admin);
-    const { results } = await env.DB.prepare('SELECT id, owner_username, remark, key_prefix, key_suffix, status, expire_at, last_used_at, usage_count, created_at FROM api_keys ORDER BY created_at DESC LIMIT 300').all();
+    const { results } = await env.DB.prepare('SELECT id, owner_username, remark, key_prefix, key_suffix, status, expire_at, last_used_at, usage_count, created_at, locked_at, lock_reason, locked_by FROM api_keys ORDER BY created_at DESC LIMIT 300').all();
     return json({ ok: true, items: results || [] });
   }
   if (path === '/api/admin/settings' && method === 'GET') {
@@ -1874,7 +2228,17 @@ export default {
       if (url.pathname.startsWith('/api/')) return await handleApi(req, env, ctx);
       return env.ASSETS.fetch(req);
     } catch (err) {
-      if (err instanceof HttpError) return json({ ok: false, message: err.message }, err.status);
+      if (err instanceof HttpError) {
+        return json({
+          ok: false,
+          message: err.message,
+          ...(err.code ? { code: err.code } : {}),
+          ...(err.details ? { details: err.details } : {}),
+        }, err.status);
+      }
+      if (err instanceof PolicyError) {
+        return json({ ok: false, message: err.message, code: err.code, ...(Object.keys(err.details).length ? { details: err.details } : {}) }, err.status);
+      }
       const message = err instanceof Error ? err.message : 'Internal error';
       return json({ ok: false, message }, 500);
     }
