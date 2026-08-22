@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   assertUploadAllowance,
   canEnterAdminDashboard,
@@ -7,6 +9,9 @@ import {
   PolicyError,
   type UserAccessProfile,
 } from './permission-policy';
+
+const migrationSql = readFileSync(resolve(process.cwd(), 'migrations/0003_permission_groups_and_quotas.sql'), 'utf8');
+const schemaSql = readFileSync(resolve(process.cwd(), 'schema.sql'), 'utf8');
 
 function profile(overrides: Partial<UserAccessProfile> = {}): UserAccessProfile {
   return {
@@ -65,5 +70,18 @@ describe('permission policy', () => {
     expect(() => assertUploadAllowance(profile({
       permissions: { ...profile().permissions, can_upload: false },
     }), 1)).toThrowError(new PolicyError('STORAGE_PERMISSION_REQUIRED', 403));
+  });
+
+  it('protects default group assignment and system-group identity in both schemas', () => {
+    for (const sql of [migrationSql, schemaSql]) {
+      expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS users_assign_default_permission_group');
+      expect(sql).toContain('AFTER INSERT ON users');
+      expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_name');
+      expect(sql).toContain('BEFORE UPDATE OF name ON permission_groups');
+      expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_delete');
+      expect(sql).toContain('BEFORE DELETE ON permission_groups');
+      expect(sql).toContain("RAISE(ABORT, 'system permission groups cannot be changed')");
+      expect(sql).toContain('locked_by TEXT');
+    }
   });
 });

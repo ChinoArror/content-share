@@ -24,6 +24,27 @@ INSERT OR IGNORE INTO permission_groups (
   ('permission-group-user', 'user', 1, 1, 1, 1, 1, 1, 5368709120, 1, datetime('now'), datetime('now')),
   ('permission-group-admin', 'admin', 1, 0, 1, 1, 1, 1, 107374182400, 1, datetime('now'), datetime('now'));
 
+CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_name
+BEFORE UPDATE OF name ON permission_groups
+WHEN OLD.is_system = 1 AND NEW.name <> OLD.name
+BEGIN
+  SELECT RAISE(ABORT, 'system permission groups cannot be changed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_flag
+BEFORE UPDATE OF is_system ON permission_groups
+WHEN OLD.is_system = 1 AND NEW.is_system <> OLD.is_system
+BEGIN
+  SELECT RAISE(ABORT, 'system permission groups cannot be changed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_delete
+BEFORE DELETE ON permission_groups
+WHEN OLD.is_system = 1
+BEGIN
+  SELECT RAISE(ABORT, 'system permission groups cannot be changed');
+END;
+
 ALTER TABLE users ADD COLUMN permission_group_id TEXT REFERENCES permission_groups(id);
 
 UPDATE users
@@ -32,6 +53,15 @@ SET permission_group_id = CASE WHEN role = 'admin'
   ELSE 'permission-group-user'
 END
 WHERE permission_group_id IS NULL;
+
+CREATE TRIGGER IF NOT EXISTS users_assign_default_permission_group
+AFTER INSERT ON users
+WHEN NEW.permission_group_id IS NULL
+BEGIN
+  UPDATE users
+  SET permission_group_id = 'permission-group-user'
+  WHERE id = NEW.id AND permission_group_id IS NULL;
+END;
 
 CREATE INDEX IF NOT EXISTS idx_users_permission_group ON users(permission_group_id);
 
@@ -57,3 +87,4 @@ CREATE INDEX IF NOT EXISTS idx_storage_reservations_expiry
 
 ALTER TABLE api_keys ADD COLUMN locked_at TEXT;
 ALTER TABLE api_keys ADD COLUMN lock_reason TEXT;
+ALTER TABLE api_keys ADD COLUMN locked_by TEXT;

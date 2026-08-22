@@ -17,6 +17,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_permission_groups_single_default
   ON permission_groups(is_default)
   WHERE is_default = 1;
 
+CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_name
+BEFORE UPDATE OF name ON permission_groups
+WHEN OLD.is_system = 1 AND NEW.name <> OLD.name
+BEGIN
+  SELECT RAISE(ABORT, 'system permission groups cannot be changed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_flag
+BEFORE UPDATE OF is_system ON permission_groups
+WHEN OLD.is_system = 1 AND NEW.is_system <> OLD.is_system
+BEGIN
+  SELECT RAISE(ABORT, 'system permission groups cannot be changed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS permission_groups_protect_system_delete
+BEFORE DELETE ON permission_groups
+WHEN OLD.is_system = 1
+BEGIN
+  SELECT RAISE(ABORT, 'system permission groups cannot be changed');
+END;
+
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   uuid TEXT,
@@ -27,8 +48,17 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_login_at TEXT,
-  permission_group_id TEXT REFERENCES permission_groups(id)
+  permission_group_id TEXT NOT NULL DEFAULT 'permission-group-user' REFERENCES permission_groups(id)
 );
+
+CREATE TRIGGER IF NOT EXISTS users_assign_default_permission_group
+AFTER INSERT ON users
+WHEN NEW.permission_group_id IS NULL
+BEGIN
+  UPDATE users
+  SET permission_group_id = 'permission-group-user'
+  WHERE id = NEW.id AND permission_group_id IS NULL;
+END;
 
 CREATE TABLE IF NOT EXISTS contents (
   id TEXT PRIMARY KEY,
@@ -145,7 +175,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
   created_at TEXT NOT NULL,
   revoked_at TEXT,
   locked_at TEXT,
-  lock_reason TEXT
+  lock_reason TEXT,
+  locked_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS api_key_usage_logs (
