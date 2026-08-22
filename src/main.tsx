@@ -11,7 +11,7 @@ import qrBgMinimalUrl from './assets/qr-bg-minimal.png';
 import qrBgPunkUrl from './assets/qr-bg-punk.png';
 import apiDocsMarkdown from '../ApiDocs.md?raw';
 import { FaceTransfer } from './face-transfer';
-import { BrowserUploadQueue, IndexedDbUploadPersistence, type ApiRequestOptions, type UploadTask } from './upload-client';
+import { BrowserUploadQueue, createFetchApiRequest, IndexedDbUploadPersistence, UploadRequestError, type UploadTask } from './upload-client';
 import { ExpiryDatePicker } from './expiry-date-picker';
 import { mimeTypeForArchivePath, previewKind, type PreviewKind } from './preview-policy';
 import { extractZipEntries, normalizeZipEntryName, selectZipHtmlEntry } from './zip-preview';
@@ -136,16 +136,22 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, { ...init, headers });
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
-  if (!res.ok || data.ok === false) throw new Error(data.message || `HTTP ${res.status}`);
+  if (!res.ok || data.ok === false) {
+    throw new UploadRequestError(
+      res.status,
+      data.message || `HTTP ${res.status}`,
+      typeof data.code === 'string' ? data.code : undefined,
+      data.details && typeof data.details === 'object' && !Array.isArray(data.details) ? data.details : undefined
+    );
+  }
   return data as T;
 }
 
-function uploadApi<T>({ method, path, body }: ApiRequestOptions): Promise<T> {
-  return api<T>(path, {
-    method,
-    body: body === undefined ? undefined : JSON.stringify(body)
-  });
-}
+const uploadApi = createFetchApiRequest(async (input, init = {}) => {
+  const headers = new Headers(init.headers);
+  if (token()) headers.set('Authorization', `Bearer ${token()}`);
+  return fetch(input, { ...init, headers });
+});
 
 function fmtBytes(n = 0) {
   if (!n) return '0 B';
@@ -157,6 +163,26 @@ function fmtBytes(n = 0) {
     i++;
   }
   return `${value.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+function localizedError(error: unknown, t: (key: string, values?: Record<string, string | number>) => string): string {
+  if (!(error instanceof UploadRequestError) || !error.code) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  const key = `error.${error.code}`;
+  const translated = t(key);
+  const message = translated === key ? error.message : translated;
+  if (error.code !== 'STORAGE_QUOTA_EXCEEDED' || !error.details) return message;
+  const detail = (name: string) => {
+    const value = Number(error.details?.[name]);
+    return Number.isFinite(value) && value >= 0 ? fmtBytes(value) : '?';
+  };
+  return `${message}. ${t('error.storageQuotaDetails', {
+    used: detail('used_bytes'),
+    reserved: detail('reserved_bytes'),
+    requested: detail('requested_bytes'),
+    quota: detail('quota_bytes'),
+  })}`;
 }
 
 function fmtEta(seconds?: number) {
@@ -465,7 +491,7 @@ function PublishText({ toast }: { toast: (s: string, k?: Toast['kind']) => void 
       toast(language === 'en-US' ? `Created: ${res.url}` : `已创建：${res.url}`);
       setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: 'public', expire_at: '', max_views: 0 });
     } catch (err) {
-      toast((err as Error).message, 'error');
+      toast(localizedError(err, t), 'error');
     } finally {
       setBusy(false);
     }
@@ -768,7 +794,7 @@ function PublishFile({ toast, username }: { toast: (s: string, k?: Toast['kind']
     const queue = queueRef.current!;
     const oversized = incoming.filter((file) => file.size > MAX_UPLOAD_SIZE);
     if (oversized.length) {
-      toast(language === 'en-US' ? `${oversized.length} file(s) exceed the 100 MiB limit.` : `${oversized.length} 个文件超过 100 MiB 限制`, 'error');
+      toast(language === 'en-US' ? `${oversized.length} file(s) exceed the 5 GiB limit.` : `${oversized.length} 个文件超过 5 GiB 限制`, 'error');
       incoming = incoming.filter((file) => file.size <= MAX_UPLOAD_SIZE);
     }
     if (!incoming.length) return;
@@ -811,7 +837,12 @@ function PublishFile({ toast, username }: { toast: (s: string, k?: Toast['kind']
         let body: any = {};
         try { body = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch { body = {}; }
         if (xhr.status >= 200 && xhr.status < 300 && body.ok !== false) resolve(body);
-        else reject(new Error(body.message || `HTTP ${xhr.status}`));
+        else reject(new UploadRequestError(
+          xhr.status,
+          body.message || `HTTP ${xhr.status}`,
+          typeof body.code === 'string' ? body.code : undefined,
+          body.details && typeof body.details === 'object' && !Array.isArray(body.details) ? body.details : undefined
+        ));
       };
       xhr.onerror = () => reject(new Error(t('upload.failed')));
       xhr.send(fd);
@@ -837,24 +868,30 @@ function PublishFile({ toast, username }: { toast: (s: string, k?: Toast['kind']
         await queue.run();
       } catch (error) {
         if (!(error as Error).message.includes('Direct R2 upload is not configured')) throw error;
-        for (const task of added) await queue.remove(task.id);
         await legacyUpload();
+        const removals = await Promise.allSettled(added.map((task) => queue.remove(task.id)));
+        const removalFailure = removals.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (removalFailure) throw removalFailure.reason;
         toast(language === 'en-US' ? 'Direct upload credentials are unavailable; compatibility upload completed.' : '直传凭证尚未配置，已使用兼容模式完成上传');
       }
       const addedIds = new Set(added.map((task) => task.id));
       const failed = queue.getTasks().filter((task) => addedIds.has(task.id) && task.status === 'failed');
-      if (failed.length) throw new Error(failed.map((task) => `${task.name}: ${task.error || t('upload.failed')}`).join(language === 'en-US' ? '; ' : '；'));
+      if (failed.length) {
+        const first = failed[0];
+        throw new UploadRequestError(0, first.error || t('upload.failed'), first.errorCode, first.errorDetails);
+      }
       if (!progress.visible || progress.progress < 100) {
         setProgress({ visible: true, stage: language === 'en-US' ? 'Transfer complete; Queue is confirming' : '传输完成，Queue 正在确认', fileName: files[files.length - 1].name, remaining: 0, progress: 100 });
       }
+      await clearCompletedTasks();
       toast(language === 'en-US' ? 'File transfer complete; the background queue is confirming the content.' : '文件传输完成，后台正在确认内容状态');
       setFiles([]);
       setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: 'public', expire_at: '', max_views: 0, format: 'markdown' });
-      await clearCompletedTasks();
       window.setTimeout(() => void load(), 700);
     } catch (err) {
-      setProgress((prev) => ({ ...prev, visible: true, stage: (err as Error).message || t('upload.failed'), failed: true }));
-      toast((err as Error).message, 'error');
+      const message = localizedError(err, t);
+      setProgress((prev) => ({ ...prev, visible: true, stage: message || t('upload.failed'), failed: true }));
+      toast(message, 'error');
     } finally {
       setBusy(false);
     }

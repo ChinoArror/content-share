@@ -78,6 +78,50 @@ describe('worker permission store', () => {
     expect(db.sql[0]).toContain("r.status = 'active'");
   });
 
+  it('reports storage permission denial with numeric accounting after a conditional insert loses', async () => {
+    const db = recordingDb({
+      changes: 0,
+      first: (sql: string) => sql.includes('FROM users u')
+        ? {
+            username: 'alice', role: 'user', group_name: 'blocked',
+            can_public_publish: 1, can_api: 1, can_internal_access: 1, can_upload: 0, can_comment: 1,
+            quota_bytes: 1000, used_bytes: 700, reserved_bytes: 100,
+          }
+        : null,
+    });
+
+    await expect(reserveStorage(db, {
+      id: 'res_1', username: 'alice', contentId: 'cnt_1', bytes: 250, expiresAt: '2026-08-22T00:30:00.000Z',
+    })).rejects.toMatchObject({
+      code: 'STORAGE_PERMISSION_REQUIRED',
+      status: 403,
+      details: { used_bytes: 700, reserved_bytes: 100, requested_bytes: 250, quota_bytes: 1000 },
+    });
+    expect(db.sql.filter((sql) => sql.includes('p.name AS group_name'))).toHaveLength(1);
+  });
+
+  it('reports quota exhaustion with the refreshed numeric profile after a conditional insert loses', async () => {
+    const db = recordingDb({
+      changes: 0,
+      first: (sql: string) => sql.includes('FROM users u')
+        ? {
+            username: 'alice', role: 'user', group_name: 'user',
+            can_public_publish: 1, can_api: 1, can_internal_access: 1, can_upload: 1, can_comment: 1,
+            quota_bytes: 1000, used_bytes: 700, reserved_bytes: 100,
+          }
+        : null,
+    });
+
+    await expect(reserveStorage(db, {
+      id: 'res_1', username: 'alice', contentId: 'cnt_1', bytes: 250, expiresAt: '2026-08-22T00:30:00.000Z',
+    })).rejects.toMatchObject({
+      code: 'STORAGE_QUOTA_EXCEEDED',
+      status: 413,
+      details: { used_bytes: 700, reserved_bytes: 100, requested_bytes: 250, quota_bytes: 1000 },
+    });
+    expect(db.sql.filter((sql) => sql.includes('p.name AS group_name'))).toHaveLength(1);
+  });
+
   it('coalesces both nullable content byte columns in the reservation gate', async () => {
     const db = recordingDb({ changes: 1 });
 

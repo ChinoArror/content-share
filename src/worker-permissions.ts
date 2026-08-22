@@ -103,12 +103,33 @@ export async function reserveStorage(db: D1Database, input: StorageReservationIn
           (SELECT COALESCE(SUM(r.bytes), 0) FROM storage_reservations r
             WHERE r.owner_username = ?2
               AND r.status = 'active'
-              AND julianday(r.expires_at) > julianday('now')) +
+              AND julianday(r.expires_at) > julianday('now')
+              AND r.id <> ?1) +
           ?4
-    )`
+    )
+    ON CONFLICT(id) DO UPDATE SET
+      owner_username = excluded.owner_username,
+      content_id = excluded.content_id,
+      bytes = excluded.bytes,
+      status = 'active',
+      expires_at = excluded.expires_at,
+      updated_at = datetime('now'),
+      released_at = NULL
+    WHERE storage_reservations.owner_username = excluded.owner_username
+      AND storage_reservations.content_id = excluded.content_id`
   ).bind(input.id, input.username, input.contentId, input.bytes, input.expiresAt).run();
   if (!result.meta.changes) {
-    throw new PolicyError('STORAGE_QUOTA_EXCEEDED', 413, { requested_bytes: input.bytes });
+    const profile = await loadUserAccessProfile(db, input.username);
+    const details = {
+      used_bytes: profile.used_bytes,
+      reserved_bytes: profile.reserved_bytes,
+      requested_bytes: input.bytes,
+      quota_bytes: profile.quota_bytes,
+    };
+    if (!profile.permissions.can_upload || profile.quota_bytes <= 0) {
+      throw new PolicyError('STORAGE_PERMISSION_REQUIRED', 403, details);
+    }
+    throw new PolicyError('STORAGE_QUOTA_EXCEEDED', 413, details);
   }
   return input.id;
 }

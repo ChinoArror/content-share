@@ -1,9 +1,9 @@
-import { buildPartPlan, chooseUploadMode, finalizedObjectKey, isContentReadyForActivation, MAX_UPLOAD_SIZE, normalizeUploadFilename, parseByteRange, safeObjectKey, safeStagingObjectKey } from './transfer-policy';
+import { buildPartPlan, buildPartWindow, chooseUploadMode, finalizedObjectKey, isContentReadyForActivation, MAX_PARTS_PER_WINDOW, MAX_UPLOAD_SIZE, normalizeUploadFilename, parseByteRange, safeObjectKey, safeStagingObjectKey } from './transfer-policy';
 import { presignR2Request } from './r2-signer';
 import { issueMediaTicket, verifyMediaTicket } from './media-ticket';
 import { isUploadSessionReusable, isUploadSessionStale, UPLOAD_INACTIVITY_MS } from './upload-resume';
 import { previewKind } from './preview-policy';
-import { ensureUserGroup, loadUserAccessProfile } from './worker-permissions';
+import { ensureUserGroup, loadUserAccessProfile, reserveStorage } from './worker-permissions';
 import { PERMISSION_KEYS, PolicyError, type PermissionKey, type UserAccessProfile } from './permission-policy';
 
 type Env = {
@@ -101,8 +101,8 @@ const UPLOAD_SIGNATURE_TTL_SECONDS = 5 * 60;
 const DOWNLOAD_SIGNATURE_TTL_SECONDS = 60;
 const MEDIA_TICKET_TTL_SECONDS = 10 * 60;
 const UPLOAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const LEGACY_UPLOAD_LIMIT = 100 * 1024 * 1024;
 const QUEUE_MAX_ATTEMPTS = 6;
-const MAX_PENDING_UPLOAD_BYTES_PER_USER = 500 * 1024 * 1024;
 const MAX_PENDING_UPLOAD_SESSIONS_PER_USER = 50;
 const RESUMABLE_SESSION_STATUSES = '"pending","uploading","completing"';
 const CLEANUP_SESSION_STATUSES = '"pending","uploading","completing","failed"';
@@ -263,19 +263,68 @@ async function fallbackUploadFingerprint(file: Pick<DirectUploadFile, 'name' | '
   ]));
 }
 
+function textSize(value: string | null | undefined): number {
+  return utf8(value || '').byteLength;
+}
+
+function reservationIdForContent(contentId: string): string {
+  return `res_${contentId}`;
+}
+
+function reservationExpiresAt(): string {
+  return new Date(Date.now() + UPLOAD_INACTIVITY_MS).toISOString();
+}
+
+function uploadSessionExpiresAt(): string {
+  return new Date(Date.now() + UPLOAD_SESSION_TTL_MS).toISOString();
+}
+
+function assertTransferFileSize(size: number): void {
+  try {
+    buildPartPlan(size);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Invalid file size';
+    if (size > MAX_UPLOAD_SIZE) {
+      throw new HttpError(413, 'File exceeds the 5 GiB limit', 'FILE_TOO_LARGE', {
+        file_size: size,
+        max_file_bytes: MAX_UPLOAD_SIZE,
+      });
+    }
+    throw new HttpError(400, message, 'INVALID_FILE_SIZE', { file_size: size });
+  }
+}
+
+function partWindowCursor(value: unknown): number {
+  const cursor = Number(value);
+  return Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : 0;
+}
+
+function partWindowLimit(value: unknown): number {
+  const limit = Number(value);
+  return Number.isSafeInteger(limit) && limit > 0
+    ? Math.min(limit, MAX_PARTS_PER_WINDOW)
+    : MAX_PARTS_PER_WINDOW;
+}
+
 async function touchUploadSession(env: Env, sessionId: string): Promise<void> {
   const timestamp = now();
-  const expiresAt = new Date(Date.now() + UPLOAD_SESSION_TTL_MS).toISOString();
-  await env.DB.prepare(
-    `UPDATE upload_sessions SET last_activity_at=?1, updated_at=?1, expires_at=?2 WHERE id=?3 AND status IN (${RESUMABLE_SESSION_STATUSES})`
-  ).bind(timestamp, expiresAt, sessionId).run();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE upload_sessions SET last_activity_at=?1, updated_at=?1, expires_at=?2 WHERE id=?3 AND status IN (${RESUMABLE_SESSION_STATUSES})`
+    ).bind(timestamp, uploadSessionExpiresAt(), sessionId),
+    env.DB.prepare(
+      `UPDATE storage_reservations SET expires_at=?2, updated_at=?1
+       WHERE content_id=(SELECT content_id FROM upload_sessions WHERE id=?3)
+         AND status='active' AND julianday(expires_at) > julianday('now')`
+    ).bind(timestamp, reservationExpiresAt(), sessionId),
+  ]);
 }
 
 async function findReusableUploadSessions(
   env: Env,
   owner: string,
   files: Array<{ size: number; fingerprint: string }>
-): Promise<{ content: { id: string; slug: string; status: string }; sessions: UploadSessionRow[] } | null> {
+): Promise<{ content: { id: string; slug: string; status: string; text_content: string | null }; sessions: UploadSessionRow[] } | null> {
   const cutoff = new Date(Date.now() - UPLOAD_INACTIVITY_MS).toISOString();
   const candidates = await Promise.all(files.map(async (file) => {
     const session = await env.DB.prepare(
@@ -290,7 +339,7 @@ async function findReusableUploadSessions(
   if (!contentId || sessions.some((session) => session.content_id !== contentId)) return null;
   const count = await env.DB.prepare('SELECT COUNT(*) count FROM upload_sessions WHERE content_id=?1').bind(contentId).first<{ count: number }>();
   if (Number(count?.count || 0) !== files.length) return null;
-  const content = await env.DB.prepare('SELECT id, slug, status FROM contents WHERE id=?1').bind(contentId).first<{ id: string; slug: string; status: string }>();
+  const content = await env.DB.prepare('SELECT id, slug, status, text_content FROM contents WHERE id=?1').bind(contentId).first<{ id: string; slug: string; status: string; text_content: string | null }>();
   if (!content || content.status !== 'processing') return null;
   return { content, sessions };
 }
@@ -669,37 +718,154 @@ async function authorizeShareRequest(
   return { ticketAuthorized: false, adminPreview, actor: user?.username };
 }
 
+type ActiveStorageReservation = {
+  id: string;
+  bytes: number;
+  expires_at: string;
+};
+
+async function reserveContentStorage(env: Env, owner: string, contentId: string, bytes: number): Promise<string | null> {
+  return reserveStorage(env.DB, {
+    id: reservationIdForContent(contentId),
+    username: owner,
+    contentId,
+    bytes,
+    expiresAt: reservationExpiresAt(),
+  });
+}
+
+async function activeContentReservation(env: Env, owner: string, contentId: string): Promise<ActiveStorageReservation | null> {
+  return env.DB.prepare(
+    `SELECT id, bytes, expires_at FROM storage_reservations
+     WHERE owner_username=?1 AND content_id=?2 AND status='active'
+       AND julianday(expires_at) > julianday('now')
+     LIMIT 1`
+  ).bind(owner, contentId).first<ActiveStorageReservation>();
+}
+
+async function ensureReusableReservation(env: Env, owner: string, contentId: string, bytes: number): Promise<string> {
+  const current = await activeContentReservation(env, owner, contentId);
+  if (current) return current.id;
+  return (await reserveContentStorage(env, owner, contentId, bytes)) || reservationIdForContent(contentId);
+}
+
+async function ensureUploadSessionReservation(env: Env, session: UploadSessionRow): Promise<string> {
+  const current = await activeContentReservation(env, session.owner_username, session.content_id);
+  if (current) return current.id;
+  const requirement = await env.DB.prepare(
+    `SELECT
+       c.owner_username,
+       c.text_content,
+       COALESCE(SUM(s.size), 0) file_size
+     FROM contents c
+     JOIN upload_sessions s ON s.content_id=c.id
+     WHERE c.id=?1 AND c.owner_username=?2 AND c.status='processing'
+     GROUP BY c.id`
+  ).bind(session.content_id, session.owner_username).first<{ owner_username: string; text_content: string | null; file_size: number }>();
+  if (!requirement) throw new HttpError(410, 'Upload content is no longer available');
+  return (await reserveContentStorage(
+    env,
+    requirement.owner_username,
+    session.content_id,
+    textSize(requirement.text_content) + Number(requirement.file_size || 0)
+  )) || reservationIdForContent(session.content_id);
+}
+
+async function touchReusableUploadSessions(env: Env, sessions: UploadSessionRow[], reservationId: string): Promise<void> {
+  const timestamp = now();
+  const statements = sessions.map((session) => env.DB.prepare(
+    `UPDATE upload_sessions SET last_activity_at=?1, updated_at=?1, expires_at=?2
+     WHERE id=?3 AND status IN (${RESUMABLE_SESSION_STATUSES})`
+  ).bind(timestamp, uploadSessionExpiresAt(), session.id));
+  statements.push(env.DB.prepare(
+    `UPDATE storage_reservations SET expires_at=?2, updated_at=?1
+     WHERE id=?3 AND status='active'`
+  ).bind(timestamp, reservationExpiresAt(), reservationId));
+  await env.DB.batch(statements);
+}
+
+async function rollbackUploadSetup(
+  env: Env,
+  contentId: string,
+  multipartUploads: R2MultipartUpload[] = [],
+  objectKeys: string[] = []
+): Promise<void> {
+  await Promise.allSettled(multipartUploads.map((upload) => upload.abort()));
+  await Promise.allSettled([...new Set(objectKeys)].map((objectKey) => env.BUCKET.delete(objectKey)));
+  const statements = [
+    env.DB.prepare('DELETE FROM upload_parts WHERE session_id IN (SELECT id FROM upload_sessions WHERE content_id=?1)').bind(contentId),
+    env.DB.prepare('DELETE FROM upload_sessions WHERE content_id=?1').bind(contentId),
+    env.DB.prepare('DELETE FROM attachments WHERE content_id=?1').bind(contentId),
+    env.DB.prepare('DELETE FROM storage_reservations WHERE content_id=?1').bind(contentId),
+    env.DB.prepare('DELETE FROM contents WHERE id=?1').bind(contentId),
+  ];
+  for (const statement of statements) await statement.run().catch(() => undefined);
+}
+
+async function activateReservedContent(env: Env, contentId: string, finalTextSize: number, finalFileSize: number): Promise<void> {
+  const timestamp = now();
+  const totalSize = finalTextSize + finalFileSize;
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE contents SET status="active", text_size=?1, file_size=?2, updated_at=?3
+       WHERE id=?4 AND status="processing"
+         AND (?5=0 OR EXISTS (
+           SELECT 1 FROM storage_reservations r
+           WHERE r.content_id=?4 AND r.status='active' AND r.bytes=?5
+             AND julianday(r.expires_at) > julianday('now')
+         ))`
+    ).bind(finalTextSize, finalFileSize, timestamp, contentId, totalSize),
+    env.DB.prepare(
+      `UPDATE storage_reservations SET status='released', released_at=?1, updated_at=?1
+       WHERE content_id=?2 AND status='active'
+         AND (?3=0 OR (bytes=?3 AND julianday(expires_at) > julianday('now')))`
+    ).bind(timestamp, contentId, totalSize),
+  ]);
+  if (Number(results[0]?.meta.changes || 0) !== 1) {
+    throw new Error(`Storage reservation is not active for content ${contentId}`);
+  }
+}
+
 async function createTextContent(env: Env, req: Request, owner: string, input: any, source: 'web' | 'cli'): Promise<Response> {
   const t = now();
   const visibility = ALLOWED_VISIBILITY.has(input.visibility) ? input.visibility : 'public';
   await requireCreationAccess(env, owner, visibility);
   const format = ALLOWED_FORMAT.has(input.format) ? input.format : 'plain';
+  const contentText = String(input.content || '');
+  const finalTextSize = textSize(contentText);
   const slug = await uniqueSlug(env.DB, input.slug);
   const contentId = id('cnt');
   const password = await hashWithSalt(input.password);
-  await env.DB.prepare(
-    'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, password_hash, password_salt, expire_at, max_views, remark, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, "text", ?5, ?6, ?7, "active", ?8, ?9, ?10, ?11, ?12, ?13, ?13)'
-  )
-    .bind(
-      contentId,
-      owner,
-      input.title?.trim() || 'Untitled text',
-      slug,
-      format,
-      String(input.content || ''),
-      visibility,
-      password.hash,
-      password.salt,
-      nullableText(input.expire_at),
-      numberField(input.max_views),
-      nullableText(input.remark),
-      t
+  try {
+    await env.DB.prepare(
+      'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, text_size, file_size, password_hash, password_salt, expire_at, max_views, remark, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, "text", ?5, ?6, ?7, "processing", 0, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?13)'
     )
-    .run();
-  return json({ ok: true, url: `${publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
+      .bind(
+        contentId,
+        owner,
+        input.title?.trim() || 'Untitled text',
+        slug,
+        format,
+        contentText,
+        visibility,
+        password.hash,
+        password.salt,
+        nullableText(input.expire_at),
+        numberField(input.max_views),
+        nullableText(input.remark),
+        t
+      )
+      .run();
+    await reserveContentStorage(env, owner, contentId, finalTextSize);
+    await activateReservedContent(env, contentId, finalTextSize, 0);
+    return json({ ok: true, url: `${publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
+  } catch (error) {
+    await rollbackUploadSetup(env, contentId).catch(() => undefined);
+    throw error;
+  }
 }
 
-async function putAttachments(env: Env, contentId: string, owner: string, files: File[]): Promise<number> {
+async function putAttachments(env: Env, contentId: string, owner: string, files: File[], objectKeys: string[]): Promise<number> {
   let totalSize = 0;
   for (const file of files) {
     const attachmentId = id('att');
@@ -709,6 +875,7 @@ async function putAttachments(env: Env, contentId: string, owner: string, files:
       httpMetadata: { contentType },
       customMetadata: { owner, contentId, attachmentId }
     });
+    objectKeys.push(objectKey);
     totalSize += file.size;
     await env.DB.prepare(
       'INSERT INTO attachments (id, content_id, owner_username, object_key, filename, content_type, size, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, "active", ?8)'
@@ -723,7 +890,15 @@ async function createUploadContent(env: Env, req: Request, owner: string, form: 
   const files = [...form.getAll('file'), ...form.getAll('file[]')].filter((v): v is File => v instanceof File && v.size > 0);
   if (!files.length) throw new HttpError(400, 'At least one file is required');
   if (files.length > 20) throw new HttpError(400, 'A maximum of 20 files can be uploaded at once');
-  if (files.some((file) => file.size > MAX_UPLOAD_SIZE)) throw new HttpError(413, 'A file exceeds the 100 MiB limit');
+  for (const file of files) assertTransferFileSize(file.size);
+  const legacyLargeFile = files.find((file) => file.size > LEGACY_UPLOAD_LIMIT);
+  if (legacyLargeFile) {
+    throw new HttpError(413, 'Use the resumable upload API for files larger than 100 MiB', 'RESUMABLE_UPLOAD_REQUIRED', {
+      file_size: legacyLargeFile.size,
+      legacy_limit_bytes: LEGACY_UPLOAD_LIMIT,
+      max_file_bytes: MAX_UPLOAD_SIZE,
+    });
+  }
   const contentText = textField(form.get('content'));
   const type = mixed || contentText ? 'mixed' : 'file';
   const visibilityRaw = textField(form.get('visibility'));
@@ -735,33 +910,41 @@ async function createUploadContent(env: Env, req: Request, owner: string, form: 
   const contentId = id('cnt');
   const password = await hashWithSalt(textField(form.get('password')));
   const t = now();
-  await env.DB.prepare(
-    'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, password_hash, password_salt, expire_at, max_views, remark, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, "processing", ?9, ?10, ?11, ?12, ?13, ?14, ?14)'
-  )
-    .bind(
-      contentId,
-      owner,
-      textField(form.get('title')) || files[0].name,
-      slug,
-      type,
-      format,
-      contentText || null,
-      visibility,
-      password.hash,
-      password.salt,
-      nullableText(textField(form.get('expire_at'))),
-      numberField(form.get('max_views')),
-      nullableText(textField(form.get('remark'))),
-      t
+  const finalTextSize = textSize(contentText);
+  const requestedBytes = finalTextSize + files.reduce((total, file) => total + file.size, 0);
+  let objectKeys: string[] = [];
+  try {
+    await env.DB.prepare(
+      'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, text_size, file_size, password_hash, password_salt, expire_at, max_views, remark, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, "processing", 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?14)'
     )
-    .run();
-  const totalSize = await putAttachments(env, contentId, owner, files);
-  await env.DB.prepare('UPDATE contents SET file_size = ?1, updated_at = ?2 WHERE id = ?3').bind(totalSize, now(), contentId).run();
-  await env.UPLOAD_QUEUE.send({ type: 'finalize-upload', contentId, owner });
-  return json({ ok: true, queued: true, url: `${publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
+      .bind(
+        contentId,
+        owner,
+        textField(form.get('title')) || files[0].name,
+        slug,
+        type,
+        format,
+        contentText || null,
+        visibility,
+        password.hash,
+        password.salt,
+        nullableText(textField(form.get('expire_at'))),
+        numberField(form.get('max_views')),
+        nullableText(textField(form.get('remark'))),
+        t
+      )
+      .run();
+    await reserveContentStorage(env, owner, contentId, requestedBytes);
+    await putAttachments(env, contentId, owner, files, objectKeys);
+    await env.UPLOAD_QUEUE.send({ type: 'finalize-upload', contentId, owner });
+    return json({ ok: true, queued: true, url: `${publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
+  } catch (error) {
+    await rollbackUploadSetup(env, contentId, [], objectKeys).catch(() => undefined);
+    throw error;
+  }
 }
 
-async function directUploadPlan(env: Env, session: UploadSessionRow) {
+async function directUploadPlan(env: Env, session: UploadSessionRow, after = 0, limit = MAX_PARTS_PER_WINDOW) {
   const { results } = await env.DB.prepare(
     'SELECT part_number, etag, size, completed_at FROM upload_parts WHERE session_id=?1 ORDER BY part_number ASC'
   ).bind(session.id).all<UploadPartRecord>();
@@ -781,7 +964,13 @@ async function directUploadPlan(env: Env, session: UploadSessionRow) {
     };
   }
 
-  const parts = await Promise.all(buildPartPlan(session.size).map(async (part) => {
+  const window = buildPartWindow(
+    session.size,
+    new Set(completedParts.map((part) => part.part_number)),
+    partWindowCursor(after),
+    partWindowLimit(limit)
+  );
+  const parts = await Promise.all(window.parts.map(async (part) => {
     const signed = await signedUploadUrl(env, session, { partNumber: part.partNumber, uploadId: session.upload_id || '' });
     return {
       part_number: part.partNumber,
@@ -799,9 +988,11 @@ async function directUploadPlan(env: Env, session: UploadSessionRow) {
     size: session.size,
     mode: session.mode,
     upload_id: session.upload_id,
-    part_size: parts[0]?.size || session.size,
+    part_size: buildPartPlan(session.size)[0]?.size || session.size,
     parts,
     completed_parts: completedParts,
+    next_part_number: window.nextPartNumber,
+    has_more_parts: window.hasMoreParts,
     expires_at: new Date(Date.now() + UPLOAD_SIGNATURE_TTL_SECONDS * 1000).toISOString()
   };
 }
@@ -821,7 +1012,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
   const files = await Promise.all(requestedFiles.map(async (file) => {
     const name = normalizeUploadFilename(String(file.name || ''));
     const size = Number(file.size);
-    buildPartPlan(size);
+    assertTransferFileSize(size);
     const suppliedFingerprint = typeof file.fingerprint === 'string' && /^[a-f0-9]{64}$/i.test(file.fingerprint)
       ? file.fingerprint.toLowerCase()
       : await fallbackUploadFingerprint({ ...file, name, size });
@@ -833,15 +1024,19 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       fingerprint: suppliedFingerprint
     };
   }));
+  const contentText = typeof settings.content === 'string' ? settings.content.trim() : '';
+  const requestedFileBytes = files.reduce((total, file) => total + file.size, 0);
   const reusable = await findReusableUploadSessions(env, owner, files);
   if (reusable) {
-    const timestamp = now();
-    const expiresAt = new Date(Date.now() + UPLOAD_SESSION_TTL_MS).toISOString();
-    await env.DB.batch(reusable.sessions.map((session) => env.DB.prepare(
-      'UPDATE upload_sessions SET last_activity_at=?1, updated_at=?1, expires_at=?2 WHERE id=?3'
-    ).bind(timestamp, expiresAt, session.id)));
+    const reservationId = await ensureReusableReservation(
+      env,
+      owner,
+      reusable.content.id,
+      requestedFileBytes + textSize(reusable.content.text_content)
+    );
+    await touchReusableUploadSessions(env, reusable.sessions, reservationId);
     const plans = await Promise.all(reusable.sessions.map(async (session, index) => ({
-      ...(await directUploadPlan(env, session)),
+      ...(await directUploadPlan(env, session, 0, MAX_PARTS_PER_WINDOW)),
       client_id: files[index].clientId
     })));
     return json({
@@ -854,27 +1049,43 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       files: plans
     }, 200);
   }
-  const requestedBytes = files.reduce((total, file) => total + file.size, 0);
   const pending = await env.DB.prepare(
-    'SELECT COUNT(*) count, COALESCE(SUM(size), 0) bytes FROM upload_sessions WHERE owner_username=?1 AND expires_at > ?2 AND status IN ("pending","uploading","completing","failed")'
-  ).bind(owner, now()).first<{ count: number; bytes: number }>();
+    'SELECT COUNT(*) count FROM upload_sessions WHERE owner_username=?1 AND expires_at > ?2 AND status IN ("pending","uploading","completing","failed")'
+  ).bind(owner, now()).first<{ count: number }>();
   if (Number(pending?.count || 0) + files.length > MAX_PENDING_UPLOAD_SESSIONS_PER_USER) {
     throw new HttpError(429, 'Too many unfinished upload sessions');
   }
-  if (Number(pending?.bytes || 0) + requestedBytes > MAX_PENDING_UPLOAD_BYTES_PER_USER) {
-    throw new HttpError(429, 'Unfinished uploads exceed the 500 MiB per-user limit');
-  }
-  const contentText = typeof settings.content === 'string' ? settings.content.trim() : '';
   const format = ALLOWED_FORMAT.has(settings.format) ? settings.format : 'plain';
   const slug = await uniqueSlug(env.DB, settings.slug);
   const contentId = id('cnt');
   const password = await hashWithSalt(settings.password);
   const createdAt = now();
-  const expiresAt = new Date(Date.now() + UPLOAD_SESSION_TTL_MS).toISOString();
+  const expiresAt = uploadSessionExpiresAt();
   const sessions: UploadSessionRow[] = [];
   const multipartUploads: R2MultipartUpload[] = [];
+  const objectKeys: string[] = [];
 
   try {
+    await env.DB.prepare(
+      'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, text_size, file_size, password_hash, password_salt, expire_at, max_views, remark, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, "processing", 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?14)'
+    ).bind(
+      contentId,
+      owner,
+      typeof settings.title === 'string' && settings.title.trim() ? settings.title.trim() : files[0].name,
+      slug,
+      contentText ? 'mixed' : 'file',
+      format,
+      contentText || null,
+      visibility,
+      password.hash,
+      password.salt,
+      nullableText(settings.expire_at),
+      numberField(settings.max_views),
+      nullableText(settings.remark),
+      createdAt
+    ).run();
+    await reserveContentStorage(env, owner, contentId, requestedFileBytes + textSize(contentText));
+
     for (const file of files) {
       const attachmentId = id('att');
       const sessionId = id('upl');
@@ -882,6 +1093,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       const objectKey = mode === 'single'
         ? safeStagingObjectKey(owner, contentId, attachmentId)
         : safeObjectKey(owner, contentId, attachmentId);
+      objectKeys.push(objectKey);
       let uploadId: string | null = null;
       if (mode === 'multipart') {
         const upload = await env.BUCKET.createMultipartUpload(objectKey, {
@@ -918,26 +1130,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       });
     }
 
-    const statements: D1PreparedStatement[] = [
-      env.DB.prepare(
-        'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, password_hash, password_salt, expire_at, max_views, remark, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, "processing", ?9, ?10, ?11, ?12, ?13, ?14, ?14)'
-      ).bind(
-        contentId,
-        owner,
-        typeof settings.title === 'string' && settings.title.trim() ? settings.title.trim() : files[0].name,
-        slug,
-        contentText ? 'mixed' : 'file',
-        format,
-        contentText || null,
-        visibility,
-        password.hash,
-        password.salt,
-        nullableText(settings.expire_at),
-        numberField(settings.max_views),
-        nullableText(settings.remark),
-        createdAt
-      )
-    ];
+    const statements: D1PreparedStatement[] = [];
     for (const session of sessions) {
       statements.push(
         env.DB.prepare(
@@ -950,7 +1143,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
     }
     await env.DB.batch(statements);
     const plans = await Promise.all(sessions.map(async (session, index) => ({
-      ...(await directUploadPlan(env, session)),
+      ...(await directUploadPlan(env, session, 0, MAX_PARTS_PER_WINDOW)),
       client_id: files[index].clientId
     })));
     return json({
@@ -962,8 +1155,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       files: plans
     }, 201);
   } catch (error) {
-    await Promise.allSettled(multipartUploads.map((upload) => upload.abort()));
-    await env.DB.prepare('DELETE FROM contents WHERE id = ?1').bind(contentId).run().catch(() => undefined);
+    await rollbackUploadSetup(env, contentId, multipartUploads, objectKeys).catch(() => undefined);
     throw error;
   }
 }
@@ -980,16 +1172,28 @@ async function ownedUploadSession(env: Env, sessionId: string, owner: string): P
 
 async function refreshContentUploadState(env: Env, contentId: string): Promise<void> {
   const state = await env.DB.prepare(
-    'SELECT COUNT(*) expected, SUM(status="completed") completed, SUM(status="failed") failed, SUM(CASE WHEN status="completed" THEN size ELSE 0 END) total_size FROM upload_sessions WHERE content_id=?1'
+     `SELECT
+       c.status,
+       c.owner_username,
+       c.text_content,
+       COUNT(a.id) expected,
+       COALESCE(SUM(a.status="active"), 0) completed,
+       COALESCE(SUM(a.status="failed"), 0) failed,
+       COALESCE(SUM(CASE WHEN a.status="active" THEN a.size ELSE 0 END), 0) total_size
+     FROM contents c
+     LEFT JOIN attachments a ON a.content_id=c.id
+     WHERE c.id=?1
+     GROUP BY c.id`
   ).bind(contentId).first<any>();
-  if (!state) return;
+  if (!state || (state.status && state.status !== 'processing')) return;
   const expected = Number(state.expected || 0);
   const completed = Number(state.completed || 0);
   const failed = Number(state.failed || 0);
   if (isContentReadyForActivation(expected, completed, failed)) {
-    await env.DB.prepare('UPDATE contents SET status="active", file_size=?1, updated_at=?2 WHERE id=?3 AND status="processing"')
-      .bind(Number(state.total_size || 0), now(), contentId)
-      .run();
+    const finalTextSize = textSize(state.text_content);
+    const finalFileSize = Number(state.total_size || 0);
+    await ensureReusableReservation(env, String(state.owner_username), contentId, finalTextSize + finalFileSize);
+    await activateReservedContent(env, contentId, finalTextSize, finalFileSize);
   }
 }
 
@@ -999,7 +1203,8 @@ async function rejectUploadedObject(env: Env, session: UploadSessionRow): Promis
   await env.DB.batch([
     env.DB.prepare('UPDATE upload_sessions SET status="failed", updated_at=?1, last_activity_at=?1 WHERE id=?2').bind(t, session.id),
     env.DB.prepare('UPDATE attachments SET status="failed" WHERE id=?1').bind(session.attachment_id),
-    env.DB.prepare('UPDATE contents SET status="expired", forced_expired_at=?1, updated_at=?1 WHERE id=?2').bind(t, session.content_id)
+    env.DB.prepare('UPDATE contents SET status="expired", forced_expired_at=?1, updated_at=?1 WHERE id=?2').bind(t, session.content_id),
+    env.DB.prepare("UPDATE storage_reservations SET status='expired', released_at=?1, updated_at=?1 WHERE content_id=?2 AND status='active'").bind(t, session.content_id)
   ]);
 }
 
@@ -1007,8 +1212,9 @@ async function finalizeUploadedSession(env: Env, sessionId: string): Promise<voi
   const session = await env.DB.prepare('SELECT * FROM upload_sessions WHERE id=?1').bind(sessionId).first<UploadSessionRow>();
   if (!session) return;
   if (['cancelled', 'expired'].includes(session.status)) return;
-  if (session.status === 'completed' && session.mode === 'single') {
-    await env.BUCKET.delete(session.object_key).catch(() => undefined);
+  if (session.status === 'completed') {
+    if (session.mode === 'single') await env.BUCKET.delete(session.object_key).catch(() => undefined);
+    await refreshContentUploadState(env, session.content_id);
     return;
   }
   let object = await env.BUCKET.head(session.object_key);
@@ -1019,7 +1225,6 @@ async function finalizeUploadedSession(env: Env, sessionId: string): Promise<voi
     await rejectUploadedObject(env, session);
     throw new Error(`Uploaded object integrity mismatch for session ${sessionId}`);
   }
-  if (session.status === 'completed') return;
   if (session.mode === 'single') {
     const stagingObject = await env.BUCKET.get(session.object_key);
     if (!stagingObject) throw new Error(`Uploaded object is not available for session ${sessionId}`);
@@ -1066,21 +1271,38 @@ async function completeMultipartSession(env: Env, sessionId: string): Promise<vo
 }
 
 async function markQueueMessageFailed(env: Env, body: UploadMessage | R2EventMessage, error: unknown): Promise<void> {
+  let contentId = 'contentId' in body ? body.contentId : undefined;
   let sessionId = 'sessionId' in body ? body.sessionId : undefined;
   if (!sessionId && 'object' in body && body.object?.key) {
     sessionId = (await env.DB.prepare('SELECT id FROM upload_sessions WHERE object_key=?1').bind(body.object.key).first<{ id: string }>())?.id;
   }
-  if (!sessionId) return;
-  const session = await env.DB.prepare('SELECT * FROM upload_sessions WHERE id=?1').bind(sessionId).first<UploadSessionRow>();
-  if (!session || session.status === 'completed') return;
+  const session = sessionId
+    ? await env.DB.prepare('SELECT * FROM upload_sessions WHERE id=?1').bind(sessionId).first<UploadSessionRow>()
+    : null;
+  contentId ||= session?.content_id;
+  if (!contentId) return;
+  const content = await env.DB.prepare('SELECT status FROM contents WHERE id=?1').bind(contentId).first<{ status: string }>();
+  if (!content || content.status !== 'processing') return;
+  const sessions = (await env.DB.prepare('SELECT * FROM upload_sessions WHERE content_id=?1').bind(contentId).all<UploadSessionRow>()).results || [];
+  const attachments = (await env.DB.prepare('SELECT object_key FROM attachments WHERE content_id=?1').bind(contentId).all<{ object_key: string }>()).results || [];
   const t = now();
   const message = error instanceof Error ? error.message.slice(0, 500) : 'Queue processing failed';
+  await Promise.allSettled(sessions
+    .filter((item) => item.mode === 'multipart' && item.upload_id && !['completed', 'cancelled', 'expired'].includes(item.status))
+    .map((item) => env.BUCKET.resumeMultipartUpload(item.object_key, item.upload_id!).abort()));
+  const objectKeys = new Set([
+    ...sessions.map((item) => item.object_key),
+    ...attachments.map((item) => item.object_key),
+  ]);
+  await Promise.allSettled([...objectKeys].map((objectKey) => env.BUCKET.delete(objectKey)));
   await env.DB.batch([
-    env.DB.prepare('UPDATE upload_sessions SET status="failed", updated_at=?1, last_activity_at=?1 WHERE id=?2').bind(t, session.id),
-    env.DB.prepare('UPDATE attachments SET status="failed" WHERE id=?1').bind(session.attachment_id),
-    env.DB.prepare('UPDATE contents SET status="expired", forced_expired_at=?1, updated_at=?1 WHERE id=?2').bind(t, session.content_id),
-    env.DB.prepare('INSERT INTO admin_actions (id, admin_username, action, target_type, target_id, detail, created_at) VALUES (?1, "system", "upload_queue_failed", "upload_session", ?2, ?3, ?4)')
-      .bind(id('adm'), session.id, JSON.stringify({ message }), t)
+    env.DB.prepare('DELETE FROM upload_parts WHERE session_id IN (SELECT id FROM upload_sessions WHERE content_id=?1)').bind(contentId),
+    env.DB.prepare('UPDATE upload_sessions SET status="failed", updated_at=?1, last_activity_at=?1 WHERE content_id=?2 AND status NOT IN ("cancelled","expired")').bind(t, contentId),
+    env.DB.prepare('UPDATE attachments SET status="failed" WHERE content_id=?1').bind(contentId),
+    env.DB.prepare('UPDATE contents SET status="expired", text_content=NULL, forced_expired_at=?1, updated_at=?1 WHERE id=?2 AND status="processing"').bind(t, contentId),
+    env.DB.prepare('INSERT INTO admin_actions (id, admin_username, action, target_type, target_id, detail, created_at) VALUES (?1, "system", "upload_queue_failed", ?2, ?3, ?4, ?5)')
+      .bind(id('adm'), session ? 'upload_session' : 'content', session?.id || contentId, JSON.stringify({ message }), t),
+    env.DB.prepare("UPDATE storage_reservations SET status='expired', released_at=?1, updated_at=?1 WHERE content_id=?2 AND status='active'").bind(t, contentId)
   ]);
 }
 
@@ -1157,6 +1379,7 @@ async function permanentDelete(env: Env, contentId: string): Promise<void> {
   await env.DB.prepare('DELETE FROM attachments WHERE content_id = ?').bind(contentId).run();
   await env.DB.prepare('DELETE FROM content_notes WHERE content_id = ?').bind(contentId).run();
   await env.DB.prepare('DELETE FROM access_logs WHERE content_id = ?').bind(contentId).run();
+  await env.DB.prepare('DELETE FROM storage_reservations WHERE content_id = ?').bind(contentId).run();
   await env.DB.prepare('DELETE FROM contents WHERE id = ?').bind(contentId).run();
 }
 
@@ -1166,28 +1389,32 @@ async function cleanupStaleUploadSessions(env: Env): Promise<number> {
     `SELECT * FROM upload_sessions WHERE status IN (${CLEANUP_SESSION_STATUSES}) AND COALESCE(last_activity_at, updated_at, created_at) < ?1 ORDER BY last_activity_at ASC LIMIT 100`
   ).bind(cutoff).all<UploadSessionRow>();
   let cleaned = 0;
-  for (const session of results || []) {
-    if (!isUploadSessionStale(session)) continue;
-    if (session.mode === 'multipart' && session.upload_id) {
-      await env.BUCKET.resumeMultipartUpload(session.object_key, session.upload_id).abort().catch(() => undefined);
-    }
-    await env.BUCKET.delete(session.object_key).catch(() => undefined);
+  const staleContentIds = [...new Set((results || [])
+    .filter((session) => isUploadSessionStale(session))
+    .map((session) => session.content_id))];
+  for (const contentId of staleContentIds) {
+    const sessions = (await env.DB.prepare(
+      'SELECT * FROM upload_sessions WHERE content_id=?1'
+    ).bind(contentId).all<UploadSessionRow>()).results || [];
+    const attachments = (await env.DB.prepare(
+      'SELECT object_key FROM attachments WHERE content_id=?1'
+    ).bind(contentId).all<{ object_key: string }>()).results || [];
+    await Promise.allSettled(sessions
+      .filter((session) => session.mode === 'multipart' && session.upload_id && !['completed', 'cancelled', 'expired'].includes(session.status))
+      .map((session) => env.BUCKET.resumeMultipartUpload(session.object_key, session.upload_id!).abort()));
+    const objectKeys = new Set([
+      ...sessions.map((session) => session.object_key),
+      ...attachments.map((attachment) => attachment.object_key),
+    ]);
+    await Promise.allSettled([...objectKeys].map((objectKey) => env.BUCKET.delete(objectKey)));
     const timestamp = now();
     await env.DB.batch([
-      env.DB.prepare('DELETE FROM upload_parts WHERE session_id=?1').bind(session.id),
-      env.DB.prepare('UPDATE upload_sessions SET status="expired", updated_at=?1, last_activity_at=?1 WHERE id=?2 AND status IN (' + CLEANUP_SESSION_STATUSES + ')').bind(timestamp, session.id),
-      env.DB.prepare('UPDATE attachments SET status="failed" WHERE id=?1 AND status != "active"').bind(session.attachment_id)
+      env.DB.prepare('DELETE FROM upload_parts WHERE session_id IN (SELECT id FROM upload_sessions WHERE content_id=?1)').bind(contentId),
+      env.DB.prepare('UPDATE upload_sessions SET status="expired", updated_at=?1, last_activity_at=?1 WHERE content_id=?2 AND status NOT IN ("cancelled","expired")').bind(timestamp, contentId),
+      env.DB.prepare('UPDATE attachments SET status="failed" WHERE content_id=?1').bind(contentId),
+      env.DB.prepare('UPDATE contents SET status="expired", text_content=NULL, forced_expired_at=?1, updated_at=?1 WHERE id=?2 AND status="processing"').bind(timestamp, contentId),
+      env.DB.prepare("UPDATE storage_reservations SET status='expired', released_at=?1, updated_at=?1 WHERE content_id=?2 AND status='active'").bind(timestamp, contentId)
     ]);
-    const state = await env.DB.prepare(
-      'SELECT COUNT(*) total, SUM(status="completed") completed, SUM(status IN ("pending","uploading","completing")) incomplete FROM upload_sessions WHERE content_id=?1'
-    ).bind(session.content_id).first<{ total: number; completed: number; incomplete: number }>();
-    if (Number(state?.incomplete || 0) === 0) {
-      if (Number(state?.completed || 0) === Number(state?.total || 0)) {
-        await refreshContentUploadState(env, session.content_id);
-      } else {
-        await env.DB.prepare('UPDATE contents SET status="expired", forced_expired_at=?1, updated_at=?1 WHERE id=?2 AND status="processing"').bind(timestamp, session.content_id).run();
-      }
-    }
     cleaned += 1;
   }
   return cleaned;
@@ -1337,7 +1564,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     return createDirectUploadContent(env, req, owner, await readJson(req), cli ? 'cli' : 'web');
   }
 
-  const uploadMatch = path.match(/^\/api\/(cli\/)?uploads\/([^/]+)(?:\/(status|part|complete|renew|heartbeat))?$/);
+  const uploadMatch = path.match(/^\/api\/(cli\/)?uploads\/([^/]+)(?:\/(status|parts|part|complete|renew|heartbeat))?$/);
   if (uploadMatch) {
     const owner = uploadMatch[1] ? (await apiKeyAuth(env, req)).owner : (await verifySso(req, env)).username;
     const session = await ownedUploadSession(env, uploadMatch[2], owner);
@@ -1367,6 +1594,22 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
       });
     }
 
+    if (action === 'parts' && method === 'GET') {
+      if (session.mode !== 'multipart') throw new HttpError(400, 'Part plans are only valid for multipart uploads');
+      if (['completed', 'cancelled', 'failed', 'expired'].includes(session.status)) throw new HttpError(409, `Upload session is ${session.status}`);
+      await ensureUploadSessionReservation(env, session);
+      await touchUploadSession(env, session.id);
+      return json({
+        ok: true,
+        item: await directUploadPlan(
+          env,
+          session,
+          partWindowCursor(url.searchParams.get('after')),
+          partWindowLimit(url.searchParams.get('limit'))
+        ),
+      });
+    }
+
     if (action === 'heartbeat' && method === 'POST') {
       if (['completed', 'cancelled', 'failed', 'expired'].includes(session.status)) {
         return json({ ok: true, status: session.status, accepted: false });
@@ -1382,6 +1625,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (action === 'part' && method === 'POST') {
       if (session.mode !== 'multipart') throw new HttpError(400, 'Part reports are only valid for multipart uploads');
       if (['completed', 'cancelled', 'failed', 'expired'].includes(session.status)) throw new HttpError(409, `Upload session is ${session.status}`);
+      await ensureUploadSessionReservation(env, session);
       const body = await readJson<{ part_number: number; etag: string }>(req);
       const partNumber = Number(body.part_number);
       const etag = normalizeEtag(body.etag);
@@ -1393,9 +1637,13 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
       ).bind(session.id, partNumber, etag, plan.size, t).run();
       const state = await env.DB.prepare('SELECT COUNT(*) completed_parts, SUM(size) uploaded_bytes FROM upload_parts WHERE session_id=?1').bind(session.id).first<any>();
       const completedParts = Number(state?.completed_parts || 0);
-      await env.DB.prepare('UPDATE upload_sessions SET status="uploading", completed_parts=?1, uploaded_bytes=?2, updated_at=?3, last_activity_at=?3 WHERE id=?4')
-        .bind(completedParts, Number(state?.uploaded_bytes || 0), t, session.id)
-        .run();
+      await env.DB.batch([
+        env.DB.prepare('UPDATE upload_sessions SET status="uploading", completed_parts=?1, uploaded_bytes=?2, updated_at=?3, last_activity_at=?3 WHERE id=?4')
+          .bind(completedParts, Number(state?.uploaded_bytes || 0), t, session.id),
+        env.DB.prepare(
+          "UPDATE storage_reservations SET expires_at=?1, updated_at=?2 WHERE content_id=?3 AND status='active' AND julianday(expires_at) > julianday('now')"
+        ).bind(reservationExpiresAt(), t, session.content_id),
+      ]);
       if (completedParts === session.expected_parts) await env.UPLOAD_QUEUE.send({ type: 'complete-multipart', sessionId: session.id });
       return json({ ok: true, completed_parts: completedParts, expected_parts: session.expected_parts });
     }
@@ -1404,6 +1652,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
       if (session.status === 'completed') {
         return json({ ok: true, queued: false, status_url: `${uploadBase}/${session.id}/status` });
       }
+      await ensureUploadSessionReservation(env, session);
       await touchUploadSession(env, session.id);
       if (session.mode === 'multipart') {
         await env.UPLOAD_QUEUE.send({ type: 'complete-multipart', sessionId: session.id });
@@ -1421,14 +1670,13 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
 
     if (action === 'renew' && method === 'POST') {
       if (['completed', 'cancelled', 'failed', 'expired'].includes(session.status)) throw new HttpError(409, `Upload session is ${session.status}`);
+      await ensureUploadSessionReservation(env, session);
       await touchUploadSession(env, session.id);
-      const body = await readJson<{ part_numbers?: number[] }>(req);
-      if (session.mode === 'single') return json({ ok: true, item: await directUploadPlan(env, session) });
-      const completed = new Set(((await env.DB.prepare('SELECT part_number FROM upload_parts WHERE session_id=?1').bind(session.id).all<{ part_number: number }>()).results || []).map((part) => part.part_number));
-      const requested = new Set(Array.isArray(body.part_numbers) ? body.part_numbers.map(Number) : []);
-      const plan = await directUploadPlan(env, session);
-      const parts = (plan.parts || []).filter((part: any) => !completed.has(part.part_number) && (!requested.size || requested.has(part.part_number)));
-      return json({ ok: true, item: { ...plan, parts } });
+      const body = await readJson<{ after?: number; limit?: number }>(req);
+      return json({
+        ok: true,
+        item: await directUploadPlan(env, session, partWindowCursor(body.after), partWindowLimit(body.limit)),
+      });
     }
 
     if (!action && method === 'DELETE') {
@@ -2258,9 +2506,7 @@ export default {
           if (body.sessionId) {
             await finalizeUploadedSession(env, body.sessionId);
           } else if (body.contentId) {
-            await env.DB.prepare('UPDATE contents SET status="active", updated_at=?1 WHERE id=?2 AND status="processing"')
-              .bind(now(), body.contentId)
-              .run();
+            await refreshContentUploadState(env, body.contentId);
           }
         } else if ('object' in body && body.object?.key) {
           const session = await env.DB.prepare('SELECT id FROM upload_sessions WHERE object_key=?1').bind(body.object.key).first<{ id: string }>();

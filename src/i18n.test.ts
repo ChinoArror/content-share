@@ -22,4 +22,16 @@ describe('i18n', () => {
     expect(translate('en-US', 'upload.remaining', { count: 3 })).toBe('3 files remaining');
     expect(translate('en-US', 'missing.key')).toBe('missing.key');
   });
+
+  it('formats structured quota accounting in both languages', () => {
+    const values = { used: '70 B', reserved: '20 B', requested: '11 B', quota: '100 B' };
+
+    expect(translate('en-US', 'error.STORAGE_QUOTA_EXCEEDED')).toBe('Storage quota exceeded');
+    expect(translate('en-US', 'error.storageQuotaDetails', values)).toBe(
+      'Used 70 B, reserved 20 B, requested 11 B, quota 100 B'
+    );
+    expect(translate('zh-CN', 'error.storageQuotaDetails', values)).toBe(
+      '已用 70 B，预留 20 B，本次请求 11 B，配额 100 B'
+    );
+  });
 });
