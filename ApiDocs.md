@@ -161,7 +161,7 @@ const response = await fetch('https://content.aryuki.com/api/cli/upload-file', {
 console.log(await response.json());
 ```
 
-The legacy file endpoint accepts up to 20 files per request and limits each file to 100 MiB. It writes the file through the Worker and returns `queued: true` while Queue finalization is pending.
+The legacy file endpoint accepts up to 20 files per request and limits each file to 100 MiB. For files above 100 MiB, use the resumable upload-session API below; its per-file limit is 5 GiB. The legacy endpoint writes the file through the Worker and returns `queued: true` while Queue finalization is pending.
 
 ## Upload text with files
 
@@ -249,7 +249,7 @@ Initiation body:
 
 `fingerprint` is a lowercase 64-character SHA-256 file identity. The browser client calculates it from the file metadata plus the first and last 1 MiB, so a reconnect is never matched by filename alone. External clients should send the same fingerprint when they want strong resume matching; if omitted, the Worker creates a metadata-based SHA-256 fallback.
 
-The response is `201` and includes `direct: true`, a content URL, and one plan per file. Files up to 16 MiB receive one `upload_url`. Larger files receive 8 MiB `parts`. Send each PUT to the returned R2 URL, using the returned headers when present, retain each response `ETag`, and report it:
+The response is `201` and includes `direct: true`, a content URL, and one plan per file. Files up to 16 MiB receive one `upload_url`; files from 16 MiB through 100 MiB use 8 MiB parts; files above 100 MiB through 5 GiB use 64 MiB parts. Send each PUT to the returned R2 URL, using the returned headers when present, retain each response `ETag`, and report it:
 
 ```json
 {
@@ -298,6 +298,6 @@ File and mixed uploads may additionally return `queued: true` while Queue finish
 
 - API Keys are hashed in D1 and shown in full only once.
 - A single CLI request accepts at most 20 files.
-- A single file is limited to 100 MiB by the upload API.
-- Unfinished direct uploads are limited to 50 sessions and 500 MiB per user.
+- Legacy upload endpoints limit a single file to 100 MiB; resumable upload sessions support a single file up to 5 GiB.
+- Unfinished direct uploads are limited to 50 sessions per user; storage quota comes from the assigned permission group.
 - Do not expose API Keys, R2 credentials, signed URLs, or password values in logs.

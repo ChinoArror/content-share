@@ -10,8 +10,8 @@
 | 后端验证 auth-center JWT | 已完成 | `src/worker.ts` | 所有网页端受保护 API | `accounts.aryuki.com/api/verify` | 传入无效 token 返回 401/403 |
 | 使用 JWT username 作为用户唯一标识 | 已完成 | `src/worker.ts`, `schema.sql` | `/api/me` | D1 `users.username` | 登录后查看 `users` |
 | D1 存储结构化数据 | 已完成 | `schema.sql`, `src/worker.ts` | 所有内容/API Key/Admin API | D1 | `wrangler d1 execute` |
-| R2 存储所有文件 | 已完成 | `src/worker.ts`, `src/r2-signer.ts` | `/api/uploads/initiate`, `/api/contents/upload`, `/api/attachments/:id/download` | R2 + D1 metadata | 分别上传小文件和大于 16 MiB 文件后下载并核对字节数 |
-| Queue 处理上传收尾 | 已完成 | `src/worker.ts`, `wrangler.toml` | `/api/uploads/:id/part`, `/api/uploads/:id/complete`, `/api/admin/uploads/:id/retry` | Cloudflare Queue + DLQ + R2 event + D1 | 重复完成消息；模拟最终失败后检查 D1 failed、DLQ 与 admin 重试 |
+| R2 存储所有文件 | 已完成 | `src/worker.ts`, `src/r2-signer.ts`, `src/transfer-policy.ts` | `/api/uploads/initiate`, `/api/contents/upload`, `/api/attachments/:id/download` | R2 + D1 metadata | 分别上传小文件、100 MiB 以上文件并下载核对 SHA-256；单文件上限 5 GiB |
+| Queue 处理上传收尾 | 已完成 | `src/worker.ts`, `migrations/0004_upload_cleanup_claims.sql`, `wrangler.toml` | `/api/uploads/:id/part`, `/api/uploads/:id/complete`, `/api/admin/uploads/:id/retry` | Cloudflare Queue + DLQ + R2 event + D1 | 重复完成消息；模拟最终失败/R2 清理失败；检查 D1 failed、配额保留与 admin 重试 |
 | 生产 R2 S3 直传凭证 | 已完成 | `wrangler.toml`, `src/r2-signer.ts`, Worker Secrets | `/api/uploads/*`, `/api/attachments/:id/download` | R2 S3 + Worker Secrets + D1 状态 | 已按 `secret.txt` 的标记格式正确解析并写入 4 个 Secret；R2 PUT=200、Range GET=206、DELETE=204 |
 | 未开发 S3/Mount/WebDAV | 已完成 | 全项目 | 无 | 无 | 搜索 UI 与源码无相关入口 |
 | 没有空按钮 | 已完成 | `src/main.tsx` | 所有按钮均调用 API、复制、下载、登录或确认 | D1/R2/API | 手动点击验证 |
@@ -34,7 +34,7 @@
 | 文件写入 R2 | 已完成 | `src/worker.ts`, `src/r2-signer.ts` | `/api/uploads/*`, `/api/contents/upload`, `/api/cli/upload-file` | 私有 R2 | 上传后核对 R2 对象大小和 ETag |
 | 附件元数据写入 D1 | 已完成 | `src/worker.ts`, `schema.sql`, `migrations/0001_direct_r2_transfers.sql` | `/api/uploads/*` | D1 `attachments`, `upload_sessions`, `upload_parts` | 查询会话、分片和附件状态 |
 | SHA-256 指纹断点续传 | 已完成 | `src/upload-resume.ts`, `src/upload-client.ts`, `src/worker.ts`, `migrations/0002_upload_resume_fingerprint.sql` | `/api/uploads/initiate`, `/api/uploads/:id/heartbeat`, `/api/cli/uploads/*` | D1 `file_fingerprint`, `last_activity_at`, `upload_parts` | 中断后 30 分钟内用同一文件重传并检查已完成分片被复用；修改首尾内容后确认不复用 |
-| 30 分钟无活动清理残留 | 已完成 | `src/worker.ts`, `wrangler.toml` | Worker scheduled handler | D1 + R2 multipart/staging objects | 设置旧 `last_activity_at` 后运行清理，确认会话、分片和 R2 残留被清理；持续心跳的大文件不被清理 |
+| 30 分钟无活动清理残留 | 已完成 | `src/worker.ts`, `migrations/0004_upload_cleanup_claims.sql`, `wrangler.toml` | Worker scheduled handler | D1 + R2 multipart/staging objects | 设置旧 `last_activity_at` 后运行清理，确认会话、分片和 R2 残留被清理；持续心跳的大文件和同组活跃兄弟会话不被清理 |
 | 最近上传/我的文件列表来自 D1 | 已完成 | `src/main.tsx` | `/api/contents?type=file` | D1 `contents` | 上传后刷新列表 |
 
 ## D. 内容访问权限
@@ -70,7 +70,9 @@
 | Dashboard 全部统计 | 已完成 | `src/main.tsx`, `src/worker.ts` | `/api/admin/dashboard` | D1 聚合 | Admin Dashboard |
 | 内容管理全部操作 | 已完成 | `src/main.tsx`, `src/worker.ts` | `/api/admin/contents*` | D1/R2 | Admin 内容管理 |
 | 永久删除清理 D1 和 R2 | 已完成 | `src/worker.ts` | `DELETE /api/admin/contents/:id/permanent` | D1/R2 | 上传文件后永久删除 |
-| 用户统计 | 已完成 | `src/worker.ts` | `/api/admin/users` | D1 聚合 | Admin 用户统计 |
+| 用户管理 | 已完成 | `src/main.tsx`, `src/worker.ts` | `/api/admin/users`, `/api/admin/users/:username/group` | D1 聚合 + permission_groups | Admin 用户管理中展开使用数据、单组分配和权限明细；手机端只局部横向滚动 |
+| 权限管理 | 已完成 | `src/main.tsx`, `src/worker.ts` | `/api/admin/permission-groups*` | D1 `permission_groups` | 创建、编辑、设默认、删除并重新分配；内置组删除按钮禁用 |
+| Admin 入口严格按 JWT role | 已完成 | `src/worker.ts`, `src/main.tsx` | `/api/admin/*` | auth-center JWT + D1 permission group | role=user 即使分配 admin 业务组也不能进入 Admin Dashboard |
 | Admin 操作日志 | 已完成 | `src/worker.ts` | Admin mutating API | D1 `admin_actions` | 执行 Admin 操作后查询 |
 
 ## G. API Key
@@ -83,6 +85,8 @@
 | 只存 hash，列表显示前缀和后四位 | 已完成 | `src/worker.ts`, `schema.sql` | `/api/api-keys` | D1 `key_hash/key_prefix/key_suffix` | 查询 D1 |
 | rotate/revoke/过期限制 | 已完成 | `src/worker.ts` | `/api/api-keys/:id/rotate`, `/revoke`, `/api/cli/*` | D1 `api_keys` | 旋转/吊销后调用旧 key |
 | API Key 只允许 CLI 上传 | 已完成 | `src/worker.ts` | `/api/cli/upload-*` | API Key hash | 用 API Key 调 `/api/me` 失败 |
+| API Key 审计操作 | 已完成 | `src/main.tsx`, `src/worker.ts` | `/api/admin/api-keys/:id/{rotate,lock,unlock,revoke}` | D1 `api_keys`, `api_key_usage_logs` | 展开详情、图标操作、二次确认；手机端检查操作图标可见可点 |
+| API 权限撤销自动锁定 | 已完成 | `src/worker.ts` | API Key CLI routes | D1 permission group + api_keys | 去除用户 API 权限后旧 key 返回锁定错误且不能调用 |
 | 使用日志 | 已完成 | `src/worker.ts` | `/api/cli/*` | D1 `api_key_usage_logs` | CLI 调用后查看审计 |
 
 ## H. 命令行上传
@@ -101,6 +105,8 @@
 | 桌面固定侧栏、手机折叠侧栏 | 已完成 | `src/styles.css`, `src/main.tsx` | 无 | UI 状态 | 调整视口 |
 | 移动端 Markdown Tab | 已完成 | `src/main.tsx`, `src/styles.css` | 无 | UI 状态 | 375px 视口 |
 | 表格横向滚动/紧凑操作 | 已完成 | `src/styles.css`, `src/main.tsx` | 内容/Admin API | D1 | 手机视口查看 |
+| QR 弹窗本地生成与滚动锁 | 已完成 | `src/main.tsx`, `src/styles.css` | 无，浏览器 Canvas/Share API | 本地背景资源 + 内容 slug | 打开二维码弹窗后页面不滚动；背景初始懒加载；下载/系统分享 |
+| SSO 回跳加载状态 | 已完成 | `src/main.tsx`, `src/styles.css` | `/api/sso-callback` | auth-center JWT exchange | 回跳页面显示活动方块和进度条，成功后进入首页 |
 | hover、Toast、二次确认 | 已完成 | `src/styles.css`, `src/main.tsx` | 删除/永久删除 API | UI + D1/R2 | 点击删除/复制 |
 | Huashu Design 全站视觉与响应式重构 | 已完成 | `src/styles.css`, `src/main.tsx` | 沿用全部现有 API | D1/R2/浏览器实时状态 | Playwright 检查落地页、分享页、面对面传输的桌面与手机布局 |
 

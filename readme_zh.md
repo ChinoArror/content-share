@@ -7,7 +7,7 @@ Content Share 是运行在 Cloudflare Workers 上的内容发布与文件分享�
 ## 功能概览
 
 - 只使用 auth-center SSO 登录。Worker 校验 auth-center JWT，并通过 `username` 识别用户。
-- 权限判断全部在 Worker 后端完成。`ADMIN_USERNAMES` 和 JWT role 决定 admin 权限。
+- 权限判断全部在 Worker 后端完成。只有 JWT `role=admin` 可以进入 Admin Dashboard；业务权限组不能替代 Admin Dashboard 权限。
 - 内容类型支持：纯文本、纯文件、文本 + 附件。
 - 文本支持：普通文本、Markdown。Markdown 页面带格式工具栏和预览。
 - 发布状态支持：`public`、`internal`、`private`。
@@ -15,7 +15,7 @@ Content Share 是运行在 Cloudflare Workers 上的内容发布与文件分享�
 - 公开内容不登录也可查看。内部/私密内容仍由 Worker 判断登录和权限。
 - 常见文件在线预览：图片、音频、视频、文本、PDF（PDF.js）、公开 Office 文件（Office Web Embed），以及使用隔离 iframe 直接打开的 HTML 文件；HTML 预览支持查看源代码和全屏。
 - ZIP 压缩包默认保持下载模式。预览页提供“查看实际页面”按钮，会优先查找 `index.html` 或其他 HTML 入口，并把压缩包内相对资源临时映射为 Blob URL；没有可用 HTML 页面时明确提示下载。
-- 浏览器上传使用只允许操作单个对象的短时 R2 地址：不超过 16 MiB 的文件单次 PUT，较大文件按 8 MiB 分片并支持 IndexedDB 队列恢复和真实字节进度。
+- 浏览器上传使用只允许操作单个对象的短时 R2 地址：不超过 16 MiB 单次 PUT，16 MiB 至 100 MiB 使用 8 MiB 分片，100 MiB 以上至 5 GiB 使用 64 MiB 分片，并支持 IndexedDB 队列恢复和真实字节进度。
 - 断点续传使用 SHA-256 文件指纹，指纹由文件元数据以及文件首尾各 1 MiB 组成，不会只按文件名匹配。Worker 通过上传进度心跳更新 `last_activity_at`，连续 30 分钟没有进度或心跳后，定时清理未完成会话、R2 分片/临时对象和 D1 分片记录。
 - 预览继续由 Worker 完成权限与 Range 检查。新直传附件在 Worker 鉴权后使用 60 秒只读 R2 地址下载；旧对象安全回退为 Worker 流式下载。
 - 公开/内部内容支持评论。已登录用户可评论，并选择所有人可见或仅自己可见。发布者可二次确认后删除任意评论。
@@ -25,6 +25,7 @@ Content Share 是运行在 Cloudflare Workers 上的内容发布与文件分享�
 - 用户头像优先使用 auth-center JWT/verify 返回的 `avatar_url`，没有时使用本地默认头像。
 - 支持响应式移动端、可折叠侧栏、点击空白关闭菜单、R2 背景图配置和落地页背景透明度设置。
 - 固定界面支持中文/English 切换，按钮位于右上角，选择会保存在浏览器 `localStorage`；用户自己的标题、文件名和正文不会被翻译。
+- 每个用户只能分配一个业务权限组。权限组控制公开发布、API、内部查看/下载、存储额度和评论权限；内置 `admin`、`user` 组不能删除。用户失去 API 权限后，名下 API Key 会自动锁定。
 - `/face-transfer` 提供面对面传文件：发送端在浏览器本地生成并循环显示 RaptorQ Fountain Code 动态二维码，每轮自动打乱并可调换码速度；接收端扫码后在本地恢复、预览和保存文件，文件内容不上传 Worker 或 R2。
 
 ## Cloudflare 资源
@@ -43,7 +44,6 @@ Content Share 是运行在 Cloudflare Workers 上的内容发布与文件分享�
 - `SSO_URL=https://accounts.aryuki.com`
 - `SSO_APP_ID=content-share`
 - `PUBLIC_BASE_URL=https://content.aryuki.com`
-- `ADMIN_USERNAMES=admin`
 - `R2_ACCOUNT_ID=...`
 - `R2_BUCKET_NAME=content-share-save`
 
@@ -81,6 +81,7 @@ Schema 包含：
 - `content_notes`
 - `upload_sessions`
 - `upload_parts`
+- `permission_groups`、`storage_reservations`、`upload_cleanup_claims`
 
 ## 部署
 
@@ -133,9 +134,9 @@ API Key 只能调用：
 - `POST /api/cli/uploads/:session_id/heartbeat`
 - `GET|POST|DELETE /api/cli/uploads/:session_id/...`
 
-旧版上传接口适合快速接入；大文件或需要刷新页面后续传时，使用 [ApiDocs.md](./ApiDocs.md) 中的可恢复上传会话 API：不超过 16 MiB 的文件使用一次签名 PUT，较大文件使用 8 MiB R2 分片，Queue 校验完成后才激活内容。每个文件可传入小写 64 位十六进制 SHA-256 `fingerprint`，浏览器端默认根据元数据和首尾各 1 MiB 计算；Worker 只会复用所有者、文件指纹、大小、文件数量和最后活动时间均匹配的未完成会话。最后一次进度或心跳在 30 分钟内可复用，超过 30 分钟无活动才会被定时清理。上传签名有效期为 5 分钟，完成后的下载可能跳转到有效期 60 秒的只读 R2 地址。
+旧版上传接口适合快速接入；大文件或需要刷新页面后续传时，使用 [ApiDocs.md](./ApiDocs.md) 中的可恢复上传会话 API：不超过 16 MiB 的文件使用一次签名 PUT，16 MiB 至 100 MiB 使用 8 MiB 分片，100 MiB 以上至 5 GiB 使用 64 MiB 分片，Queue 校验完成后才激活内容。每个文件可传入小写 64 位十六进制 SHA-256 `fingerprint`，浏览器端默认根据元数据和首尾各 1 MiB 计算；Worker 只会复用所有者、文件指纹、大小、文件数量和最后活动时间均匹配的未完成会话。最后一次进度或心跳在 30 分钟内可复用，超过 30 分钟无活动才会被定时清理。上传签名有效期为 5 分钟，完成后的下载可能跳转到有效期 60 秒的只读 R2 地址。
 
-文件 MIME 类型不是必填项。客户端没有提供有效 MIME 类型时，Worker 会根据文件扩展名自动识别；无法识别的类型会安全保存，并在分享页提示下载。旧版 CLI 接口单次最多接收 20 个文件，每个文件最多 100 MiB；未完成的直传会话按用户限制为最多 50 个会话、总计 500 MiB。
+文件 MIME 类型不是必填项。客户端没有提供有效 MIME 类型时，Worker 会根据文件扩展名自动识别；无法识别的类型会安全保存，并在分享页提示下载。旧版 CLI 接口单次最多接收 20 个文件，每个文件最多 100 MiB；100 MiB 以上请使用可恢复上传会话，单文件上限 5 GiB。未完成的直传会话按用户限制为最多 50 个会话，存储额度由权限组控制，不再使用固定 500 MiB 总量限制。
 
 ### curl：上传文本
 

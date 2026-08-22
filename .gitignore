@@ -4,6 +4,9 @@ node_modules/
 dist/
 .wrangler/
 .playwright-cli/
+playwright-report/
+test-results/
+.superpowers/
 .vite/
 .cache/
 coverage/
