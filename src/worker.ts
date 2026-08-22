@@ -3,6 +3,7 @@ import { presignR2Request } from './r2-signer';
 import { issueMediaTicket, verifyMediaTicket } from './media-ticket';
 import { isUploadSessionReusable, isUploadSessionStale, UPLOAD_INACTIVITY_MS } from './upload-resume';
 import { previewKind } from './preview-policy';
+import { ensureUserGroup, loadUserAccessProfile } from './worker-permissions';
 
 type Env = {
   DB: D1Database;
@@ -13,7 +14,6 @@ type Env = {
   SSO_APP_ID: string;
   MEDIA_TICKET_SECRET: string;
   PUBLIC_BASE_URL: string;
-  ADMIN_USERNAMES: string;
   R2_ACCOUNT_ID?: string;
   R2_BUCKET_NAME?: string;
   R2_UPLOAD_ACCESS_KEY_ID?: string;
@@ -384,9 +384,8 @@ async function verifySso(req: Request, env: Env, tokenOverride?: string): Promis
   const source = verifyBody.user || verifyBody || {};
   const username = String(source.username || payload.username || '').trim();
   if (!username) throw new HttpError(403, 'auth-center token does not include username');
-  const adminNames = (env.ADMIN_USERNAMES || '').split(',').map((v) => v.trim()).filter(Boolean);
   const roleRaw = String(source.role || payload.role || '').toLowerCase();
-  const role: 'admin' | 'user' = roleRaw === 'admin' || adminNames.includes(username) ? 'admin' : 'user';
+  const role: 'admin' | 'user' = roleRaw === 'admin' ? 'admin' : 'user';
   const avatarUrl = String(
     source.avatar_url ||
       source.avatarUrl ||
@@ -412,6 +411,7 @@ async function verifySso(req: Request, env: Env, tokenOverride?: string): Promis
     avatar_url: avatarUrl
   };
   await upsertUser(env.DB, user);
+  await ensureUserGroup(env.DB, user.username, user.role);
   return user;
 }
 
@@ -1150,7 +1150,19 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (path === '/api/me' && method === 'GET') {
     const user = await verifySso(req, env);
-    return json({ ok: true, user });
+    const profile = await loadUserAccessProfile(env.DB, user.username);
+    return json({
+      ok: true,
+      user,
+      group: profile.groupName,
+      permissions: profile.permissions,
+      storage: {
+        used_bytes: profile.used_bytes,
+        reserved_bytes: profile.reserved_bytes,
+        quota_bytes: profile.quota_bytes,
+        available_bytes: Math.max(0, profile.quota_bytes - profile.used_bytes - profile.reserved_bytes),
+      },
+    });
   }
 
   if (path === '/api/contents' && method === 'GET') {
