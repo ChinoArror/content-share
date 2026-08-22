@@ -25,6 +25,9 @@ export interface UploadPlan {
   upload_id?: string;
   parts?: UploadPartPlan[];
   completed_parts?: CompletedUploadPart[];
+  next_part_number?: number | null;
+  has_more_parts?: boolean;
+  window_after?: number;
 }
 
 export interface ApiRequestOptions {
@@ -80,6 +83,8 @@ export interface UploadTask {
   progress: UploadProgress;
   needsFileReselection: boolean;
   error?: string;
+  errorCode?: string;
+  errorDetails?: Record<string, unknown>;
 }
 
 export interface UploadInput {
@@ -131,9 +136,15 @@ interface UploadStatusResponse {
   parts?: CompletedUploadPart[];
 }
 
-class UploadRequestError extends Error {
-  constructor(readonly status: number, message: string) {
+export class UploadRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly code?: string,
+    readonly details?: Record<string, unknown>
+  ) {
     super(message);
+    this.name = 'UploadRequestError';
   }
 }
 
@@ -223,10 +234,17 @@ export function createFetchApiRequest(fetcher: typeof fetch = fetch): ApiRequest
       headers: body === undefined ? undefined : { 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body)
     });
+    const payload = await response.json().catch(() => undefined);
     if (!response.ok) {
-      throw new UploadRequestError(response.status, `Upload API request failed with ${response.status}`);
+      const error = isRecord(payload) ? payload : {};
+      throw new UploadRequestError(
+        response.status,
+        typeof error.message === 'string' ? error.message : `Upload API request failed with ${response.status}`,
+        typeof error.code === 'string' ? error.code : undefined,
+        isRecord(error.details) ? error.details : undefined
+      );
     }
-    return response.json() as Promise<T>;
+    return payload as T;
   };
 }
 
@@ -245,7 +263,7 @@ export class BrowserUploadQueue {
   private runPromise?: Promise<void>;
 
   constructor(options: BrowserUploadQueueOptions = {}) {
-    const mobile = isMobileBrowser();
+    const mobile = isTouchOrMobileBrowser();
     this.api = options.api ?? createFetchApiRequest();
     this.xhrFactory = options.xhrFactory ?? (() => new XMLHttpRequest());
     this.persistence = options.persistence ?? (typeof indexedDB === 'undefined'
@@ -262,7 +280,7 @@ export class BrowserUploadQueue {
 
   async enqueue(inputs: readonly UploadInput[]): Promise<UploadTask[]> {
     const oversized = inputs.find((input) => input.file.size > MAX_UPLOAD_SIZE);
-    if (oversized) throw new Error(`File exceeds 100 MiB: ${oversized.file.name}`);
+    if (oversized) throw new Error(`File exceeds 5 GiB: ${oversized.file.name}`);
     const added: UploadTask[] = [];
     for (const input of inputs) {
       const id = createId(this.clock());
@@ -315,7 +333,7 @@ export class BrowserUploadQueue {
             task.needsFileReselection = false;
           }
         } catch (error) {
-          task.error = errorMessage(error);
+          assignTaskError(task, error);
         }
       }
       if (task.status !== 'complete') {
@@ -339,6 +357,8 @@ export class BrowserUploadQueue {
     task.file = file;
     task.fingerprint = await fingerprintForFile(file);
     task.error = undefined;
+    task.errorCode = undefined;
+    task.errorDetails = undefined;
     task.needsFileReselection = false;
     task.status = 'paused';
     await this.persist(task);
@@ -367,7 +387,7 @@ export class BrowserUploadQueue {
         await this.uploadTask(task);
       } catch (error) {
         task.status = 'failed';
-        task.error = errorMessage(error);
+        assignTaskError(task, error);
         await this.persist(task);
         this.notify(task);
       }
@@ -411,10 +431,9 @@ export class BrowserUploadQueue {
         this.notify(task);
       }
     } catch (error) {
-      const message = errorMessage(error);
       for (const task of queued) {
         task.status = 'failed';
-        task.error = message;
+        assignTaskError(task, error);
         await this.persist(task);
         this.notify(task);
       }
@@ -427,6 +446,8 @@ export class BrowserUploadQueue {
     if (!task.plan) await this.renewPlan(task);
     task.status = 'uploading';
     task.error = undefined;
+    task.errorCode = undefined;
+    task.errorDetails = undefined;
     await this.persist(task);
     this.notify(task);
     if (task.mode === 'single') {
@@ -446,32 +467,37 @@ export class BrowserUploadQueue {
   }
 
   private async uploadMultipart(task: TaskState): Promise<void> {
-    const parts = task.plan?.parts;
-    if (!parts || !task.file) throw new Error('Multipart upload plan is incomplete');
-    if (!parts.length) return;
-    const completed = new Set(task.completedParts.map((part) => part.part_number));
-    const pending = parts.filter((part) => !completed.has(part.part_number));
-    await runWithConcurrency(pending, this.maxConcurrentParts, async (part) => {
-      const file = task.file;
-      if (!file) throw new Error('File must be selected before upload can resume');
-      const body = file.slice(part.start, part.end, file.type);
-      const etag = await this.uploadWithRetry(task, body, part.part_number);
-      if (!etag) throw new Error(`Multipart upload did not return an ETag for part ${part.part_number}`);
-      const completedPart = { part_number: part.part_number, etag, size: part.size };
-      await this.api({
-        method: 'POST',
-        path: `/api/uploads/${encodeURIComponent(task.sessionId ?? '')}/part`,
-        body: { attachment_id: task.attachmentId, ...completedPart }
+    if (!task.plan?.parts || !task.file) throw new Error('Multipart upload plan is incomplete');
+    let window = task.plan;
+    while (true) {
+      const completed = new Set(task.completedParts.map((part) => part.part_number));
+      const pending = (window.parts ?? []).filter((part) => !completed.has(part.part_number));
+      const windowAfter = partWindowStart(window);
+      await runWithConcurrency(pending, this.maxConcurrentParts, async (part) => {
+        const file = task.file;
+        if (!file) throw new Error('File must be selected before upload can resume');
+        const body = file.slice(part.start, part.end, file.type);
+        const etag = await this.uploadWithRetry(task, body, part.part_number, windowAfter);
+        if (!etag) throw new Error(`Multipart upload did not return an ETag for part ${part.part_number}`);
+        const completedPart = { part_number: part.part_number, etag, size: part.size };
+        await this.api({
+          method: 'POST',
+          path: `/api/uploads/${encodeURIComponent(task.sessionId ?? '')}/part`,
+          body: { attachment_id: task.attachmentId, ...completedPart }
+        });
+        task.completedParts = normalizeCompletedParts([...task.completedParts, completedPart]);
+        task.partialPartBytes.delete(part.part_number);
+        this.updateProgress(task);
+        await this.persist(task);
+        this.notify(task);
       });
-      task.completedParts = normalizeCompletedParts([...task.completedParts, completedPart]);
-      task.partialPartBytes.delete(part.part_number);
-      this.updateProgress(task);
-      await this.persist(task);
-      this.notify(task);
-    });
+      if (window.has_more_parts !== true) return;
+      const after = partWindowEnd(window);
+      window = await this.fetchPartWindow(task, after);
+    }
   }
 
-  private async uploadWithRetry(task: TaskState, body: Blob, partNumber: number | undefined): Promise<string | null> {
+  private async uploadWithRetry(task: TaskState, body: Blob, partNumber: number | undefined, windowAfter = 0): Promise<string | null> {
     let retryCount = 0;
     let renewed = false;
     while (true) {
@@ -481,7 +507,7 @@ export class BrowserUploadQueue {
       } catch (error) {
         const status = error instanceof UploadRequestError ? error.status : 0;
         if ((status === 401 || status === 403) && !renewed) {
-          await this.renewPlan(task);
+          await this.renewPlan(task, windowAfter);
           renewed = true;
           continue;
         }
@@ -557,15 +583,26 @@ export class BrowserUploadQueue {
     throw new Error('Upload validation timed out; the task was kept for recovery');
   }
 
-  private async renewPlan(task: TaskState): Promise<void> {
+  private async fetchPartWindow(task: TaskState, after: number): Promise<UploadPlan> {
+    if (!task.sessionId) throw new Error('Upload session is missing');
+    const response = await this.api<UploadPlan | { item: UploadPlan }>({
+      method: 'GET',
+      path: `/api/uploads/${encodeURIComponent(task.sessionId)}/parts?after=${after}&limit=8`
+    });
+    const plan = mergePlans(task.plan, { ...unwrapItem(response), window_after: after });
+    this.assignPlan(task, plan);
+    return plan;
+  }
+
+  private async renewPlan(task: TaskState, after = 0): Promise<void> {
     if (!task.sessionId) throw new Error('Upload session is missing');
     const response = await this.api<UploadPlan | { plan: UploadPlan } | { item: UploadPlan }>({
       method: 'POST',
       path: `/api/uploads/${encodeURIComponent(task.sessionId)}/renew`,
-      body: { attachment_id: task.attachmentId }
+      body: { attachment_id: task.attachmentId, after, limit: 8 }
     });
     const plan = 'plan' in response ? response.plan : unwrapItem(response);
-    this.assignPlan(task, mergePlans(task.plan, plan));
+    this.assignPlan(task, mergePlans(task.plan, { ...plan, window_after: after }));
   }
 
   private destinationFor(task: TaskState, partNumber: number | undefined): { url: string; headers: Record<string, string> } {
@@ -587,7 +624,7 @@ export class BrowserUploadQueue {
     task.mode = plan.mode;
     task.plan = plan;
     if (plan.completed_parts) {
-      task.completedParts = normalizeCompletedParts(plan.completed_parts);
+      task.completedParts = normalizeCompletedParts([...task.completedParts, ...plan.completed_parts]);
       this.updateProgress(task);
     }
   }
@@ -628,6 +665,8 @@ export class BrowserUploadQueue {
       mode: task.mode,
       status: task.status,
       error: task.error,
+      error_code: task.errorCode,
+      error_details: task.errorDetails,
       completed_parts: task.completedParts,
       progress: task.progress,
       metadata: task.metadata,
@@ -674,12 +713,30 @@ function unwrapItem<T>(response: T | { item: T }): T {
 
 function mergePlans(previous: UploadPlan | undefined, renewed: UploadPlan): UploadPlan {
   if (!previous) return renewed;
+  const completedParts = normalizeCompletedParts([
+    ...(previous.completed_parts ?? []),
+    ...(renewed.completed_parts ?? [])
+  ]);
   return {
     ...previous,
     ...renewed,
     headers: renewed.headers ?? previous.headers,
-    parts: renewed.parts ?? previous.parts
+    parts: renewed.parts ?? previous.parts,
+    completed_parts: completedParts.length ? completedParts : undefined
   };
+}
+
+function partWindowStart(plan: UploadPlan): number {
+  if (Number.isInteger(plan.window_after) && Number(plan.window_after) >= 0) return Number(plan.window_after);
+  const first = plan.parts?.reduce((minimum, part) => Math.min(minimum, part.part_number), Number.POSITIVE_INFINITY);
+  return Number.isFinite(first) ? Math.max(0, Number(first) - 1) : 0;
+}
+
+function partWindowEnd(plan: UploadPlan): number {
+  const last = plan.parts?.reduce((maximum, part) => Math.max(maximum, part.part_number), 0) ?? 0;
+  if (last > 0) return last;
+  if (typeof plan.next_part_number === 'number' && plan.next_part_number > 0) return plan.next_part_number - 1;
+  throw new Error('Multipart upload window did not advance');
 }
 
 function validatePlan(plan: UploadPlan, expectedSize: number): void {
@@ -713,6 +770,8 @@ function deserializeTask(record: Record<string, unknown>): TaskState | null {
     mode: record.mode === 'single' || record.mode === 'multipart' ? record.mode : undefined,
     status: isTaskStatus(record.status) ? record.status : 'paused',
     error: typeof record.error === 'string' ? record.error : undefined,
+    errorCode: typeof record.error_code === 'string' ? record.error_code : undefined,
+    errorDetails: isRecord(record.error_details) ? record.error_details : undefined,
     completedParts: completed,
     progress,
     needsFileReselection: !file,
@@ -788,8 +847,9 @@ function nonNegativeInteger(value: number | undefined, fallback: number): number
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
-function isMobileBrowser(): boolean {
-  return typeof navigator !== 'undefined' && /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent);
+function isTouchOrMobileBrowser(): boolean {
+  return typeof navigator !== 'undefined'
+    && (navigator.maxTouchPoints > 0 || /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent));
 }
 
 function createId(now: number): string {
@@ -811,4 +871,10 @@ function isProgress(value: unknown): value is UploadProgress {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Upload failed';
+}
+
+function assignTaskError(task: TaskState, error: unknown): void {
+  task.error = errorMessage(error);
+  task.errorCode = error instanceof UploadRequestError ? error.code : undefined;
+  task.errorDetails = error instanceof UploadRequestError ? error.details : undefined;
 }

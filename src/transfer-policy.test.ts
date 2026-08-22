@@ -1,16 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
+  GiB,
+  MiB,
+  MAX_UPLOAD_SIZE,
   buildPartPlan,
+  buildPartWindow,
   chooseUploadMode,
   finalizedObjectKey,
   isContentReadyForActivation,
   normalizeUploadFilename,
+  partSizeFor,
   parseByteRange,
   safeObjectKey,
   safeStagingObjectKey
 } from './transfer-policy';
-
-const MiB = 1024 * 1024;
 
 describe('chooseUploadMode', () => {
   it('uses a single upload through 16 MiB', () => {
@@ -31,9 +34,51 @@ describe('buildPartPlan', () => {
     ]);
   });
 
-  it('rejects empty and oversized files', () => {
+  it('uses 8 MiB parts through 100 MiB and 64 MiB parts above it', () => {
+    expect(partSizeFor(100 * MiB)).toBe(8 * MiB);
+    expect(partSizeFor(100 * MiB + 1)).toBe(64 * MiB);
+  });
+
+  it('supports exactly 5 GiB as 80 uniform parts', () => {
+    const parts = buildPartPlan(5 * GiB);
+
+    expect(MAX_UPLOAD_SIZE).toBe(5 * GiB);
+    expect(parts).toHaveLength(80);
+    expect(parts.every((part) => part.size === 64 * MiB)).toBe(true);
+    expect(parts.at(-1)).toEqual({
+      partNumber: 80,
+      start: 5 * GiB - 64 * MiB,
+      end: 5 * GiB,
+      size: 64 * MiB
+    });
+  });
+
+  it('rejects empty files and bytes above 5 GiB', () => {
     expect(() => buildPartPlan(0)).toThrow('File size must be positive');
-    expect(() => buildPartPlan(101 * MiB)).toThrow('File exceeds 100 MiB');
+    expect(() => buildPartPlan(5 * GiB + 1)).toThrow('File exceeds 5 GiB');
+  });
+});
+
+describe('buildPartWindow', () => {
+  it('returns at most eight missing parts after the cursor and reports the next gap', () => {
+    const completed = new Set([1, 3, 10]);
+
+    const first = buildPartWindow(100 * MiB, completed, 0, 99);
+    const second = buildPartWindow(100 * MiB, completed, 11, 8);
+
+    expect(first.parts.map((part) => part.partNumber)).toEqual([2, 4, 5, 6, 7, 8, 9, 11]);
+    expect(first).toMatchObject({ nextPartNumber: 12, hasMoreParts: true });
+    expect(second.parts.map((part) => part.partNumber)).toEqual([12, 13]);
+    expect(second).toMatchObject({ nextPartNumber: null, hasMoreParts: false });
+  });
+
+  it('never returns completed parts from a later window', () => {
+    const completed = [2, 4, 6, 8, 10, 12];
+
+    const window = buildPartWindow(100 * MiB, completed, 5, 8);
+
+    expect(window.parts.map((part) => part.partNumber)).toEqual([7, 9, 11, 13]);
+    expect(window.hasMoreParts).toBe(false);
   });
 });
 
