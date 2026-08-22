@@ -17,6 +17,7 @@ import { mimeTypeForArchivePath, previewKind, type PreviewKind } from './preview
 import { extractZipEntries, normalizeZipEntryName, selectZipHtmlEntry } from './zip-preview';
 import { MAX_UPLOAD_SIZE } from './transfer-policy';
 import { getInitialLanguage, I18nProvider, LanguageSwitcher, translate, useI18n } from './i18n';
+import { compactAuditValue, permissionKeys, type AdminPermissionKey } from './admin-display';
 import {
   ChevronDown,
   ChevronRight,
@@ -33,14 +34,17 @@ import {
   Link2,
   List,
   ListFilter,
+  Lock,
   LogOut,
   Menu,
   MoreVertical,
   Moon,
+  Plus,
   Pencil,
   QrCode,
   RefreshCw,
   RotateCw,
+  Save,
   ScanLine,
   Share2,
   Search,
@@ -50,6 +54,7 @@ import {
   Table2,
   TextCursorInput,
   Trash2,
+  Unlock,
   Upload,
   UserRound,
   Quote,
@@ -60,6 +65,12 @@ import './styles.css';
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 type Role = 'admin' | 'user';
+type PermissionSet = Record<AdminPermissionKey, boolean>;
+type AccessProfile = {
+  group: string;
+  permissions: PermissionSet;
+  storage: { used_bytes: number; reserved_bytes: number; quota_bytes: number; available_bytes: number };
+};
 type User = { id?: string; uuid?: string; username: string; name?: string; role: Role; avatar_url?: string };
 type Visibility = 'public' | 'internal' | 'private';
 type Content = {
@@ -103,6 +114,19 @@ const SSO_URL = 'https://accounts.aryuki.com';
 const APP_ID = 'content-share';
 const BASE_URL = 'https://content.aryuki.com';
 const visibilityOptions: Visibility[] = ['public', 'internal', 'private'];
+
+const noPermissions: PermissionSet = {
+  can_public_publish: false,
+  can_api: false,
+  can_internal_access: false,
+  can_upload: false,
+  can_comment: false,
+};
+
+function visibilityOptionsFor(permissions?: PermissionSet): Visibility[] {
+  if (!permissions || !permissions.can_public_publish) return ['internal', 'private'];
+  return visibilityOptions;
+}
 
 function token() {
   return localStorage.getItem('sso_token') || '';
@@ -310,14 +334,16 @@ function Field({ label, children, className = '' }: { label: string; children: R
   return <label className={`field ${className}`}><span>{label}</span>{children}</label>;
 }
 
-function VisibilitySegment({ value, onChange }: { value: Visibility; onChange: (v: Visibility) => void }) {
-  const { t, language } = useI18n();
-  const index = visibilityOptions.findIndex((item) => item === value);
+function VisibilitySegment({ value, onChange, permissions }: { value: Visibility; onChange: (v: Visibility) => void; permissions?: PermissionSet }) {
+  const { t } = useI18n();
+  const options = visibilityOptionsFor(permissions);
+  const displayValue = options.includes(value) ? value : options[options.length - 1];
+  const index = options.findIndex((item) => item === displayValue);
   return (
     <div className="visibility-segment" role="radiogroup" aria-label={t('visibility.label')}>
       <i style={{ transform: `translateX(${Math.max(index, 0) * 100}%)` }} />
-      {visibilityOptions.map((item) => (
-        <button type="button" key={item} className={value === item ? 'on' : ''} onClick={() => onChange(item)}>
+      {options.map((item) => (
+        <button type="button" key={item} className={displayValue === item ? 'on' : ''} onClick={() => onChange(item)}>
           {t(`visibility.${item}`)}
         </button>
       ))}
@@ -353,16 +379,16 @@ function FilterMenu({ items, values, onChange, onClear }: { items: FilterMenuIte
   );
 }
 
-function Sidebar({ page, setPage, user, open, setOpen, collapsed, setCollapsed }: { page: string; setPage: (v: string) => void; user: User; open: boolean; setOpen: (v: boolean) => void; collapsed: boolean; setCollapsed: (v: boolean) => void }) {
-  const { t, language } = useI18n();
+function Sidebar({ page, setPage, user, profile, open, setOpen, collapsed, setCollapsed }: { page: string; setPage: (v: string) => void; user: User; profile: AccessProfile; open: boolean; setOpen: (v: boolean) => void; collapsed: boolean; setCollapsed: (v: boolean) => void }) {
+  const { t } = useI18n();
   const items = [
     ['text', t('nav.publishText'), TextCursorInput],
     ['file', t('nav.publishFile'), FileUp],
     ['face', t('nav.faceTransfer'), ScanLine],
     ['mine', t('nav.myContent'), Clipboard],
-    ['keys', t('nav.apiKeys'), KeyRound],
     ['settings', t('nav.settings'), Settings]
-  ] as const;
+  ] as Array<readonly [string, string, React.ElementType]>;
+  if (profile.permissions.can_api) items.splice(4, 0, ['keys', t('nav.apiKeys'), KeyRound]);
   return (
     <aside className={`sidebar ${open ? 'open' : ''} ${collapsed ? 'collapsed' : ''}`}>
       <div className="brand">
@@ -475,7 +501,7 @@ function MarkdownToolbar({ textareaRef, content, setContent }: { textareaRef: Re
   );
 }
 
-function PublishText({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+function PublishText({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
   const { t, language } = useI18n();
   const [format, setFormat] = useState<'markdown' | 'plain'>('plain');
   const [mobileTab, setMobileTab] = useState<'pure' | 'preview'>('pure');
@@ -520,12 +546,12 @@ function PublishText({ toast }: { toast: (s: string, k?: Toast['kind']) => void 
       ) : (
         <textarea className="plain-editor" value={form.content} onChange={(e) => setForm({ ...form, content: e.target.value })} placeholder={t('text.plainPlaceholder')} />
       )}
-      <OptionsGrid form={form} setForm={setForm} />
+      <OptionsGrid form={form} setForm={setForm} permissions={permissions} />
     </form>
   );
 }
 
-function OptionsGrid({ form, setForm }: { form: any; setForm: (v: any) => void }) {
+function OptionsGrid({ form, setForm, permissions }: { form: any; setForm: (v: any) => void; permissions: PermissionSet }) {
   const { t } = useI18n();
   return (
     <div className="options-grid">
@@ -534,7 +560,7 @@ function OptionsGrid({ form, setForm }: { form: any; setForm: (v: any) => void }
       <Field label={t('text.password')}><input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder={t('text.optional')} /></Field>
       <ExpiryDatePicker className="expire-field" value={form.expire_at} onChange={(expire_at) => setForm({ ...form, expire_at })} />
       <Field label={t('text.maxViews')} className="max-views-field"><input type="number" min="0" value={form.max_views} onChange={(e) => setForm({ ...form, max_views: Number(e.target.value) })} /></Field>
-      <Field label={t('visibility.label')} className="status-field"><VisibilitySegment value={form.visibility} onChange={(visibility) => setForm({ ...form, visibility })} /></Field>
+      <Field label={t('visibility.label')} className="status-field"><VisibilitySegment value={form.visibility} permissions={permissions} onChange={(visibility) => setForm({ ...form, visibility })} /></Field>
       <Field label={t('text.remark')} className="remark-field"><input value={form.remark} onChange={(e) => setForm({ ...form, remark: e.target.value })} placeholder={t('text.optionalRemark')} /></Field>
     </div>
   );
@@ -711,7 +737,7 @@ function QrShareModal({ item, close, toast }: { item: Content; close: () => void
   );
 }
 
-function PublishFile({ toast, username }: { toast: (s: string, k?: Toast['kind']) => void; username: string }) {
+function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: Toast['kind']) => void; username: string; permissions: PermissionSet }) {
   const { t, language } = useI18n();
   const [files, setFiles] = useState<File[]>([]);
   const [form, setForm] = useState({ title: '', content: '', remark: '', slug: '', password: '', visibility: 'public' as Visibility, expire_at: '', max_views: 0, format: 'markdown' });
@@ -906,17 +932,17 @@ function PublishFile({ toast, username }: { toast: (s: string, k?: Toast['kind']
         </div>
         {!!files.length && <div className="file-list">{files.map((f, i) => <div key={`${f.name}-${i}`}><span>{f.name}</span><small>{fmtBytes(f.size)}</small><button className="icon" onClick={() => setFiles(files.filter((_, idx) => idx !== i))}><X size={16} /></button></div>)}</div>}
         {!!uploadTasks.filter((task) => task.needsFileReselection).length && <div className="resume-hint">{t('file.resumeHint')}</div>}
-        <OptionsGrid form={form} setForm={setForm} />
+        <OptionsGrid form={form} setForm={setForm} permissions={permissions} />
         <Field label={t('file.optionalText')}><textarea className="short" value={form.content} onChange={(e) => setForm({ ...form, content: e.target.value })} placeholder={t('file.mixedPlaceholder')} /></Field>
         <button className="primary" onClick={upload} disabled={busy}><Upload size={16} /> {t('file.startUpload')}</button>
       </section>
-      <ContentTable title={t('content.recentFiles')} items={recent} toast={toast} refresh={load} compact />
+      <ContentTable title={t('content.recentFiles')} items={recent} toast={toast} refresh={load} compact permissions={permissions} />
       <UploadFloating state={progress} onClose={() => setProgress({ visible: false, stage: '', fileName: '', remaining: 0, progress: 0 })} />
     </div>
   );
 }
 
-function ContentTable({ title, items, toast, refresh, admin = false, compact = false }: { title: string; items: Content[]; toast: (s: string, k?: Toast['kind']) => void; refresh: () => void; admin?: boolean; compact?: boolean }) {
+function ContentTable({ title, items, toast, refresh, admin = false, compact = false, permissions }: { title: string; items: Content[]; toast: (s: string, k?: Toast['kind']) => void; refresh: () => void; admin?: boolean; compact?: boolean; permissions?: PermissionSet }) {
   const { t, language } = useI18n();
   const [editing, setEditing] = useState<Content | null>(null);
   const [qrItem, setQrItem] = useState<Content | null>(null);
@@ -968,13 +994,13 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
           </tbody>
         </table>
       </div>
-      {editing && <EditContent item={editing} admin={admin} close={() => setEditing(null)} done={() => { setEditing(null); refresh(); }} toast={toast} />}
+      {editing && <EditContent item={editing} admin={admin} permissions={permissions} close={() => setEditing(null)} done={() => { setEditing(null); refresh(); }} toast={toast} />}
       {qrItem && <QrShareModal item={qrItem} close={() => setQrItem(null)} toast={toast} />}
     </section>
   );
 }
 
-function EditContent({ item, admin, close, done, toast }: { item: Content; admin: boolean; close: () => void; done: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
+function EditContent({ item, admin, permissions, close, done, toast }: { item: Content; admin: boolean; permissions?: PermissionSet; close: () => void; done: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t, language } = useI18n();
   const [form, setForm] = useState({ title: item.title, remark: item.remark || '', visibility: item.visibility, expire_at: item.expire_at || '', max_views: item.max_views, text_content: item.text_content || '', format: item.format });
   async function save() {
@@ -990,7 +1016,7 @@ function EditContent({ item, admin, close, done, toast }: { item: Content; admin
     <div className="modal"><div className="dialog">
       <div className="panel-head"><h2>{admin ? (language === 'en-US' ? 'Admin content edit' : 'Admin 修改内容') : (language === 'en-US' ? 'Edit content' : '编辑内容')}</h2><button className="icon" onClick={close} aria-label={t('common.close')}><X /></button></div>
       {!admin && <Field label={t('text.title')}><input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></Field>}
-      <Field label={t('visibility.label')}><VisibilitySegment value={form.visibility} onChange={(visibility) => setForm({ ...form, visibility })} /></Field>
+      <Field label={t('visibility.label')}><VisibilitySegment value={form.visibility} permissions={permissions} onChange={(visibility) => setForm({ ...form, visibility })} /></Field>
       <ExpiryDatePicker className="expire-field" value={form.expire_at || ''} onChange={(expire_at) => setForm({ ...form, expire_at })} />
       <Field label={t('text.maxViews')}><input type="number" min="0" value={form.max_views} onChange={(e) => setForm({ ...form, max_views: Number(e.target.value) })} /></Field>
       {!admin && item.type !== 'file' && <Field label={language === 'en-US' ? 'Text content' : '文本内容'}><textarea className="short" value={form.text_content} onChange={(e) => setForm({ ...form, text_content: e.target.value })} /></Field>}
@@ -1000,7 +1026,7 @@ function EditContent({ item, admin, close, done, toast }: { item: Content; admin
   );
 }
 
-function MyContents({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+function MyContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
   const { t } = useI18n();
   const [items, setItems] = useState<Content[]>([]);
   const [filter, setFilter] = useState({ q: '', type: '', status: '' });
@@ -1024,7 +1050,7 @@ function MyContents({ toast }: { toast: (s: string, k?: Toast['kind']) => void }
         />
         <button className="soft" onClick={() => load()}>{t('common.search')}</button>
       </section>
-      <ContentTable title={t('content.my')} items={items} toast={toast} refresh={load} />
+      <ContentTable title={t('content.my')} items={items} toast={toast} refresh={load} permissions={permissions} />
     </div>
   );
 }
@@ -1078,7 +1104,7 @@ function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
   );
 }
 
-function UserSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+function UserSettings({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
   const { t, language } = useI18n();
   const [form, setForm] = useState<any>({ default_visibility: 'public', default_expire_days: 0, default_max_views: 0, default_format: 'markdown', default_endpoint: BASE_URL, default_slug_mode: 'random' });
   useEffect(() => { api<{ item: any }>('/api/settings/cli').then((r) => r.item && setForm(r.item)).catch((e) => toast(e.message, 'error')); }, []);
@@ -1097,7 +1123,7 @@ function UserSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => void
   return (
     <section className="panel">
       <div className="options-grid">
-        <Field label={t('settings.defaultVisibility')} className="status-field"><VisibilitySegment value={form.default_visibility} onChange={(default_visibility) => setForm({ ...form, default_visibility })} /></Field>
+        <Field label={t('settings.defaultVisibility')} className="status-field"><VisibilitySegment value={form.default_visibility} permissions={permissions} onChange={(default_visibility) => setForm({ ...form, default_visibility })} /></Field>
         <Field label={t('settings.defaultExpireDays')}><input type="number" min="0" value={form.default_expire_days} onChange={(e) => setForm({ ...form, default_expire_days: Number(e.target.value) })} /></Field>
         <Field label={t('settings.defaultMaxViews')}><input type="number" min="0" value={form.default_max_views} onChange={(e) => setForm({ ...form, default_max_views: Number(e.target.value) })} /></Field>
         <Field label={t('settings.defaultMarkdown')}><select value={form.default_format} onChange={(e) => setForm({ ...form, default_format: e.target.value })}><option value="markdown">markdown</option><option value="plain">plain</option></select></Field>
@@ -1110,16 +1136,17 @@ function UserSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => void
   );
 }
 
-function AdminPanel({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+function AdminPanel({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
   const { t } = useI18n();
   const [tab, setTab] = useState('dashboard');
-  const tabs = [['dashboard', t('admin.dashboard')], ['contents', t('admin.contents')], ['users', t('admin.users')], ['logs', t('admin.logs')], ['keys', t('admin.keys')], ['settings', t('admin.settings')]];
+  const tabs = [['dashboard', t('admin.dashboard')], ['contents', t('admin.contents')], ['users', t('admin.users')], ['permissions', t('admin.permissions')], ['logs', t('admin.logs')], ['keys', t('admin.keys')], ['settings', t('admin.settings')]];
   return (
     <div className="stack">
       <div className="tabs">{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
       {tab === 'dashboard' && <AdminDashboard toast={toast} />}
-      {tab === 'contents' && <AdminContents toast={toast} />}
-      {tab === 'users' && <ExpandableAdminTable endpoint="/api/admin/users" title={t('admin.users')} kind="users" toast={toast} />}
+      {tab === 'contents' && <AdminContents toast={toast} permissions={permissions} />}
+      {tab === 'users' && <UserManagement toast={toast} />}
+      {tab === 'permissions' && <PermissionManagement toast={toast} />}
       {tab === 'logs' && <ExpandableAdminTable endpoint="/api/admin/access-logs" title={t('admin.logs')} kind="logs" toast={toast} />}
       {tab === 'keys' && <ExpandableAdminTable endpoint="/api/admin/api-keys" title={t('admin.keys')} kind="keys" toast={toast} />}
       {tab === 'settings' && <AdminSettings toast={toast} />}
@@ -1163,16 +1190,15 @@ function Chart({ title, rows }: { title: string; rows: any[] }) {
   return <section className="panel chart"><h2>{title}</h2>{rows.length ? rows.map((r) => <div className="bar" key={r.label}><span>{r.label}</span><div><i style={{ width: `${(Number(r.value || 0) / max) * 100}%` }} /></div><b>{r.value}</b></div>) : <p className="empty">{t('common.noData')}</p>}</section>;
 }
 
-function AdminContents({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+function AdminContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
   const { t } = useI18n();
   const [items, setItems] = useState<Content[]>([]);
   const load = () => api<{ items: Content[] }>('/api/admin/contents').then((r) => setItems(r.items)).catch((e) => toast(e.message, 'error'));
   useEffect(() => { void load(); }, []);
-  return <ContentTable title={`${t('nav.admin')} · ${t('admin.contents')}`} items={items} toast={toast} refresh={load} admin />;
+  return <ContentTable title={`${t('nav.admin')} · ${t('admin.contents')}`} items={items} toast={toast} refresh={load} admin permissions={permissions} />;
 }
 
 function adminColumns(kind: string) {
-  if (kind === 'users') return ['username', 'total_count', 'text_count', 'file_count', 'last_publish_at', 'role', 'total_file_size'];
   if (kind === 'logs') return ['created_at', 'action', 'slug', 'username', 'ip'];
   return ['owner_username', 'remark', 'key_prefix', 'status', 'last_used_at', 'usage_count'];
 }
@@ -1187,12 +1213,27 @@ function labelOf(key: string, language = getInitialLanguage()) {
     last_publish_at: translate(language, 'admin.lastPublish'),
     role: translate(language, 'admin.role'),
     total_file_size: translate(language, 'admin.storage'),
+    used_bytes: translate(language, 'admin.usedStorage'),
+    reserved_bytes: translate(language, 'admin.reservedStorage'),
+    total_views: translate(language, 'admin.totalViews'),
     created_at: translate(language, 'admin.time'),
     action: translate(language, 'admin.action'),
     slug: 'slug',
     ip: translate(language, 'admin.ip'),
     remark: translate(language, 'keys.remark'),
     key_prefix: 'Key',
+    permission_group_name: translate(language, 'admin.permissionGroup'),
+    can_public_publish: translate(language, 'permission.publicPublish'),
+    can_api: translate(language, 'permission.api'),
+    can_internal_access: translate(language, 'permission.internalAccess'),
+    can_upload: translate(language, 'permission.storage'),
+    can_comment: translate(language, 'permission.comments'),
+    quota_bytes: translate(language, 'permission.storageQuota'),
+    public_count: 'public',
+    internal_count: 'internal',
+    private_count: 'private',
+    expired_count: translate(language, 'admin.expired'),
+    deleted_count: translate(language, 'admin.deleted'),
     status: translate(language, 'keys.status'),
     last_used_at: translate(language, 'admin.lastUsed'),
     usage_count: translate(language, 'admin.calls')
@@ -1202,16 +1243,275 @@ function labelOf(key: string, language = getInitialLanguage()) {
 
 function formatCell(key: string, value: any) {
   if (key.includes('size')) return fmtBytes(Number(value || 0));
+  if (key === 'quota_bytes' || key === 'used_bytes' || key === 'reserved_bytes') return fmtBytes(Number(value || 0));
   if (key.includes('_at') || key === 'created_at') return fmtDate(value);
   return String(value ?? '-');
 }
 
-function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: string; title: string; kind: 'users' | 'logs' | 'keys'; toast: (s: string, k?: Toast['kind']) => void }) {
+function CopyFullValue({ value, className = '' }: { value: string; className?: string }) {
+  const { t, language } = useI18n();
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 5000);
+    } catch {
+      setCopied(false);
+    }
+  }
+  const label = copied ? t('admin.copied') : t('admin.copyValue');
+  return <button type="button" className={`icon copy-value-btn ${copied ? 'copied' : ''} ${className}`} onClick={() => void copy()} aria-label={label} title={language === 'en-US' ? (copied ? 'Copied' : 'Copy full value') : label}>{copied ? <Check size={15} /> : <Clipboard size={15} />}</button>;
+}
+
+function isLongAuditKey(key: string): boolean {
+  return ['ip', 'user_agent', 'userAgent', 'browser', 'device', 'device_info'].includes(key);
+}
+
+function AdminAuditValue({ value, keyName, maxLength = 28 }: { value: unknown; keyName: string; maxLength?: number }) {
+  const raw = String(value ?? '');
+  if (!raw || raw === '-') return <span>-</span>;
+  if (!isLongAuditKey(keyName)) return <span>{raw}</span>;
+  return <span className="admin-audit-value"><span title={raw}>{compactAuditValue(raw, maxLength)}</span><CopyFullValue value={raw} /></span>;
+}
+
+function AdminCell({ keyName, value }: { keyName: string; value: any }) {
+  if (keyName === 'status') return <Badge text={formatCell(keyName, value)} danger={value !== 'active'} />;
+  if (keyName === 'key_prefix') {
+    const fingerprint = String(value || '-');
+    return <span className="admin-audit-value"><code title={fingerprint}>{compactAuditValue(fingerprint, 22)}</code><CopyFullValue value={fingerprint} /></span>;
+  }
+  return <AdminAuditValue keyName={keyName} value={formatCell(keyName, value)} />;
+}
+
+type AdminUserRow = {
+  username: string;
+  role: string;
+  permission_group_id: string;
+  permission_group_name: string;
+  can_public_publish: number | boolean;
+  can_api: number | boolean;
+  can_internal_access: number | boolean;
+  can_upload: number | boolean;
+  can_comment: number | boolean;
+  quota_bytes: number;
+  total_count: number;
+  text_count: number;
+  file_count: number;
+  mixed_count: number;
+  public_count: number;
+  internal_count: number;
+  private_count: number;
+  expired_count: number;
+  deleted_count: number;
+  total_file_size: number;
+  used_bytes: number;
+  reserved_bytes: number;
+  total_views: number;
+  last_publish_at?: string | null;
+};
+
+type PermissionGroup = {
+  id: string;
+  name: string;
+  is_system: boolean | number;
+  is_default: boolean | number;
+  can_public_publish: boolean | number;
+  can_api: boolean | number;
+  can_internal_access: boolean | number;
+  can_upload: boolean | number;
+  quota_bytes: number;
+  can_comment: boolean | number;
+  created_at?: string;
+  updated_at?: string;
+};
+
+const permissionLabels: Record<AdminPermissionKey, string> = {
+  can_public_publish: 'permission.publicPublish',
+  can_api: 'permission.api',
+  can_internal_access: 'permission.internalAccess',
+  can_upload: 'permission.storage',
+  can_comment: 'permission.comments',
+};
+
+function permissionEnabled(group: PermissionGroup, key: AdminPermissionKey): boolean {
+  return Boolean(group[key]);
+}
+
+function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+  const { t, language } = useI18n();
+  const [items, setItems] = useState<AdminUserRow[]>([]);
+  const [groups, setGroups] = useState<PermissionGroup[]>([]);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [selected, setSelected] = useState<AdminUserRow | null>(null);
+  const [query, setQuery] = useState('');
+  const [groupFilter, setGroupFilter] = useState('');
+  const load = async () => {
+    try {
+      const [users, groupResponse] = await Promise.all([
+        api<{ items: AdminUserRow[] }>('/api/admin/users'),
+        api<{ items: PermissionGroup[] }>('/api/admin/permission-groups'),
+      ]);
+      setItems(users.items || []);
+      setGroups(groupResponse.items || []);
+    } catch (err) {
+      toast((err as Error).message, 'error');
+    }
+  };
+  useEffect(() => { void load(); }, []);
+  const filtered = items.filter((row) => (!query || JSON.stringify(row).toLowerCase().includes(query.toLowerCase())) && (!groupFilter || row.permission_group_id === groupFilter));
+  const exportRows = () => {
+    const blob = new Blob([JSON.stringify(filtered, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'user-management.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  async function assignGroup() {
+    if (!selected) return;
+    const groupId = selected.permission_group_id;
+    try {
+      await api(`/api/admin/users/${encodeURIComponent(selected.username)}/group`, { method: 'PATCH', body: JSON.stringify({ group_id: groupId }) });
+      toast(language === 'en-US' ? 'Permission group assigned' : '权限组已分配');
+      setSelected(null);
+      await load();
+    } catch (err) {
+      toast((err as Error).message, 'error');
+    }
+  }
+  return (
+    <section className="panel admin-list">
+      <div className="admin-tools">
+        <div className="searchbox"><Search size={16} /><input placeholder={t('admin.searchUser')} value={query} onChange={(e) => setQuery(e.target.value)} /></div>
+        <FilterMenu values={{ group: groupFilter }} items={[{ key: 'group', label: t('admin.permissionGroup'), options: groups.map((group) => ({ value: group.id, label: group.name })) }]} onChange={(_, value) => setGroupFilter(value)} onClear={() => { setGroupFilter(''); setQuery(''); }} />
+        <button className="soft" onClick={() => void load()}><RefreshCw size={16} /> {t('common.refresh')}</button>
+        <button className="soft" onClick={exportRows}><Download size={16} /> {t('common.export')}</button>
+      </div>
+      <div className="admin-table-scroll"><div className="admin-table user-management-table">
+        <div className="admin-row admin-head users-head"><span /><strong>{t('admin.user')}</strong><strong>{t('admin.permissionGroup')}</strong><strong>{t('admin.contentCount')}</strong><strong>{t('admin.usedStorage')}</strong><strong>{t('admin.totalViews')}</strong><strong>{t('admin.lastPublish')}</strong><strong>{t('admin.manage')}</strong></div>
+        {filtered.map((row) => {
+          const isExpanded = Boolean(expanded[row.username]);
+          return <div className="admin-row-wrap" key={row.username}>
+            <div className="admin-row users-row">
+              <button className="expand-btn" onClick={() => setExpanded({ ...expanded, [row.username]: !isExpanded })} aria-label={t('admin.expandDetail')} title={t('admin.toggleDetail')}>{isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</button>
+              <span title={row.username}>{row.username}</span>
+              <span><Badge text={row.permission_group_name || '-'} /></span>
+              <span>{row.total_count}</span>
+              <span>{fmtBytes(row.used_bytes)}</span>
+              <span>{row.total_views}</span>
+              <span>{fmtDate(row.last_publish_at)}</span>
+              <button className="icon" onClick={() => setSelected({ ...row })} aria-label={t('admin.manageUser')} title={t('admin.manageUser')}><Settings size={16} /></button>
+            </div>
+            {isExpanded && <div className="admin-detail user-detail-grid">
+              {Object.entries(row).map(([key, value]) => <div key={key}><span>{labelOf(key, language)}</span><strong>{isLongAuditKey(key) ? <AdminAuditValue keyName={key} value={value} /> : formatCell(key, value)}</strong></div>)}
+            </div>}
+          </div>;
+        })}
+        {!filtered.length && <div className="empty">{t('common.noData')}</div>}
+      </div></div>
+      {selected && <div className="modal" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
+        <section className="dialog user-group-dialog" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="panel-head"><div><h2>{t('admin.manageUser')}</h2><p className="muted">{selected.username}</p></div><button className="icon" onClick={() => setSelected(null)} aria-label={t('common.close')} title={t('common.close')}><X size={18} /></button></div>
+          <div className="admin-user-usage">
+            <div><span>{t('admin.contentCount')}</span><strong>{selected.total_count}</strong></div>
+            <div><span>{t('admin.usedStorage')}</span><strong>{fmtBytes(selected.used_bytes)}</strong></div>
+            <div><span>{t('admin.reservedStorage')}</span><strong>{fmtBytes(selected.reserved_bytes)}</strong></div>
+            <div><span>{t('admin.totalViews')}</span><strong>{selected.total_views}</strong></div>
+          </div>
+          <Field label={t('admin.permissionGroup')}><select value={selected.permission_group_id} onChange={(event) => setSelected({ ...selected, permission_group_id: event.target.value })}>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}{group.is_default ? ` · ${t('admin.default')}` : ''}</option>)}</select></Field>
+          {(() => {
+            const group = groups.find((item) => item.id === selected.permission_group_id);
+            return group ? <div className="permission-chip-list">{permissionKeys.map((key) => <span className={permissionEnabled(group, key) ? 'allowed' : 'denied'} key={key}>{permissionEnabled(group, key) ? <Check size={13} /> : <X size={13} />} {t(permissionLabels[key])}</span>)}<span className="allowed"><Check size={13} /> {t('permission.storageQuota')}: {fmtBytes(group.quota_bytes)}</span></div> : null;
+          })()}
+          <div className="right"><button className="soft" onClick={() => setSelected(null)}>{t('common.cancel')}</button><button className="primary" onClick={() => void assignGroup()}><Save size={16} /> {t('common.save')}</button></div>
+        </section>
+      </div>}
+    </section>
+  );
+}
+
+type PermissionDraft = Omit<PermissionGroup, 'id' | 'created_at' | 'updated_at'> & { id?: string; quota_gib: string };
+
+function defaultPermissionDraft(): PermissionDraft {
+  return { name: '', is_system: false, is_default: false, can_public_publish: true, can_api: true, can_internal_access: true, can_upload: true, quota_bytes: 5 * 1024 ** 3, quota_gib: '5', can_comment: true };
+}
+
+function draftFromGroup(group: PermissionGroup): PermissionDraft {
+  return { ...group, quota_gib: String(Number(group.quota_bytes || 0) / 1024 ** 3) };
+}
+
+function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+  const { t, language } = useI18n();
+  const [groups, setGroups] = useState<PermissionGroup[]>([]);
+  const [draft, setDraft] = useState<PermissionDraft | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<PermissionGroup | null>(null);
+  const [replacementId, setReplacementId] = useState('');
+  const load = () => api<{ items: PermissionGroup[] }>('/api/admin/permission-groups').then((r) => setGroups(r.items || [])).catch((e) => toast((e as Error).message, 'error'));
+  useEffect(() => { void load(); }, []);
+  function setDraftValue<K extends keyof PermissionDraft>(key: K, value: PermissionDraft[K]) {
+    setDraft((current) => current ? { ...current, [key]: value } : current);
+  }
+  async function save() {
+    if (!draft || !draft.name.trim()) return toast(language === 'en-US' ? 'Group name is required' : '请输入权限组名称', 'error');
+    const quota = Math.max(0, Number(draft.quota_gib) || 0) * 1024 ** 3;
+    const body = { name: draft.name.trim(), is_default: Boolean(draft.is_default), can_public_publish: Boolean(draft.can_public_publish), can_api: Boolean(draft.can_api), can_internal_access: Boolean(draft.can_internal_access), can_upload: Boolean(draft.can_upload), can_comment: Boolean(draft.can_comment), quota_bytes: quota };
+    try {
+      await api(draft.id ? `/api/admin/permission-groups/${encodeURIComponent(draft.id)}` : '/api/admin/permission-groups', { method: draft.id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
+      toast(language === 'en-US' ? 'Permission group saved' : '权限组已保存');
+      setDraft(null);
+      await load();
+    } catch (err) {
+      toast((err as Error).message, 'error');
+    }
+  }
+  async function remove() {
+    if (!deleteTarget || !replacementId) return;
+    if (!confirm(language === 'en-US' ? 'Delete this group and reassign its users?' : '删除此权限组并重新分配组内用户？')) return;
+    try {
+      await api(`/api/admin/permission-groups/${encodeURIComponent(deleteTarget.id)}`, { method: 'DELETE', body: JSON.stringify({ replacement_group_id: replacementId }) });
+      toast(language === 'en-US' ? 'Permission group deleted' : '权限组已删除并完成重新分配');
+      setDeleteTarget(null);
+      setReplacementId('');
+      await load();
+    } catch (err) {
+      toast((err as Error).message, 'error');
+    }
+  }
+  return <section className="panel permission-management">
+    <div className="panel-head"><div><h2>{t('admin.permissions')}</h2><p className="muted">{t('admin.permissionHint')}</p></div><button className="primary" onClick={() => setDraft(defaultPermissionDraft())}><Plus size={16} /> {t('admin.createGroup')}</button></div>
+    <div className="permission-group-list">
+      {groups.map((group) => <article className="permission-group-card" key={group.id}>
+        <div className="permission-group-head"><div><h3>{group.name}</h3><div className="group-meta"><Badge text={group.is_system ? t('admin.builtIn') : t('admin.custom')} /><Badge text={group.is_default ? t('admin.default') : t('admin.notDefault')} /></div></div><div className="actions"><button className="icon" onClick={() => setDraft(draftFromGroup(group))} aria-label={t('admin.editGroup')} title={t('admin.editGroup')}><Pencil size={16} /></button><button className="icon danger" disabled={Boolean(group.is_system)} onClick={() => { setDeleteTarget(group); setReplacementId(groups.find((candidate) => candidate.id !== group.id)?.id || ''); }} aria-label={t('admin.deleteGroup')} title={group.is_system ? t('admin.builtInCannotDelete') : t('admin.deleteGroup')}><Trash2 size={16} /></button></div></div>
+        <div className="permission-chip-list">{permissionKeys.map((key) => <span className={permissionEnabled(group, key) ? 'allowed' : 'denied'} key={key}>{permissionEnabled(group, key) ? <Check size={13} /> : <X size={13} />} {t(permissionLabels[key])}</span>)}<span className="allowed"><Check size={13} /> {t('permission.storageQuota')}: {fmtBytes(group.quota_bytes)}</span></div>
+      </article>)}
+      {!groups.length && <p className="empty">{t('common.noData')}</p>}
+    </div>
+    {draft && <div className="modal" onMouseDown={(event) => { if (event.target === event.currentTarget) setDraft(null); }}><section className="dialog permission-editor" onMouseDown={(event) => event.stopPropagation()}>
+      <div className="panel-head"><h2>{draft.id ? t('admin.editGroup') : t('admin.createGroup')}</h2><button className="icon" onClick={() => setDraft(null)} aria-label={t('common.close')} title={t('common.close')}><X size={18} /></button></div>
+      <Field label={t('admin.groupName')}><input value={draft.name} disabled={Boolean(draft.is_system)} onChange={(event) => setDraftValue('name', event.target.value)} /></Field>
+      <Field label={t('permission.storageQuota')}><input type="number" min="0" step="0.1" value={draft.quota_gib} onChange={(event) => setDraftValue('quota_gib', event.target.value)} /></Field>
+      <label className="checkbox-field"><input type="checkbox" checked={Boolean(draft.is_default)} onChange={(event) => setDraftValue('is_default', event.target.checked)} /><span>{t('admin.makeDefault')}</span></label>
+      <div className="permission-editor-grid">{permissionKeys.map((key) => <label className="checkbox-field" key={key}><input type="checkbox" checked={Boolean(draft[key])} onChange={(event) => setDraftValue(key, event.target.checked)} /><span>{t(permissionLabels[key])}</span></label>)}</div>
+      <div className="right"><button className="soft" onClick={() => setDraft(null)}>{t('common.cancel')}</button><button className="primary" onClick={() => void save()}><Save size={16} /> {t('common.save')}</button></div>
+    </section></div>}
+    {deleteTarget && <div className="modal" onMouseDown={(event) => { if (event.target === event.currentTarget) setDeleteTarget(null); }}><section className="dialog permission-editor" onMouseDown={(event) => event.stopPropagation()}>
+      <div className="panel-head"><h2>{t('admin.deleteGroup')}</h2><button className="icon" onClick={() => setDeleteTarget(null)} aria-label={t('common.close')} title={t('common.close')}><X size={18} /></button></div>
+      <p>{language === 'en-US' ? `Users in ${deleteTarget.name} must be moved to another group.` : `${deleteTarget.name} 中的用户需要重新分配到其他组。`}</p>
+      <Field label={t('admin.replacementGroup')}><select value={replacementId} onChange={(event) => setReplacementId(event.target.value)}>{groups.filter((group) => group.id !== deleteTarget.id).map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></Field>
+      <div className="right"><button className="soft" onClick={() => setDeleteTarget(null)}>{t('common.cancel')}</button><button className="primary danger-fill" disabled={!replacementId} onClick={() => void remove()}><Trash2 size={16} /> {t('admin.deleteGroup')}</button></div>
+    </section></div>}
+  </section>;
+}
+
+function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: string; title: string; kind: 'logs' | 'keys'; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t, language } = useI18n();
   const [items, setItems] = useState<any[]>([]);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('');
+  const [newKey, setNewKey] = useState('');
   const columns = adminColumns(kind);
   const load = () => api<{ items: any[] }>(endpoint).then((r) => setItems(r.items)).catch((e) => toast(e.message, 'error'));
   useEffect(() => { load(); }, [endpoint]);
@@ -1230,7 +1530,19 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
     a.click();
     URL.revokeObjectURL(url);
   };
-  const showAction = kind !== 'users';
+  const showAction = kind === 'keys';
+  async function keyAction(row: any, action: 'rotate' | 'lock' | 'unlock' | 'revoke') {
+    const destructive = action !== 'unlock';
+    if (destructive && !confirm(language === 'en-US' ? `${action} this API key?` : `确认${action === 'rotate' ? '旋转' : action === 'lock' ? '锁定' : '吊销'}这个 API Key？`)) return;
+    try {
+      const result = await api<any>(`/api/admin/api-keys/${encodeURIComponent(row.id)}/${action}`, { method: 'POST' });
+      if (result.key) setNewKey(result.key);
+      toast(language === 'en-US' ? 'API key updated' : 'API Key 已更新');
+      await load();
+    } catch (err) {
+      toast((err as Error).message, 'error');
+    }
+  }
   return (
     <section className="panel admin-list">
       <div className="admin-tools">
@@ -1244,30 +1556,31 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
         <button className="soft" onClick={load}><RefreshCw size={16} /> {t('common.refresh')}</button>
         <button className="soft" onClick={exportRows}><Download size={16} /> {t('common.export')}</button>
       </div>
-      <div className="admin-table">
-        <div className={`admin-row admin-head ${showAction ? '' : 'no-action'}`}>
+      {newKey && <div className="one-time admin-one-time"><strong>{t('keys.fullOnce')}</strong><code>{newKey}</code><CopyFullValue value={newKey} /></div>}
+      <div className="admin-table-scroll"><div className="admin-table">
+        <div className={`admin-row admin-head ${showAction ? 'has-action' : 'no-action'}`}>
           <span />
           {columns.map((key) => <strong key={key}>{labelOf(key, language)}</strong>)}
-          {showAction && <strong>{t('admin.noAction')}</strong>}
+          {showAction && <strong>{t('admin.actions')}</strong>}
         </div>
         {filtered.map((row, index) => (
           <div className="admin-row-wrap" key={row.id || row.username || index}>
-            <div className={`admin-row ${showAction ? '' : 'no-action'}`}>
-              <button className="expand-btn" onClick={() => setExpanded({ ...expanded, [index]: !expanded[index] })} aria-label={t('admin.expandDetail')}>
+            <div className={`admin-row ${showAction ? 'has-action' : 'no-action'}`}>
+              <button className="expand-btn" onClick={() => setExpanded({ ...expanded, [index]: !expanded[index] })} aria-label={t('admin.expandDetail')} title={t('admin.toggleDetail')}>
                 {expanded[index] ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
               </button>
-              {columns.map((key) => <span key={key}>{key === 'status' ? <Badge text={formatCell(key, row[key])} danger={row[key] !== 'active'} /> : formatCell(key, row[key])}</span>)}
-              {showAction && <button className="soft compact-btn" onClick={() => setExpanded({ ...expanded, [index]: !expanded[index] })} title={t('admin.toggleDetail')}>{t('admin.operation')}</button>}
+              {columns.map((key) => <span key={key}><AdminCell keyName={key} value={key === 'key_prefix' ? `${row.key_prefix || '-'}...${row.key_suffix || ''}` : row[key]} /></span>)}
+              {showAction && <span className="admin-key-actions"><button className="icon" onClick={() => void keyAction(row, 'rotate')} aria-label={t('admin.rotateKey')} title={t('admin.rotateKey')}><RotateCw size={15} /></button>{row.locked_at ? <button className="icon" onClick={() => void keyAction(row, 'unlock')} aria-label={t('admin.unlockKey')} title={t('admin.unlockKey')}><Unlock size={15} /></button> : <button className="icon" onClick={() => void keyAction(row, 'lock')} aria-label={t('admin.lockKey')} title={t('admin.lockKey')}><Lock size={15} /></button>}<button className="icon danger" onClick={() => void keyAction(row, 'revoke')} aria-label={t('admin.revokeKey')} title={t('admin.revokeKey')}><Trash2 size={15} /></button></span>}
             </div>
             {expanded[index] && (
               <div className="admin-detail">
-                {Object.entries(row).map(([key, value]) => <div key={key}><span>{labelOf(key, language)}</span><strong>{formatCell(key, value)}</strong></div>)}
+                {Object.entries(row).map(([key, value]) => <div key={key}><span>{labelOf(key, language)}</span><strong>{isLongAuditKey(key) ? <AdminAuditValue keyName={key} value={value} maxLength={38} /> : formatCell(key, value)}</strong></div>)}
               </div>
             )}
           </div>
         ))}
         {!filtered.length && <div className="empty">{t('common.noData')}</div>}
-      </div>
+      </div></div>
     </section>
   );
 }
@@ -2112,6 +2425,7 @@ function App() {
   const { t } = useI18n();
   const { toasts, push } = useToast();
   const [user, setUser] = useState<User | null>(null);
+  const [profile, setProfile] = useState<AccessProfile | null>(null);
   const [page, setPage] = useState('text');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -2130,9 +2444,10 @@ function App() {
     }
     if (location.pathname === '/') {
       api<{ item: { landing_background?: any } }>('/api/public/settings').then((r) => setLandingBackground(r.item?.landing_background || null)).catch(() => {});
-      if (token()) api<{ user: User }>('/api/me').then(async (r) => {
+      if (token()) api<{ user: User; group: string; permissions: PermissionSet; storage: AccessProfile['storage'] }>('/api/me').then(async (r) => {
         await deleteUploadDatabase('content-share-upload-queue');
         setUser(r.user);
+        setProfile({ group: r.group, permissions: r.permissions, storage: r.storage });
       }).catch(() => setUser(null));
     }
   }, []);
@@ -2141,22 +2456,23 @@ function App() {
   if (location.pathname === '/docs') return <><ApiDocsPage /><Toasts items={toasts} /></>;
   if (location.pathname === '/face-transfer') return <><FaceTransferPublicPage toast={push} /><Toasts items={toasts} /></>;
   if (location.pathname === '/sso-callback') return <div className="public-page"><section className="panel narrow">{t('sso.completing')}</section><Toasts items={toasts} /></div>;
-  if (!user) return <><LandingPage background={landingBackground} /><Toasts items={toasts} /></>;
+  if (!user || !profile) return <><LandingPage background={landingBackground} /><Toasts items={toasts} /></>;
+  const permissions = profile.permissions || noPermissions;
   const titleMap: Record<string, string> = { text: t('nav.publishText'), file: t('nav.publishFile'), face: t('nav.faceTransfer'), mine: t('nav.myContent'), keys: t('nav.apiKeys'), settings: t('nav.settings'), admin: t('nav.admin') };
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
-      <Sidebar page={page} setPage={setPage} user={user} open={sidebarOpen} setOpen={setSidebarOpen} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} />
+      <Sidebar page={page} setPage={setPage} user={user} profile={profile} open={sidebarOpen} setOpen={setSidebarOpen} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} />
       {sidebarOpen && <button type="button" className="sidebar-scrim" aria-label={t('nav.closeSidebar')} onClick={() => setSidebarOpen(false)} />}
       <main>
         <Header title={titleMap[page]} onMenu={() => setSidebarOpen(true)} dark={dark} setDark={setDark} user={user} />
         <div className="content">
-          {page === 'text' && <PublishText toast={push} />}
-          {page === 'file' && <PublishFile toast={push} username={user.username} />}
+          {page === 'text' && <PublishText toast={push} permissions={permissions} />}
+          {page === 'file' && <PublishFile toast={push} username={user.username} permissions={permissions} />}
           {page === 'face' && <FaceTransfer toast={push} />}
-          {page === 'mine' && <MyContents toast={push} />}
+          {page === 'mine' && <MyContents toast={push} permissions={permissions} />}
           {page === 'keys' && <ApiKeys toast={push} />}
-          {page === 'settings' && <UserSettings toast={push} />}
-          {page === 'admin' && user.role === 'admin' && <AdminPanel toast={push} />}
+          {page === 'settings' && <UserSettings toast={push} permissions={permissions} />}
+          {page === 'admin' && user.role === 'admin' && <AdminPanel toast={push} permissions={permissions} />}
         </div>
       </main>
       <Toasts items={toasts} />
