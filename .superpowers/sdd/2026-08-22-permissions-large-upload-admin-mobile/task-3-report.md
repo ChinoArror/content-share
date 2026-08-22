@@ -103,3 +103,83 @@ Result: exit `0`; Git emitted only the checkout's LF-to-CRLF notices.
 - No blocker remains. Task 4 must still integrate atomic storage reservations, text byte accounting, and quota-capacity errors; Task 3 intentionally enforces storage permission and zero quota only.
 - No migration, deployment, or live production checks were requested or performed for this task.
 - Vite continues to emit the pre-existing React Babel/esbuild deprecation notices and generated chunk-size warning; neither was introduced by these Worker changes.
+
+## Fix Round 1
+
+### Reviewer Findings
+
+1. Owner and admin content PATCH routes checked only an explicit `body.visibility`, allowing edits to an already-public row after public-publish permission was removed.
+2. Admin rotation created a replacement key without checking the owner's current `can_api` permission.
+3. Comment and private memo deletion enforced share access and ownership but omitted `can_comment`.
+4. The recording D1 tests checked SQL text but did not retain execution-time bind values or prove batch targeting, order, and raw-secret exclusion.
+5. The route suite lacked the zero-quota case where `can_upload=true` but `quota_bytes=0`.
+
+### RED Evidence
+
+After adding the route regressions and strengthening the D1 recorder, before changing Worker code:
+
+```text
+npx vitest run src/access-control.test.ts
+```
+
+Result: exit `1`; `28` tests passed and `7` failed.
+
+The seven expected failures were:
+
+- owner title-only and text-only PATCH requests on existing public content returned `200` instead of `403`;
+- admin title-only and text-only PATCH requests on existing public content returned `200` instead of `403`;
+- public comment and private memo DELETE requests without `can_comment` returned `200` instead of `403`;
+- admin rotation for an owner without `can_api` returned `200` and created a replacement instead of returning `API_PERMISSION_REQUIRED`.
+
+The new zero-quota route regression already passed against the existing shared storage guard, confirming no production change was needed for finding 5.
+
+### Fix
+
+- Owner PATCH now derives the effective visibility from valid request visibility or the existing row, then applies the shared visibility guard before any update.
+- Admin PATCH now loads the existing row visibility, derives the same effective visibility, and applies the shared guard before its update or audit write.
+- Comment and private memo DELETE now load the owner's effective profile and require `can_comment` after share and ownership authorization, before reading or mutating the note.
+- Admin rotate now loads the key owner's effective profile and requires `can_api` before generating a raw replacement or constructing a D1 batch.
+- The test D1 recorder now captures each executed statement with its bind values and preserves batch order.
+- Group permission removal, user reassignment, default-group deletion, and key rotation tests now assert exact statement order and target bind values.
+- The rotation regression independently recomputes `SHA-256("api-key:" + raw)`, verifies the stored hash/prefix/suffix, and proves the raw secret appears in no D1 or audit bind.
+
+### GREEN Evidence
+
+Focused command:
+
+```text
+npx vitest run src/access-control.test.ts src/worker-permissions.test.ts src/i18n.test.ts
+```
+
+Result: exit `0`; `3` files and `47` tests passed.
+
+Full command:
+
+```text
+npm test
+```
+
+Result: exit `0`; `12` files and `90` tests passed.
+
+Type check:
+
+```text
+npx tsc --noEmit
+```
+
+Result: exit `0` with no diagnostics.
+
+Production build:
+
+```text
+npm run build
+```
+
+Result: exit `0`; Vite transformed `1688` modules and built in `17.25s`. It emitted only the pre-existing deprecation and generated chunk-size warnings.
+
+### Fix Round Self-Review
+
+- Effective-visibility enforcement now covers omitted, invalid, public, internal, and private request visibility without changing the resulting stored visibility.
+- Denied admin rotation performs no API Key insert, revocation, or audit batch and generates no replacement secret.
+- Note delete preserves the prior authorization order: share/password access, publisher ownership, business permission, note existence, then deletion.
+- Raw rotated secrets remain response-only; D1 receives the independent hash plus display prefix/suffix, and audit detail contains only owner and replacement key identifiers.

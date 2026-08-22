@@ -110,6 +110,7 @@ function testDb(options: TestDbOptions = {}) {
     if (sql.includes('FROM permission_groups WHERE is_default = 1')) return { id: 'permission-group-user' };
     if (sql.startsWith('SELECT * FROM contents WHERE slug')) return currentContent;
     if (sql.startsWith('SELECT * FROM contents WHERE id')) return currentContent;
+    if (sql.startsWith('SELECT visibility FROM contents WHERE id')) return currentContent;
     if (sql.startsWith('SELECT id, owner_username, title, slug')) return currentContent;
     if (sql.startsWith('SELECT * FROM attachments WHERE id')) return currentAttachment;
     if (sql.startsWith('SELECT * FROM upload_sessions WHERE attachment_id')) return null;
@@ -146,18 +147,30 @@ function testDb(options: TestDbOptions = {}) {
   }
 
   function statement(sql: string, values: unknown[] = []): RecordedStatement {
-    return {
+    const item: RecordedStatement = {
       sql,
       values,
       bind: (...nextValues: unknown[]) => statement(sql, nextValues),
-      first: async <T>() => firstFor(sql, values) as T | null,
-      run: async () => ({ meta: { changes: 1 } }),
-      all: async <T>() => ({ results: allFor(sql) as T[] }),
+      first: async <T>() => {
+        executed.push(item);
+        return firstFor(sql, values) as T | null;
+      },
+      run: async () => {
+        executed.push(item);
+        return { meta: { changes: 1 } };
+      },
+      all: async <T>() => {
+        executed.push(item);
+        return { results: allFor(sql) as T[] };
+      },
     };
+    return item;
   }
 
+  const executed: RecordedStatement[] = [];
   const db = {
     prepared,
+    executed,
     batches,
     prepare(sql: string) {
       const item = statement(sql);
@@ -166,10 +179,15 @@ function testDb(options: TestDbOptions = {}) {
     },
     async batch(items: RecordedStatement[]) {
       batches.push(items);
+      executed.push(...items);
       return items.map(() => ({ meta: { changes: 1 } }));
     },
   };
-  return db as unknown as D1Database & { prepared: RecordedStatement[]; batches: RecordedStatement[][] };
+  return db as unknown as D1Database & {
+    prepared: RecordedStatement[];
+    executed: RecordedStatement[];
+    batches: RecordedStatement[][];
+  };
 }
 
 function env(db: D1Database) {
@@ -207,6 +225,11 @@ async function errorBody(response: Response) {
   return response.json() as Promise<{ ok: false; message: string; code?: string; details?: Record<string, unknown> }>;
 }
 
+async function apiKeyHash(raw: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`api-key:${raw}`));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 describe('route-level business permissions', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(JSON.stringify({
@@ -235,6 +258,18 @@ describe('route-level business permissions', () => {
 
     expect(response.status).toBe(403);
     await expect(errorBody(response)).resolves.toMatchObject({ ok: false, code: 'STORAGE_PERMISSION_REQUIRED' });
+  });
+
+  it('rejects creation when storage permission is enabled but quota is zero', async () => {
+    const db = testDb({ profile: { can_upload: 1, quota_bytes: 0 } });
+
+    const response = await invoke(db, '/api/contents/text', {
+      method: 'POST',
+      body: JSON.stringify({ visibility: 'private', content: 'hello' }),
+    });
+
+    expect(response.status).toBe(403);
+    await expect(errorBody(response)).resolves.toMatchObject({ code: 'STORAGE_PERMISSION_REQUIRED' });
   });
 
   it.each(['text', 'file', 'direct', 'cli'])('enforces storage permission on %s creation', async (kind) => {
@@ -276,6 +311,22 @@ describe('route-level business permissions', () => {
     expect(settings.status).toBe(403);
     await expect(errorBody(update)).resolves.toMatchObject({ code: 'PUBLIC_PUBLISH_PERMISSION_REQUIRED' });
     await expect(errorBody(settings)).resolves.toMatchObject({ code: 'PUBLIC_PUBLISH_PERMISSION_REQUIRED' });
+  });
+
+  it.each([
+    { label: 'title', body: { title: 'Updated title' } },
+    { label: 'text', body: { text_content: 'Updated text' } },
+  ])('rejects owner $label-only updates when the effective visibility remains public', async ({ body }) => {
+    const db = testDb({
+      profile: { can_public_publish: 0 },
+      content: contentRow({ visibility: 'public' }),
+    });
+
+    const response = await invoke(db, '/api/contents/cnt_1', { method: 'PATCH', body: JSON.stringify(body) });
+
+    expect(response.status).toBe(403);
+    await expect(errorBody(response)).resolves.toMatchObject({ code: 'PUBLIC_PUBLISH_PERMISSION_REQUIRED' });
+    expect(db.executed.some((item) => item.sql.startsWith('UPDATE contents SET title='))).toBe(false);
   });
 
   it.each([
@@ -327,6 +378,23 @@ describe('route-level business permissions', () => {
     expect(memo.status).toBe(403);
     await expect(errorBody(comment)).resolves.toMatchObject({ code: 'COMMENT_PERMISSION_REQUIRED' });
     await expect(errorBody(memo)).resolves.toMatchObject({ code: 'COMMENT_PERMISSION_REQUIRED' });
+  });
+
+  it.each([
+    { label: 'comment', visibility: 'public' },
+    { label: 'private memo', visibility: 'private' },
+  ])('requires comment permission to delete a $label after ownership authorization', async ({ visibility }) => {
+    const db = testDb({
+      profile: { can_comment: 0 },
+      content: contentRow({ visibility }),
+    });
+
+    const response = await invoke(db, '/api/share/shared-item/notes/note_1', { method: 'DELETE' });
+
+    expect(response.status).toBe(403);
+    await expect(errorBody(response)).resolves.toMatchObject({ code: 'COMMENT_PERMISSION_REQUIRED' });
+    expect(db.executed.some((item) => item.sql.startsWith('SELECT id FROM content_notes'))).toBe(false);
+    expect(db.executed.some((item) => item.sql.startsWith('UPDATE content_notes'))).toBe(false);
   });
 
   it('requires API permission on user key management routes', async () => {
@@ -403,6 +471,22 @@ describe('route-level admin permission mutations', () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
+  it.each([
+    { label: 'title', body: { title: 'Updated title' } },
+    { label: 'text', body: { text_content: 'Updated text' } },
+  ])('rejects admin $label-only updates when the effective visibility remains public', async ({ body }) => {
+    const db = testDb({
+      profile: { username: 'root', role: 'admin', group_name: 'admin', can_public_publish: 0 },
+      content: contentRow({ visibility: 'public' }),
+    });
+
+    const response = await invoke(db, '/api/admin/contents/cnt_1', { method: 'PATCH', body: JSON.stringify(body) });
+
+    expect(response.status).toBe(403);
+    await expect(errorBody(response)).resolves.toMatchObject({ code: 'PUBLIC_PUBLISH_PERMISSION_REQUIRED' });
+    expect(db.executed.some((item) => item.sql.startsWith('UPDATE contents SET visibility='))).toBe(false);
+  });
+
   it('locks active keys in the same batch when a group loses API permission', async () => {
     const db = testDb({
       profile: { username: 'root', role: 'admin', group_name: 'admin' },
@@ -412,10 +496,15 @@ describe('route-level admin permission mutations', () => {
     const response = await invoke(db, '/api/admin/permission-groups/group_1', { method: 'PATCH', body: JSON.stringify({ can_api: false }) });
 
     expect(response.status).toBe(200);
-    const sql = db.batches.at(-1)!.map((item) => item.sql).join('\n');
-    expect(sql).toContain('UPDATE permission_groups');
-    expect(sql).toContain('UPDATE api_keys SET locked_at');
-    expect(sql).toContain('INSERT INTO admin_actions');
+    const batch = db.batches.at(-1)!;
+    expect(batch.map((item) => item.sql)).toEqual([
+      expect.stringContaining('UPDATE permission_groups'),
+      expect.stringContaining('UPDATE api_keys SET locked_at'),
+      expect.stringContaining('INSERT INTO admin_actions'),
+    ]);
+    expect(batch[0].values.at(-1)).toBe('group_1');
+    expect(batch[1].values).toEqual([expect.any(String), 'permission_group_api_removed', 'root', 'group_1']);
+    expect(batch[2].values.slice(1, 5)).toEqual(['root', 'update_permission_group', 'permission_group', 'group_1']);
   });
 
   it('returns current group and storage accounting in user management rows', async () => {
@@ -449,7 +538,15 @@ describe('route-level admin permission mutations', () => {
     const restored = await invoke(restoredDb, '/api/admin/permission-groups/group_1', { method: 'PATCH', body: JSON.stringify({ can_api: true }) });
 
     expect(assigned.status).toBe(200);
-    expect(noApiDb.batches.at(-1)!.map((item) => item.sql).join('\n')).toContain('UPDATE api_keys SET locked_at');
+    const assignmentBatch = noApiDb.batches.at(-1)!;
+    expect(assignmentBatch.map((item) => item.sql)).toEqual([
+      expect.stringContaining('UPDATE users SET permission_group_id'),
+      expect.stringContaining('UPDATE api_keys SET locked_at'),
+      expect.stringContaining('INSERT INTO admin_actions'),
+    ]);
+    expect(assignmentBatch[0].values).toEqual(['group_1', expect.any(String), 'alice']);
+    expect(assignmentBatch[1].values).toEqual([expect.any(String), 'user_reassigned_without_api', 'root', 'alice']);
+    expect(assignmentBatch[2].values.slice(1, 5)).toEqual(['root', 'assign_user_permission_group', 'user', 'alice']);
     expect(restored.status).toBe(200);
     expect(restoredDb.batches.at(-1)!.map((item) => item.sql).join('\n')).not.toContain('locked_at=NULL');
   });
@@ -489,16 +586,28 @@ describe('route-level admin permission mutations', () => {
     });
 
     expect(created.status).toBe(201);
-    const createSql = createDb.batches.at(-1)!.map((item) => item.sql).join('\n');
-    expect(createSql).toContain('SET is_default=0');
-    expect(createSql).toContain('INSERT INTO permission_groups');
-    expect(createSql).toContain('INSERT INTO admin_actions');
+    const createBatch = createDb.batches.at(-1)!;
+    expect(createBatch.map((item) => item.sql)).toEqual([
+      expect.stringContaining('SET is_default=0'),
+      expect.stringContaining('INSERT INTO permission_groups'),
+      expect.stringContaining('INSERT INTO admin_actions'),
+    ]);
+    expect(createBatch[2].values.slice(1, 4)).toEqual(['root', 'create_permission_group', 'permission_group']);
     expect(removed.status).toBe(200);
-    const deleteSql = deleteDb.batches.at(-1)!.map((item) => item.sql).join('\n');
-    expect(deleteSql).toContain('UPDATE users SET permission_group_id');
-    expect(deleteSql).toContain('UPDATE api_keys SET locked_at');
-    expect(deleteSql).toContain('DELETE FROM permission_groups');
-    expect(deleteSql).toContain('INSERT INTO admin_actions');
+    const deleteBatch = deleteDb.batches.at(-1)!;
+    expect(deleteBatch.map((item) => item.sql)).toEqual([
+      expect.stringContaining('UPDATE api_keys SET locked_at'),
+      expect.stringContaining('UPDATE users SET permission_group_id'),
+      expect.stringContaining('SET is_default=0'),
+      expect.stringContaining('SET is_default=1'),
+      expect.stringContaining('DELETE FROM permission_groups'),
+      expect.stringContaining('INSERT INTO admin_actions'),
+    ]);
+    expect(deleteBatch[0].values.at(-1)).toBe('group_1');
+    expect(deleteBatch[1].values).toEqual(['replacement', expect.any(String), 'group_1']);
+    expect(deleteBatch[3].values.at(-1)).toBe('replacement');
+    expect(deleteBatch[4].values).toEqual(['group_1']);
+    expect(deleteBatch[5].values.slice(1, 5)).toEqual(['root', 'delete_permission_group', 'permission_group', 'group_1']);
   });
 
   it('rejects duplicate group names and assignments to missing users', async () => {
@@ -549,6 +658,21 @@ describe('route-level admin permission mutations', () => {
     await expect(errorBody(response)).resolves.toMatchObject({ code: 'API_PERMISSION_REQUIRED' });
   });
 
+  it('rejects admin rotation when the owner lacks API permission without creating a replacement', async () => {
+    const db = testDb({
+      profile: { username: 'root', role: 'admin', group_name: 'admin', can_api: 1 },
+      ownerProfile: { username: 'alice', can_api: 0 },
+      apiKey: { id: 'key_1', owner_username: 'alice', remark: 'client', status: 'active', expire_at: null, locked_at: null },
+    });
+
+    const response = await invoke(db, '/api/admin/api-keys/key_1/rotate', { method: 'POST' });
+
+    expect(response.status).toBe(403);
+    await expect(errorBody(response)).resolves.toMatchObject({ code: 'API_PERMISSION_REQUIRED' });
+    expect(db.batches).toHaveLength(0);
+    expect(db.executed.some((item) => item.sql.startsWith('INSERT INTO api_keys'))).toBe(false);
+  });
+
   it('audits admin unlock and returns a rotated secret once', async () => {
     const unlockDb = testDb({
       profile: { username: 'alice', role: 'user', group_name: 'user', can_api: 1 },
@@ -556,6 +680,7 @@ describe('route-level admin permission mutations', () => {
     });
     const rotateDb = testDb({
       profile: { username: 'root', role: 'admin', group_name: 'admin', can_api: 1 },
+      ownerProfile: { username: 'alice', can_api: 1 },
       apiKey: { id: 'key_1', owner_username: 'alice', remark: 'client', status: 'active', expire_at: null, locked_at: null },
     });
 
@@ -567,7 +692,20 @@ describe('route-level admin permission mutations', () => {
     expect(unlockDb.batches.at(-1)!.map((item) => item.sql).join('\n')).toContain('locked_at=NULL');
     expect(rotated.status).toBe(200);
     expect(rotatedBody.key).toMatch(/^csk_[A-Za-z0-9_-]+$/);
-    expect(rotateDb.batches.at(-1)!.map((item) => item.sql).join('\n')).toContain('INSERT INTO admin_actions');
+    const raw = rotatedBody.key!;
+    const batch = rotateDb.batches.at(-1)!;
+    expect(batch.map((item) => item.sql)).toEqual([
+      expect.stringContaining('UPDATE api_keys SET status="revoked"'),
+      expect.stringContaining('INSERT INTO api_keys'),
+      expect.stringContaining('INSERT INTO admin_actions'),
+    ]);
+    expect(batch[0].values).toEqual([expect.any(String), 'key_1']);
+    expect(batch[1].values[1]).toBe('alice');
+    expect(batch[1].values[3]).toBe(await apiKeyHash(raw));
+    expect(batch[1].values[4]).toBe(raw.slice(0, 10));
+    expect(batch[1].values[5]).toBe(raw.slice(-4));
+    expect(batch[2].values.slice(1, 5)).toEqual(['root', 'rotate_api_key', 'api_key', 'key_1']);
+    expect(rotateDb.executed.flatMap((item) => item.values).some((value) => value === raw || String(value).includes(raw))).toBe(false);
   });
 
   it.each(['lock', 'revoke'] as const)('keeps admin %s distinct and audited', async (action) => {

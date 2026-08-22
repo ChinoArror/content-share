@@ -1455,8 +1455,8 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (!action && method === 'GET') return json({ ok: true, item: await contentWithAttachments(env.DB, contentId) });
     if (!action && method === 'PATCH') {
       const body = await readJson<any>(req);
-      if (body.visibility === 'public') requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_public_publish');
-      if (body.visibility === 'internal') requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_internal_access');
+      const visibility = ALLOWED_VISIBILITY.has(body.visibility) ? body.visibility : row.visibility;
+      requireVisibility(await loadUserAccessProfile(env.DB, user.username), visibility);
       const password = typeof body.password === 'string' && body.password ? await hashWithSalt(body.password) : { hash: row.password_hash, salt: row.password_salt };
       await env.DB.prepare(
         'UPDATE contents SET title=?1, remark=?2, visibility=?3, expire_at=?4, max_views=?5, format=?6, text_content=?7, password_hash=?8, password_salt=?9, updated_at=?10 WHERE id=?11'
@@ -1464,7 +1464,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
         .bind(
           body.title?.trim() || row.title,
           nullableText(body.remark) ?? row.remark,
-          ALLOWED_VISIBILITY.has(body.visibility) ? body.visibility : row.visibility,
+          visibility,
           body.expire_at === undefined ? row.expire_at : nullableText(body.expire_at),
           body.max_views === undefined ? row.max_views : numberField(body.max_views),
           ALLOWED_FORMAT.has(body.format) ? body.format : row.format,
@@ -1506,6 +1506,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     const user = await verifySso(req, env);
     await authorizeShareRequest(env, req, row, user, url.searchParams.get('admin_preview') === '1');
     if (user.username !== row.owner_username) throw new HttpError(403, 'Only the publisher can delete comments');
+    requirePermission(await loadUserAccessProfile(env.DB, user.username), 'can_comment');
     const note = await env.DB.prepare('SELECT id FROM content_notes WHERE id = ?1 AND content_id = ?2 AND deleted_at IS NULL').bind(noteId, row.id).first<any>();
     if (!note) throw new HttpError(404, 'Comment not found');
     const t = now();
@@ -1977,6 +1978,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
       return json({ ok: true });
     }
     if (action === 'rotate') {
+      requirePermission(await loadUserAccessProfile(env.DB, row.owner_username), 'can_api');
       const created = await newApiKey(env, row.owner_username, { remark: row.remark, expire_at: row.expire_at });
       await env.DB.batch([
         env.DB.prepare('UPDATE api_keys SET status="revoked", revoked_at=?1 WHERE id=?2').bind(t, keyId),
@@ -2040,10 +2042,12 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (!action && method === 'GET') return json({ ok: true, item: await contentWithAttachments(env.DB, contentId) });
     if (!action && method === 'PATCH') {
       const body = await readJson<any>(req);
-      if (body.visibility === 'public') requirePermission(await loadUserAccessProfile(env.DB, admin.username), 'can_public_publish');
-      if (body.visibility === 'internal') requirePermission(await loadUserAccessProfile(env.DB, admin.username), 'can_internal_access');
+      const row = await env.DB.prepare('SELECT visibility FROM contents WHERE id=?1').bind(contentId).first<{ visibility: string }>();
+      if (!row) throw new HttpError(404, 'Content not found');
+      const visibility = ALLOWED_VISIBILITY.has(body.visibility) ? body.visibility : row.visibility;
+      requireVisibility(await loadUserAccessProfile(env.DB, admin.username), visibility);
       await env.DB.prepare('UPDATE contents SET visibility=COALESCE(?1, visibility), expire_at=?2, max_views=COALESCE(?3, max_views), updated_at=?4 WHERE id=?5')
-        .bind(ALLOWED_VISIBILITY.has(body.visibility) ? body.visibility : null, body.expire_at === undefined ? null : nullableText(body.expire_at), body.max_views === undefined ? null : numberField(body.max_views), now(), contentId)
+        .bind(visibility, body.expire_at === undefined ? null : nullableText(body.expire_at), body.max_views === undefined ? null : numberField(body.max_views), now(), contentId)
         .run();
       await adminAction(env, admin, 'update_content', 'content', contentId, body);
       return json({ ok: true });
