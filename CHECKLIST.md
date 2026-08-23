@@ -131,3 +131,18 @@
 | 中文/English 全站切换 | 已完成 | `src/i18n.tsx`, `src/main.tsx`, `src/face-transfer.tsx`, `src/expiry-date-picker.tsx` | 无，浏览器本地语言偏好 | `localStorage` `content-share-language` + 浏览器语言回退 | Playwright 在落地页切换 English，确认导航/公共页面/预览固定文案切换 |
 | 语言偏好刷新后保留 | 已完成 | `src/i18n.tsx` | 无 | 浏览器 `localStorage` | 切换语言后刷新页面，确认按钮与标题保持所选语言 |
 | 移动端语言按钮不溢出 | 已完成 | `src/styles.css` | 无 | 浏览器视口布局 | Playwright 390×844 检查 `document.documentElement.scrollWidth === 390` |
+
+## L. Auth Center 弹窗与分享访问加固
+
+| 功能 | 状态 | 对应文件 | 对应 API | 数据来源 | 测试方法 |
+|---|---|---|---|---|---|
+| Auth Center 风格浮窗与右上角关闭 | 已完成 | `src/main.tsx`, `src/styles.css` | 内容、权限组、用户、二维码、确认操作 API | React 状态 + D1/R2 API | Playwright 打开弹窗，检查遮罩关闭、关闭按钮、页面滚动锁 |
+| 危险操作应用内二次确认 | 已完成 | `src/main.tsx`, `src/i18n.tsx` | 删除、永久删除、锁定、解锁、旋转、吊销 API | D1/R2 | 搜索 `confirm(` 无计划内调用；点击危险操作检查红色确认窗口 |
+| 列表查询 shimmer | 已完成 | `src/main.tsx`, `src/styles.css` | 用户、内容、日志、审计、设置 API | D1 查询状态 | Playwright 模拟慢请求，检查灰色横向光带移动 |
+| 动态发布状态控件与我的内容筛选器 | 已完成 | `src/main.tsx`, `src/styles.css` | `/api/me`, `/api/contents` | D1 权限与内容数据 | 无公开权限时检查控件缩短；390px 检查搜索和筛选同排且无页面横滚 |
+| Admin 用户/日志/API 审计紧凑双语详情 | 已完成 | `src/main.tsx`, `src/admin-display.ts`, `src/i18n.tsx`, `src/styles.css` | `/api/admin/users`, `/api/admin/access-logs`, `/api/admin/api-keys` | D1 聚合 | 展开详情检查双列、局部滚动、ID/IP/UA 复制和 5 秒反馈；切换语言检查枚举值 |
+| 密码分享 ticket 隔离 | 已完成 | `src/worker.ts`, `src/access-control.test.ts` | `/api/share/:slug`, `/api/attachments/:id/{preview-info,preview,download}` | D1 密码 hash + R2 对象 | 带 ticket 无密码请求四条路径均拒绝；正确密码请求在当前页面使用 blob |
+| 密码附件当前页预览/下载 | 已完成 | `src/main.tsx`, `src/share-resource.ts`, `src/share-resource.test.ts` | 同上 | 当前文档内存密码 + Blob/Object URL | 预览、下载并检查卸载释放 object URL；新标签页重新要求密码 |
+| SSO 切换登录回原分享页 | 已完成 | `src/main.tsx`, `src/sso-redirect.ts`, `src/sso-redirect.test.ts` | auth-center logout/login、`/api/sso-callback` | 同源 `return_to` | 外域、协议相对地址和带 token 回跳归一到 `/`；同源分享路径保留 |
+| 管理员联系入口 | 已完成 | `src/worker.ts`, `src/main.tsx`, `wrangler.toml`, `readme.md`, `readme_zh.md` | 登录后 `GET /api/public/admin-contact` | Worker `ADMIN_CONTACT_EMAIL` | 未登录/未配置返回不可用；已登录且配置后生成用户主动点击的 mailto |
+| 品牌 mark 与 favicon | 已完成 | `src/main.tsx`, `public/favicon.svg`, `index.html` | 无 | 静态品牌资源 | Playwright 检查侧栏、SSO 加载页、落地页和浏览器图标加载 |
