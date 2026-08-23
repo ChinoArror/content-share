@@ -33,6 +33,7 @@ import {
   withAllowedVisibility,
 } from './admin-display';
 import { classifyShareAccessError, type ShareAccessPresentation } from './share-access';
+import { classifyShareResourceError, shareResourceMode, type ShareResourceFailure } from './share-resource';
 import { currentReturnTo, safeReturnTo } from './sso-redirect';
 import {
   ChevronDown,
@@ -115,7 +116,7 @@ type Content = {
 type Attachment = { id: string; filename: string; content_type: string; size: number; media_ticket?: string; office_preview_allowed?: boolean };
 type Toast = { id: number; text: string; kind?: 'ok' | 'error' };
 type UploadProgress = { visible: boolean; stage: string; fileName: string; remaining: number; progress: number; speed?: number; eta?: number; failed?: boolean };
-type PreviewInfo = { id: string; filename: string; content_type: string; size: number; kind: PreviewKind; preview_url: string; download_url: string; office_embed_url?: string | null };
+type PreviewInfo = { id: string; filename: string; content_type: string; size: number; kind: PreviewKind; preview_url: string; download_url: string; media_ticket?: string; office_embed_url?: string | null };
 type ShareNote = {
   id: string;
   parent_id?: string | null;
@@ -210,6 +211,68 @@ function shareHeaders(password: string, shareTicket = ''): HeadersInit | undefin
   return [...headers.keys()].length ? headers : undefined;
 }
 
+class ShareResourceRequestError extends Error {
+  constructor(public readonly failure: ShareResourceFailure) {
+    super('Share resource request failed');
+    this.name = 'ShareResourceRequestError';
+  }
+}
+
+async function shareResourceFailure(response: Response): Promise<ShareResourceFailure> {
+  let code = '';
+  try {
+    const data = await response.clone().json() as { code?: unknown };
+    code = typeof data.code === 'string' ? data.code : '';
+  } catch {
+    // The resource endpoint may return an empty or non-JSON error body.
+  }
+  return classifyShareResourceError(response.status, code);
+}
+
+async function fetchShareResourceBlob(url: string, password: string): Promise<Blob> {
+  const response = await fetch(url, { headers: shareHeaders(password), credentials: 'include' });
+  if (!response.ok) throw new ShareResourceRequestError(await shareResourceFailure(response));
+  return response.blob();
+}
+
+function useShareResource(url: string, password: string, mediaTicket?: string | null, enabled = true) {
+  const mode = shareResourceMode(password, mediaTicket);
+  const [retry, setRetry] = useState(0);
+  const [state, setState] = useState<{ url: string | null; loading: boolean; failure: ShareResourceFailure | null }>(() => ({
+    url: mode === 'direct' && enabled ? url : null,
+    loading: mode === 'protected-blob' && enabled,
+    failure: null
+  }));
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl = '';
+    if (!enabled || mode === 'direct') {
+      setState({ url: enabled ? url : null, loading: false, failure: null });
+      return () => undefined;
+    }
+
+    setState({ url: null, loading: true, failure: null });
+    fetchShareResourceBlob(url, password)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setState({ url: objectUrl, loading: false, failure: null });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setState({ url: null, loading: false, failure: error instanceof ShareResourceRequestError ? error.failure : 'unavailable' });
+      });
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [enabled, mode, password, retry, url]);
+
+  return { ...state, protected: enabled && mode === 'protected-blob', retry: () => setRetry((value) => value + 1) };
+}
+
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (token()) headers.set('Authorization', `Bearer ${token()}`);
@@ -293,8 +356,52 @@ function avatarSrc(url?: string | null) {
   return value;
 }
 
-function DownloadButton({ url, className = 'primary', children }: { url: string; className?: string; children: React.ReactNode }) {
-  return <button type="button" className={className} onClick={() => location.assign(url)}>{children}</button>;
+function DownloadButton({
+  url,
+  className = 'primary',
+  children,
+  password = '',
+  mediaTicket,
+  filename,
+  onPasswordRequired,
+  onResourceError
+}: {
+  url: string;
+  className?: string;
+  children: React.ReactNode;
+  password?: string;
+  mediaTicket?: string | null;
+  filename?: string;
+  onPasswordRequired?: () => void;
+  onResourceError?: (failure: ShareResourceFailure) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const protectedResource = shareResourceMode(password, mediaTicket) === 'protected-blob';
+
+  async function download() {
+    if (!protectedResource) {
+      location.assign(url);
+      return;
+    }
+    setLoading(true);
+    try {
+      const blob = await fetchShareResourceBlob(url, password);
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = filename || 'download';
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (error) {
+      const failure = error instanceof ShareResourceRequestError ? error.failure : 'unavailable';
+      if (failure === 'password') onPasswordRequired?.();
+      onResourceError?.(failure);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return <button type="button" className={className} onClick={() => void download()} disabled={loading}>{children}</button>;
 }
 
 function authCenterProfile(user: User) {
@@ -1990,11 +2097,38 @@ function attachmentPreviewInfo(attachment: Attachment, adminPreview: boolean): P
     kind,
     preview_url: previewUrl,
     download_url: attachmentUrl(attachment.id, 'download', attachment.media_ticket, adminPreview),
+    media_ticket: attachment.media_ticket,
     office_embed_url: kind === 'office' && attachment.office_preview_allowed ? `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(`${location.origin}${previewUrl}`)}` : null
   };
 }
 
-function PdfCanvasPreview({ info }: { info: PreviewInfo }) {
+function ShareResourceState({
+  loading,
+  failure,
+  onRetry,
+  onPasswordRequired
+}: {
+  loading: boolean;
+  failure: ShareResourceFailure | null;
+  onRetry: () => void;
+  onPasswordRequired?: () => void;
+}) {
+  const { t } = useI18n();
+  if (!loading && !failure) return null;
+  const passwordFailure = failure === 'password';
+  return (
+    <section className="share-resource-state" role={failure ? 'alert' : 'status'}>
+      <p>{loading ? t('preview.resourceLoading') : passwordFailure ? t('preview.resourcePasswordReload') : t('preview.resourceLoadFailed')}</p>
+      {!loading && (
+        <button type="button" className="soft" onClick={passwordFailure && onPasswordRequired ? onPasswordRequired : onRetry}>
+          {passwordFailure ? t('preview.resourceReenterPassword') : t('preview.resourceRetry')}
+        </button>
+      )}
+    </section>
+  );
+}
+
+function PdfCanvasPreview({ info, password = '', onPasswordRequired }: { info: PreviewInfo; password?: string; onPasswordRequired?: () => void }) {
   const { t } = useI18n();
   const hostRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState(t('preview.loading'));
@@ -2061,7 +2195,7 @@ function PdfCanvasPreview({ info }: { info: PreviewInfo }) {
   return (
     <div className="pdf-canvas-preview">
       <div className="pdf-status">{error || status}</div>
-      {error && <a className="primary" href={info.download_url}><Download size={16} /> {t('common.download')}</a>}
+      {error && <DownloadButton url={info.download_url} password={password} mediaTicket={info.media_ticket} filename={info.filename} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton>}
       <div ref={hostRef} className="pdf-pages" />
     </div>
   );
@@ -2309,9 +2443,14 @@ function ZipPagePreview({ info }: { info: PreviewInfo }) {
   );
 }
 
-function PreviewCanvas({ info, toast }: { info: PreviewInfo; toast?: (s: string, k?: Toast['kind']) => void }) {
+function PreviewCanvas({ info, password = '', onPasswordRequired, toast }: { info: PreviewInfo; password?: string; onPasswordRequired?: () => void; toast?: (s: string, k?: Toast['kind']) => void }) {
   const { t } = useI18n();
-  const src = info.preview_url;
+  const previewable = ['image', 'video', 'audio', 'pdf', 'html', 'text', 'zip'].includes(info.kind);
+  const resource = useShareResource(info.preview_url, password, info.media_ticket, previewable);
+  if (previewable && (resource.loading || resource.failure)) {
+    return <ShareResourceState loading={resource.loading} failure={resource.failure} onRetry={resource.retry} onPasswordRequired={onPasswordRequired} />;
+  }
+  const src = resource.url || info.preview_url;
   const download = info.download_url;
   const name = info.filename;
   return (
@@ -2319,35 +2458,38 @@ function PreviewCanvas({ info, toast }: { info: PreviewInfo; toast?: (s: string,
       {info.kind === 'image' && <img src={src} alt={name} />}
       {info.kind === 'video' && <video src={src} controls />}
       {info.kind === 'audio' && <audio src={src} controls />}
-      {info.kind === 'pdf' && <PdfCanvasPreview info={info} />}
+      {info.kind === 'pdf' && <PdfCanvasPreview info={{ ...info, preview_url: src }} password={password} onPasswordRequired={onPasswordRequired} />}
       {info.kind === 'html' && <HtmlPageFrame title={name} sourceUrl={src} />}
       {info.kind === 'text' && <iframe sandbox="" src={src} title={name} />}
       {info.kind === 'office' && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
-      {info.kind === 'zip' && <ZipPagePreview info={info} />}
-      {info.kind === 'office' && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{t('preview.downloadLocal')}</p><DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton></section>}
-      {info.kind === 'download' && <section className="panel narrow"><h1>{t('preview.unsupportedTitle')}</h1><p>{t('preview.downloadLocal')}</p><DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton></section>}
+      {info.kind === 'zip' && <ZipPagePreview info={{ ...info, preview_url: src }} />}
+      {info.kind === 'office' && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{t('preview.downloadLocal')}</p><DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton></section>}
+      {info.kind === 'download' && <section className="panel narrow"><h1>{t('preview.unsupportedTitle')}</h1><p>{t('preview.downloadLocal')}</p><DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton></section>}
     </>
   );
 }
 
-function AttachmentPreview({ attachment, password, adminPreview, toast }: { attachment: Attachment; password: string; adminPreview: boolean; toast: (s: string, k?: Toast['kind']) => void }) {
+function AttachmentPreview({ attachment, password, adminPreview, onPasswordRequired, toast }: { attachment: Attachment; password: string; adminPreview: boolean; onPasswordRequired?: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t } = useI18n();
   const info = attachmentPreviewInfo(attachment, adminPreview);
-  const preview = info.preview_url;
-  const download = info.download_url;
   const kind = previewKind(attachment.filename, attachment.content_type);
+  const previewable = ['image', 'video', 'audio', 'text'].includes(kind);
+  const resource = useShareResource(info.preview_url, password, info.media_ticket, previewable);
+  const preview = resource.url || info.preview_url;
+  const download = info.download_url;
   return (
     <div className="attachment-card">
       <div className="attachment-head">
         <FileUp size={18} />
         <strong>{attachment.filename}</strong>
         <span>{fmtBytes(attachment.size)}</span>
-        <DownloadButton url={download} className="soft download-btn attachment-download"><Download size={16} /> {t('common.download')}</DownloadButton>
+        <DownloadButton url={download} className="soft download-btn attachment-download" password={password} mediaTicket={info.media_ticket} filename={attachment.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton>
       </div>
-      {kind === 'image' && <img className="file-preview image-preview" src={preview} alt={attachment.filename} />}
-      {kind === 'video' && <video className="file-preview" controls src={preview} />}
-      {kind === 'audio' && <audio className="audio-preview" controls src={preview} />}
-      {kind === 'text' && <iframe sandbox="" className="file-preview frame-preview" src={preview} title={attachment.filename} />}
+      {previewable && (resource.loading || resource.failure) && <ShareResourceState loading={resource.loading} failure={resource.failure} onRetry={resource.retry} onPasswordRequired={onPasswordRequired} />}
+      {previewable && !resource.loading && !resource.failure && kind === 'image' && <img className="file-preview image-preview" src={preview} alt={attachment.filename} />}
+      {previewable && !resource.loading && !resource.failure && kind === 'video' && <video className="file-preview" controls src={preview} />}
+      {previewable && !resource.loading && !resource.failure && kind === 'audio' && <audio className="audio-preview" controls src={preview} />}
+      {previewable && !resource.loading && !resource.failure && kind === 'text' && <iframe sandbox="" className="file-preview frame-preview" src={preview} title={attachment.filename} />}
       {kind === 'download' && (
         <div className="preview-actions">
           <p className="muted">{t('preview.downloadable')}</p>
@@ -2397,7 +2539,7 @@ function FilePreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) => v
   );
 }
 
-function SharePreviewPage({ item, password, adminPreview, toast }: { item: Content; password: string; adminPreview: boolean; toast: (s: string, k?: Toast['kind']) => void }) {
+function SharePreviewPage({ item, password, adminPreview, onPasswordRequired, toast }: { item: Content; password: string; adminPreview: boolean; onPasswordRequired?: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t, language } = useI18n();
   const attachments = item.attachments || [];
   const routeFile = new URLSearchParams(location.search).get('file') || '';
@@ -2426,12 +2568,12 @@ function SharePreviewPage({ item, password, adminPreview, toast }: { item: Conte
             {attachments.map((a) => <option key={a.id} value={a.id}>{a.filename}</option>)}
           </select>
         )}
-        {info ? <DownloadButton url={info.download_url}><Download size={16} /> {t('common.download')}</DownloadButton> : <button className="soft" onClick={() => navigator.clipboard.writeText(location.href).then(() => toast(t('common.copied')))}>{t('common.copy')}</button>}
+        {info ? <DownloadButton url={info.download_url} password={password} mediaTicket={info.media_ticket} filename={info.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton> : <button className="soft" onClick={() => navigator.clipboard.writeText(location.href).then(() => toast(t('common.copied')))}>{t('common.copy')}</button>}
       </header>
       <main className={`preview-main ${showText ? 'text-preview-main' : ''} ${info?.kind === 'pdf' ? 'pdf-preview-main' : ''}`}>
         {showText ? (
           <TextPreviewBox html={renderTextHtml(item.format, item.text_content || '')} rawText={item.text_content || ''} />
-        ) : info ? <PreviewCanvas info={info} toast={toast} /> : <section className="panel narrow">{t('preview.noPreview')}</section>}
+        ) : info ? <PreviewCanvas info={info} password={password} onPasswordRequired={onPasswordRequired} toast={toast} /> : <section className="panel narrow">{t('preview.noPreview')}</section>}
       </main>
     </div>
   );
@@ -2617,6 +2759,11 @@ function ContentPreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) =
       setError({ message: (err as Error).message, code: err instanceof UploadRequestError ? err.code : undefined, attempted });
     }
   }
+  function requestPasswordAgain() {
+    setItem(null);
+    setPassword('');
+    setError({ message: '', code: 'PASSWORD_REQUIRED_OR_INCORRECT', attempted: false });
+  }
   useEffect(() => { void load('', false); }, [slug]);
   const accessPresentation: ShareAccessPresentation = error ? classifyShareAccessError(error.code, error.message) : 'generic';
   useEffect(() => {
@@ -2660,7 +2807,7 @@ function ContentPreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) =
     );
   }
   if (!item) return <div className="share-shell"><section className="panel narrow">{t('preview.loading')}</section></div>;
-  if (preview) return <SharePreviewPage item={item} password={password} adminPreview={adminPreview} toast={toast} />;
+  if (preview) return <SharePreviewPage item={item} password={password} adminPreview={adminPreview} onPasswordRequired={requestPasswordAgain} toast={toast} />;
   const previewQs = new URLSearchParams();
   if (adminPreview) previewQs.set('admin_preview', '1');
   if (item.share_ticket && !item.password_required) previewQs.set('access', item.share_ticket);
@@ -2691,7 +2838,7 @@ function ContentPreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) =
           {!!item.attachments?.length && (
             <section className="panel share-files">
               <h2>{t('share.files')}</h2>
-              {item.attachments.map((a) => <AttachmentPreview key={a.id} attachment={a} password={password} adminPreview={adminPreview} toast={toast} />)}
+              {item.attachments.map((a) => <AttachmentPreview key={a.id} attachment={a} password={password} adminPreview={adminPreview} onPasswordRequired={requestPasswordAgain} toast={toast} />)}
             </section>
           )}
           <ShareNotesPanel item={item} password={password} adminPreview={adminPreview} toast={toast} />

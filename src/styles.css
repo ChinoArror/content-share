@@ -437,6 +437,9 @@ code, .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .frame-preview { min-height: 520px; }
 .audio-preview { width: 100%; }
 .preview-actions { display: grid; gap: 10px; }
+.share-resource-state { width: min(560px, 100%); display: grid; justify-items: center; gap: 12px; padding: 28px 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft); color: var(--muted); text-align: center; }
+.share-resource-state p { margin: 0; line-height: 1.7; }
+.share-resource-state button { min-height: 36px; }
 .preview-page { width: 100vw; height: 100dvh; background: var(--bg); overflow: hidden; display: grid; grid-template-rows: 62px minmax(0, 1fr); }
 .preview-topbar { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; padding: 0 18px; background: var(--panel); border-bottom: 1px solid var(--line); box-shadow: 0 1px 8px rgba(24,27,25,.04); }
 .preview-topbar strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
