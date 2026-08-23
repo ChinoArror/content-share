@@ -132,6 +132,7 @@ function testDb(options: TestDbOptions = {}) {
   }
 
   function allFor(sql: string): unknown[] {
+    if (sql.includes('FROM attachments') && currentAttachment) return [currentAttachment];
     if (sql.includes('FROM users u') && sql.includes('permission_group_name') && sql.includes('reserved_bytes')) {
       return [{
         username: 'alice',
@@ -363,6 +364,46 @@ describe('route-level business permissions', () => {
 
     expect(response.status).toBe(401);
     await expect(errorBody(response)).resolves.toMatchObject({ code: 'LOGIN_REQUIRED' });
+  });
+
+  it.each([
+    ['/api/share/shared-item', 'content'],
+    ['/api/attachments/att_1/preview-info?media=', 'attachment-info'],
+    ['/api/attachments/att_1/preview?media=', 'attachment-preview'],
+    ['/api/attachments/att_1/download?media=', 'attachment-download'],
+  ])('requires x-share-password for password content even with a valid ticket on %s', async (path, target) => {
+    const content = contentRow({ password_hash: 'hash', password_salt: 'salt' });
+    const db = testDb({ content, attachment: attachmentRow() });
+    const ticket = await issueMediaTicket('media-secret', {
+      attachmentId: target === 'content' ? 'content:cnt_1' : 'att_1',
+      actor: 'alice',
+      policyVersion: String(content.updated_at),
+    });
+    const requestPath = path.endsWith('media=') ? `${path}${encodeURIComponent(ticket)}` : path;
+    const init: RequestInit = target === 'content' ? { headers: { 'x-share-ticket': ticket } } : {};
+
+    const response = await invoke(db, requestPath, init);
+
+    expect(response.status).toBe(423);
+    await expect(errorBody(response)).resolves.toMatchObject({ code: 'PASSWORD_REQUIRED_OR_INCORRECT' });
+  });
+
+  it('does not emit reusable share or media tickets for password content', async () => {
+    const password = 'secret';
+    const passwordSalt = 'test-salt';
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${passwordSalt}:${password}`));
+    const passwordHash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    const db = testDb({
+      content: contentRow({ password_hash: passwordHash, password_salt: passwordSalt }),
+      attachment: attachmentRow(),
+    });
+
+    const response = await invoke(db, '/api/share/shared-item', { headers: { 'x-share-password': password } });
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as { item: { share_ticket?: string; attachments: Array<{ media_ticket?: string }> } };
+    expect(body.item.share_ticket).toBeUndefined();
+    expect(body.item.attachments[0]?.media_ticket).toBeUndefined();
   });
 
   it('keeps comments readable while blocking comment and memo writes', async () => {

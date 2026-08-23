@@ -21,6 +21,19 @@ export const permissionKeys = [
 
 export type AdminPermissionKey = typeof permissionKeys[number];
 
+const adminFieldLabelKeys: Record<string, string> = {
+  slug: 'admin.slug',
+  key_prefix: 'keys.key',
+  mixed_count: 'admin.mixed',
+  public_count: 'visibility.public',
+  internal_count: 'visibility.internal',
+  private_count: 'visibility.private',
+};
+
+export function adminFieldLabelKey(key: string): string | null {
+  return adminFieldLabelKeys[key] || null;
+}
+
 export type AdminVisibility = 'public' | 'internal' | 'private';
 const allVisibilityOptions: AdminVisibility[] = ['public', 'internal', 'private'];
 

@@ -20,6 +20,7 @@ import { MAX_UPLOAD_SIZE } from './transfer-policy';
 import { getInitialLanguage, I18nProvider, LanguageSwitcher, translate, useI18n, type Language } from './i18n';
 import {
   adminKeyActions,
+  adminFieldLabelKey,
   allowedVisibilityOptions,
   compactAuditValue,
   auditNullLabel,
@@ -32,6 +33,7 @@ import {
   withAllowedVisibility,
 } from './admin-display';
 import { classifyShareAccessError, type ShareAccessPresentation } from './share-access';
+import { currentReturnTo, safeReturnTo } from './sso-redirect';
 import {
   ChevronDown,
   ChevronRight,
@@ -376,8 +378,11 @@ function login() {
 }
 
 function switchLogin() {
+  const returnTo = currentReturnTo(location);
+  const callback = `${location.origin}/sso-callback?return_to=${encodeURIComponent(returnTo)}`;
+  const loginUrl = `${SSO_URL}/?client_id=${APP_ID}&redirect=${encodeURIComponent(callback)}`;
   localStorage.removeItem('sso_token');
-  location.href = `${SSO_URL}/logout?redirect=${encodeURIComponent(`${location.origin}/`)}`;
+  location.href = `${SSO_URL}/logout?redirect=${encodeURIComponent(loginUrl)}`;
 }
 
 function useToast() {
@@ -1456,10 +1461,10 @@ function labelOf(key: string, language = getInitialLanguage()) {
     locked_by: translate(language, 'admin.lockedBy'),
     locked_at: translate(language, 'admin.lockedAt'),
     action: translate(language, 'admin.action'),
-    slug: 'slug',
+    mixed_count: translate(language, 'admin.mixed'),
     ip: translate(language, 'admin.ip'),
     remark: translate(language, 'keys.remark'),
-    key_prefix: 'Key',
+    key_prefix: translate(language, 'keys.key'),
     permission_group_name: translate(language, 'admin.permissionGroup'),
     can_public_publish: translate(language, 'permission.publicPublish'),
     can_api: translate(language, 'permission.api'),
@@ -1467,16 +1472,14 @@ function labelOf(key: string, language = getInitialLanguage()) {
     can_upload: translate(language, 'permission.storage'),
     can_comment: translate(language, 'permission.comments'),
     quota_bytes: translate(language, 'permission.storageQuota'),
-    public_count: 'public',
-    internal_count: 'internal',
-    private_count: 'private',
     expired_count: translate(language, 'admin.expired'),
     deleted_count: translate(language, 'admin.deleted'),
     status: translate(language, 'keys.status'),
     last_used_at: translate(language, 'admin.lastUsed'),
     usage_count: translate(language, 'admin.calls')
   };
-  return map[key] || key;
+  const translatedKey = adminFieldLabelKey(key);
+  return translatedKey ? translate(language, translatedKey) : map[key] || key;
 }
 
 function formatCell(key: string, value: any) {
@@ -2794,9 +2797,10 @@ function App() {
   useEffect(() => {
     if (location.pathname === '/sso-callback') {
       const t = new URLSearchParams(location.search).get('token');
+      const returnTo = safeReturnTo(new URLSearchParams(location.search).get('return_to'), location.origin);
       if (t) {
         api<{ user: User; token: string }>('/api/sso-callback', { method: 'POST', body: JSON.stringify({ token: t }) })
-          .then((r) => { localStorage.setItem('sso_token', r.token); location.href = '/'; })
+          .then((r) => { localStorage.setItem('sso_token', r.token); location.href = returnTo; })
           .catch((e) => push(e.message, 'error'));
       }
       return;

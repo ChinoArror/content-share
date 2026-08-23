@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { translate } from './i18n';
 import {
+  adminFieldLabelKey,
   adminKeyActions,
   compactAuditValue,
   middleEllipsis,
@@ -12,6 +14,20 @@ import {
 } from './admin-display';
 
 describe('admin display helpers', () => {
+  it('maps admin detail fields to localized message keys', () => {
+    expect(adminFieldLabelKey('slug')).toBe('admin.slug');
+    expect(adminFieldLabelKey('key_prefix')).toBe('keys.key');
+    expect(adminFieldLabelKey('mixed_count')).toBe('admin.mixed');
+    expect(adminFieldLabelKey('public_count')).toBe('visibility.public');
+    expect(adminFieldLabelKey('internal_count')).toBe('visibility.internal');
+    expect(adminFieldLabelKey('private_count')).toBe('visibility.private');
+    expect(adminFieldLabelKey('permission_group_id')).toBe(null);
+    expect(translate('zh-CN', adminFieldLabelKey('public_count')!)).toBe('公开');
+    expect(translate('en-US', adminFieldLabelKey('public_count')!)).toBe('Public');
+    expect(translate('zh-CN', adminFieldLabelKey('mixed_count')!)).toBe('混合');
+    expect(translate('en-US', adminFieldLabelKey('mixed_count')!)).toBe('Mixed');
+  });
+
   it('keeps the beginning and end of long values', () => {
     expect(compactAuditValue('Mozilla/5.0 very long browser signature', 22)).toMatch(/^Mozilla\/5\.0.*….*signature$/);
   });

@@ -673,17 +673,23 @@ async function shareContentWithAttachments(env: Env, contentId: string, actor?: 
   const { results } = await env.DB.prepare(
     'SELECT id, filename, content_type, size, status, created_at FROM attachments WHERE content_id = ?1 AND status = "active" ORDER BY created_at ASC'
   ).bind(contentId).all<any>();
-  const attachments = await Promise.all((results || []).map(async (attachment) => ({
-    ...attachment,
-    office_preview_allowed: content.visibility === 'public' && !content.password_hash,
-    media_ticket: await issueMediaTicket(env.MEDIA_TICKET_SECRET, {
-      attachmentId: attachment.id,
-      actor,
-      adminPreview,
-      policyVersion: content.updated_at,
-      expiresInSeconds: MEDIA_TICKET_TTL_SECONDS
-    })
-  })));
+  const attachments = await Promise.all((results || []).map(async (attachment) => {
+    const safeAttachment = {
+      ...attachment,
+      office_preview_allowed: content.visibility === 'public' && !content.password_hash,
+    };
+    if (content.password_hash) return safeAttachment;
+    return {
+      ...safeAttachment,
+      media_ticket: await issueMediaTicket(env.MEDIA_TICKET_SECRET, {
+        attachmentId: attachment.id,
+        actor,
+        adminPreview,
+        policyVersion: content.updated_at,
+        expiresInSeconds: MEDIA_TICKET_TTL_SECONDS
+      })
+    };
+  }));
   const { password_hash: _passwordHash, ...safeContent } = content;
   return { ...safeContent, password_required: Boolean(content.password_hash), attachments };
 }
@@ -721,7 +727,7 @@ async function authorizeShareRequest(
   const ticket = ticketValue
     ? await verifyMediaTicket(env.MEDIA_TICKET_SECRET, ticketValue, contentTicketKey(row.id))
     : null;
-  if (ticket && ticket.policyVersion === row.updated_at) {
+  if (ticket && ticket.policyVersion === row.updated_at && !row.password_hash) {
     await assertInternalShareAccess(env, row, user);
     const adminPreview = ticket.adminPreview;
     if (row.status === 'processing') throw new HttpError(409, 'Upload is still processing');
@@ -1977,15 +1983,17 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
       await logAccess(env, req, { contentId: row.id, slug, username: user?.username, action: 'preview' });
     }
     const item = await shareContentWithAttachments(env, row.id, access.actor, access.adminPreview);
-    item.share_ticket = access.ticketAuthorized
-      ? req.headers.get('x-share-ticket')
-      : await issueMediaTicket(env.MEDIA_TICKET_SECRET, {
-          attachmentId: contentTicketKey(row.id),
-          actor: user?.username,
-          adminPreview: access.adminPreview,
-          policyVersion: row.updated_at,
-          expiresInSeconds: MEDIA_TICKET_TTL_SECONDS
-        });
+    if (!row.password_hash) {
+      item.share_ticket = access.ticketAuthorized
+        ? req.headers.get('x-share-ticket')
+        : await issueMediaTicket(env.MEDIA_TICKET_SECRET, {
+            attachmentId: contentTicketKey(row.id),
+            actor: user?.username,
+            adminPreview: access.adminPreview,
+            policyVersion: row.updated_at,
+            expiresInSeconds: MEDIA_TICKET_TTL_SECONDS
+          });
+    }
     return json({ ok: true, item });
   }
 
@@ -2000,7 +2008,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (att.status !== 'active') throw new HttpError(409, 'Attachment has not passed upload validation');
     const suppliedTicket = url.searchParams.get('media');
     const verifiedTicket = suppliedTicket ? await verifyMediaTicket(env.MEDIA_TICKET_SECRET, suppliedTicket, att.id) : null;
-    const existingTicket = verifiedTicket?.policyVersion === row.updated_at ? verifiedTicket : null;
+    const existingTicket = !row.password_hash && verifiedTicket?.policyVersion === row.updated_at ? verifiedTicket : null;
     if (existingTicket) {
       await assertInternalShareAccess(env, row, user);
       adminPreview = existingTicket.adminPreview;
@@ -2009,6 +2017,9 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
       if (isExpiredIgnoringViews(row) && !adminPreview) throw new HttpError(410, 'Content expired');
     } else {
       await assertShareAccess(env, req, row, user, sharePassword(req), adminPreview);
+      if (row.password_hash) {
+        throw new HttpError(409, 'Password-protected attachments must be reloaded from the password page', 'PASSWORD_ATTACHMENT_RELOAD_REQUIRED');
+      }
     }
     const ticket = existingTicket ? suppliedTicket! : await issueMediaTicket(env.MEDIA_TICKET_SECRET, {
       attachmentId: att.id,
@@ -2052,7 +2063,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     let user: User | null = null;
     let adminPreview = false;
     let actor: string | undefined;
-    if (ticket) {
+    if (ticket && !row.password_hash) {
       if (row.visibility === 'internal') user = await optionalUser(req, env);
       await assertInternalShareAccess(env, row, user);
       adminPreview = ticket.adminPreview;
