@@ -15,6 +15,7 @@ type Env = {
   SSO_APP_ID: string;
   MEDIA_TICKET_SECRET: string;
   PUBLIC_BASE_URL: string;
+  ADMIN_CONTACT_EMAIL?: string;
   R2_ACCOUNT_ID?: string;
   R2_BUCKET_NAME?: string;
   R2_UPLOAD_ACCESS_KEY_ID?: string;
@@ -684,7 +685,7 @@ async function shareContentWithAttachments(env: Env, contentId: string, actor?: 
     })
   })));
   const { password_hash: _passwordHash, ...safeContent } = content;
-  return { ...safeContent, attachments };
+  return { ...safeContent, password_required: Boolean(content.password_hash), attachments };
 }
 
 async function assertRestorableContent(env: Env, row: any): Promise<void> {
@@ -701,7 +702,7 @@ async function assertShareAccess(env: Env, req: Request, row: any, user: User | 
   if (isExpired(row) && !(user?.role === 'admin' && adminPreview)) throw new HttpError(410, 'Content expired');
   if (!(await verifyHash(password, row.password_hash, row.password_salt))) {
     await logAccess(env, req, { contentId: row.id, slug: row.slug, username: user?.username, action: 'denied' });
-    throw new HttpError(423, 'Password required or incorrect');
+    throw new HttpError(423, 'Password required or incorrect', 'PASSWORD_REQUIRED_OR_INCORRECT');
   }
   await assertInternalShareAccess(env, row, user);
   if (row.visibility === 'private' && user?.username !== row.owner_username && !(user?.role === 'admin' && adminPreview)) {
@@ -1633,6 +1634,16 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (path === '/api/public/settings' && method === 'GET') {
     return json({ ok: true, item: { landing_background: await systemSetting(env.DB, 'landing_background') } });
+  }
+
+  if (path === '/api/public/admin-contact' && method === 'GET') {
+    const email = String(env.ADMIN_CONTACT_EMAIL || '').trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      throw new HttpError(404, 'Administrator contact is not configured', 'ADMIN_CONTACT_UNAVAILABLE');
+    }
+    const subject = encodeURIComponent('ShareWorker access request');
+    const body = encodeURIComponent('Please help me access a ShareWorker share.');
+    return json({ ok: true, href: `mailto:${email}?subject=${subject}&body=${body}` });
   }
 
   if (path === '/api/me' && method === 'GET') {

@@ -1,4 +1,5 @@
 ﻿import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import QRCode from 'qrcode';
 import { marked } from 'marked';
@@ -16,25 +17,31 @@ import { ExpiryDatePicker } from './expiry-date-picker';
 import { mimeTypeForArchivePath, previewKind, type PreviewKind } from './preview-policy';
 import { extractZipEntries, normalizeZipEntryName, selectZipHtmlEntry } from './zip-preview';
 import { MAX_UPLOAD_SIZE } from './transfer-policy';
-import { getInitialLanguage, I18nProvider, LanguageSwitcher, translate, useI18n } from './i18n';
+import { getInitialLanguage, I18nProvider, LanguageSwitcher, translate, useI18n, type Language } from './i18n';
 import {
   adminKeyActions,
   allowedVisibilityOptions,
   compactAuditValue,
+  auditNullLabel,
+  mergeKeyFingerprint,
   normalizeVisibility,
   permissionKeys,
   quotaGiBToBytes,
+  visibilitySegmentMetrics,
   type AdminPermissionKey,
   withAllowedVisibility,
 } from './admin-display';
+import { classifyShareAccessError, type ShareAccessPresentation } from './share-access';
 import {
   ChevronDown,
   ChevronRight,
   Check,
+  CircleX,
   Bold,
   Code2,
   Clipboard,
   Download,
+  AlertTriangle,
   FileUp,
   Heading2,
   Italic,
@@ -97,6 +104,7 @@ type Content = {
   view_count: number;
   download_count: number;
   file_size: number;
+  password_required?: boolean;
   remark?: string;
   created_at: string;
   share_ticket?: string;
@@ -138,17 +146,43 @@ function token() {
   return localStorage.getItem('sso_token') || '';
 }
 
+let scrollLockDepth = 0;
+let scrollLockSnapshot: { body: Record<string, string>; htmlOverflow: string; scrollY: number } | null = null;
+
 function useBodyScrollLock(locked: boolean) {
   useEffect(() => {
-    if (!locked) return;
-    const previousOverflow = document.body.style.overflow;
-    const previousPaddingRight = document.body.style.paddingRight;
-    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
-    document.body.style.overflow = 'hidden';
-    if (scrollbarWidth > 0) document.body.style.paddingRight = `${scrollbarWidth}px`;
+    if (!locked || typeof document === 'undefined') return;
+    if (scrollLockDepth === 0) {
+      const body = document.body.style;
+      scrollLockSnapshot = {
+        body: {
+          position: body.position,
+          top: body.top,
+          width: body.width,
+          overflow: body.overflow,
+          paddingRight: body.paddingRight,
+        },
+        htmlOverflow: document.documentElement.style.overflow,
+        scrollY: window.scrollY,
+      };
+      const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+      body.position = 'fixed';
+      body.top = `-${window.scrollY}px`;
+      body.width = '100%';
+      body.overflow = 'hidden';
+      if (scrollbarWidth > 0) body.paddingRight = `${scrollbarWidth}px`;
+      document.documentElement.style.overflow = 'hidden';
+    }
+    scrollLockDepth += 1;
     return () => {
-      document.body.style.overflow = previousOverflow;
-      document.body.style.paddingRight = previousPaddingRight;
+      scrollLockDepth = Math.max(0, scrollLockDepth - 1);
+      if (scrollLockDepth !== 0 || !scrollLockSnapshot) return;
+      const snapshot = scrollLockSnapshot;
+      const body = document.body.style;
+      Object.entries(snapshot.body).forEach(([key, value]) => { (body as any)[key] = value; });
+      document.documentElement.style.overflow = snapshot.htmlOverflow;
+      window.scrollTo(0, snapshot.scrollY);
+      scrollLockSnapshot = null;
     };
   }, [locked]);
 }
@@ -239,6 +273,10 @@ function fmtEta(seconds?: number) {
 
 function fmtDate(v?: string | null) {
   return v ? new Date(v).toLocaleString(getInitialLanguage() === 'en-US' ? 'en-US' : 'zh-CN') : translate(getInitialLanguage(), 'common.permanent');
+}
+
+function fmtAuditDate(key: string, v?: string | null, language = getInitialLanguage()) {
+  return v ? new Date(v).toLocaleString(language === 'en-US' ? 'en-US' : 'zh-CN') : auditNullLabel(key, language);
 }
 
 function publicLink(slug: string) {
@@ -337,6 +375,11 @@ function login() {
   location.href = `${SSO_URL}/?client_id=${APP_ID}&redirect=${encodeURIComponent(`${location.origin}/sso-callback`)}`;
 }
 
+function switchLogin() {
+  localStorage.removeItem('sso_token');
+  location.href = `${SSO_URL}/logout?redirect=${encodeURIComponent(`${location.origin}/`)}`;
+}
+
 function useToast() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const push = (text: string, kind: Toast['kind'] = 'ok') => {
@@ -351,6 +394,51 @@ function Toasts({ items }: { items: Toast[] }) {
   return <div className="toasts" aria-live="polite">{items.map((t) => <div className={`toast ${t.kind || 'ok'}`} key={t.id}>{t.text}</div>)}</div>;
 }
 
+function BrandMark({ compact = false }: { compact?: boolean }) {
+  return <span className={`brand-mark${compact ? ' compact' : ''}`} aria-hidden="true"><Share2 size={compact ? 17 : 19} /><i /></span>;
+}
+
+function ModalShell({ children, close, title, className = '', mobileMode = 'sheet' }: { children: React.ReactNode; close: () => void; title?: React.ReactNode; className?: string; mobileMode?: 'sheet' | 'full' }) {
+  const { t } = useI18n();
+  useBodyScrollLock(true);
+  const theme = typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+  return createPortal(
+    <div className={`modal modal-root ${mobileMode === 'full' ? 'modal-full-mobile' : ''}`} data-theme={theme} onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+      <section className={`dialog modal-shell ${className}`} onMouseDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()} onTouchMove={(event) => event.stopPropagation()}>
+        <button type="button" className="icon modal-close" onClick={close} aria-label={t('common.close')} title={t('common.close')}><X size={18} /></button>
+        <div className="ui-modal-scroll modal-shell-scroll">
+          {title && <div className="modal-shell-title">{title}</div>}
+          {children}
+        </div>
+      </section>
+    </div>,
+    document.body
+  );
+}
+
+function ConfirmModal({ open, title, message, confirmLabel, destructive = false, onConfirm, onClose }: { open: boolean; title: string; message: React.ReactNode; confirmLabel: string; destructive?: boolean; onConfirm: () => void | Promise<void>; onClose: () => void }) {
+  const { t } = useI18n();
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { if (!open) setBusy(false); }, [open]);
+  if (!open) return null;
+  async function confirmAction() {
+    setBusy(true);
+    try {
+      await onConfirm();
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <ModalShell close={onClose} className="confirm-modal" title={<><div className={`confirm-mark${destructive ? ' destructive' : ''}`}><AlertTriangle size={20} /></div><div><h2>{title}</h2><p className="muted">{message}</p></div></>}>
+    <div className="confirm-actions"><button type="button" className="soft" onClick={onClose} disabled={busy}>{t('common.cancel')}</button><button type="button" className={destructive ? 'primary danger-fill' : 'primary'} onClick={() => void confirmAction()} disabled={busy}>{confirmLabel}</button></div>
+  </ModalShell>;
+}
+
+function QueryLoading() {
+  const { t } = useI18n();
+  return <div className="query-loading" role="status" aria-live="polite"><span>{t('common.refreshing')}</span><i /></div>;
+}
+
 function Field({ label, children, className = '' }: { label: string; children: React.ReactNode; className?: string }) {
   return <label className={`field ${className}`}><span>{label}</span>{children}</label>;
 }
@@ -360,9 +448,10 @@ function VisibilitySegment({ value, onChange, permissions }: { value: Visibility
   const options = visibilityOptionsFor(permissions);
   const displayValue = normalizeVisibility(value, permissions?.can_public_publish);
   const index = options.findIndex((item) => item === displayValue);
+  const metrics = visibilitySegmentMetrics(options.length, index);
   return (
-    <div className="visibility-segment" role="radiogroup" aria-label={t('visibility.label')}>
-      <i style={{ transform: `translateX(${Math.max(index, 0) * 100}%)` }} />
+    <div className="visibility-segment" role="radiogroup" aria-label={t('visibility.label')} style={{ '--segment-count': metrics.count } as React.CSSProperties}>
+      <i style={{ transform: `translateX(${metrics.index * 100}%)` }} />
       {options.map((item) => (
         <button type="button" key={item} className={displayValue === item ? 'on' : ''} onClick={() => onChange(item)}>
           {t(`visibility.${item}`)}
@@ -414,7 +503,7 @@ function Sidebar({ page, setPage, user, profile, open, setOpen, collapsed, setCo
     <aside className={`sidebar ${open ? 'open' : ''} ${collapsed ? 'collapsed' : ''}`}>
       <div className="brand">
       <div className="brand-lockup">
-          <span className="brand-mark"><Share2 size={18} /></span>
+          <BrandMark />
           <span className="brand-name">ShareWorker<small>{t('nav.contentDesk')}</small></span>
         </div>
         <button className="icon sidebar-toggle" onClick={() => { if (open) { setOpen(false); return; } setCollapsed(!collapsed); }} aria-label={open ? t('nav.closeSidebar') : collapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')} title={open ? t('nav.closeSidebar') : collapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')}><Menu size={18} /></button>
@@ -666,7 +755,6 @@ function drawQrWrappedText(ctx: CanvasRenderingContext2D, value: string, x: numb
 
 function QrShareModal({ item, close, toast }: { item: Content; close: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t, language } = useI18n();
-  useBodyScrollLock(true);
   const [background, setBackground] = useState(qrBackgrounds[0].src);
   const [customBackground, setCustomBackground] = useState('');
   const [loadedBackgrounds, setLoadedBackgrounds] = useState<Set<string>>(() => new Set([qrBackgrounds[0].id]));
@@ -751,9 +839,7 @@ function QrShareModal({ item, close, toast }: { item: Content; close: () => void
   }
 
   return (
-    <div className="modal qr-modal" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
-      <section className="dialog qr-dialog" onMouseDown={(event) => event.stopPropagation()}>
-        <div className="panel-head"><div><h2>{t('qr.title')}</h2><p className="muted">{t('qr.localOnly')}</p></div><button type="button" className="icon" onClick={close} aria-label={t('common.close')} title={t('common.close')}><X size={18} /></button></div>
+    <ModalShell close={close} className="qr-dialog" title={<div className="modal-heading"><h2>{t('qr.title')}</h2><p className="muted">{t('qr.localOnly')}</p></div>}>
         <div className="qr-layout">
           <div className="qr-card-preview">{busy || !cardUrl ? <div className="qr-loading">{t('common.loading')}</div> : <img src={cardUrl} alt={title} />}</div>
           <div className="qr-options">
@@ -766,8 +852,7 @@ function QrShareModal({ item, close, toast }: { item: Content; close: () => void
             <div className="qr-actions"><a className="primary" href={cardUrl || '#'} download={fileName} onClick={(event) => { if (!cardUrl) event.preventDefault(); }}><Download size={16} /> {t('qr.save')}</a><button type="button" className="soft" onClick={() => void share()} disabled={!cardUrl}><Share2 size={16} /> {t('qr.share')}</button></div>
           </div>
         </div>
-      </section>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -777,11 +862,22 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
   const [form, setForm] = useState(() => ({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, format: 'markdown' }));
   const [busy, setBusy] = useState(false);
   const [recent, setRecent] = useState<Content[]>([]);
+  const [loading, setLoading] = useState(false);
   const [uploadTasks, setUploadTasks] = useState<UploadTask[]>([]);
   const [progress, setProgress] = useState<UploadProgress>({ visible: false, stage: '', fileName: '', remaining: 0, progress: 0 });
   const queueRef = useRef<BrowserUploadQueue | null>(null);
   const sampleRef = useRef({ at: Date.now(), loaded: 0, speed: 0 });
-  const load = () => api<{ items: Content[] }>('/api/contents?type=file').then((r) => setRecent(r.items)).catch((e) => toast(e.message, 'error'));
+  async function load() {
+    setLoading(true);
+    try {
+      const r = await api<{ items: Content[] }>('/api/contents?type=file');
+      setRecent(r.items);
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
   useEffect(() => {
     setForm((current) => {
       const visibility = normalizeVisibility(current.visibility, permissions.can_public_publish);
@@ -978,6 +1074,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
         <button className="primary" onClick={upload} disabled={busy}><Upload size={16} /> {t('file.startUpload')}</button>
       </section>
       <ContentTable title={t('content.recentFiles')} items={recent} toast={toast} refresh={load} compact permissions={permissions} />
+      {loading && <QueryLoading />}
       <UploadFloating state={progress} onClose={() => setProgress({ visible: false, stage: '', fileName: '', remaining: 0, progress: 0 })} />
     </div>
   );
@@ -987,8 +1084,8 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
   const { t, language } = useI18n();
   const [editing, setEditing] = useState<Content | null>(null);
   const [qrItem, setQrItem] = useState<Content | null>(null);
-  async function act(item: Content, action: string, method = 'POST') {
-    if ((action === 'delete' || action === 'permanent') && !confirm(action === 'permanent' ? (language === 'en-US' ? 'Permanent deletion clears D1 records and R2 objects. Continue?' : '永久删除会清理 D1 和 R2 对象，确认继续？') : (language === 'en-US' ? 'Confirm soft delete?' : '确认软删除？'))) return;
+  const [confirmation, setConfirmation] = useState<{ item: Content; action: string; method: string } | null>(null);
+  async function executeAction(item: Content, action: string, method = 'POST') {
     try {
       const base = admin ? '/api/admin/contents' : '/api/contents';
       await api(`${base}/${item.id}/${action}`, { method });
@@ -997,6 +1094,13 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
     } catch (err) {
       toast((err as Error).message, 'error');
     }
+  }
+  function act(item: Content, action: string, method = 'POST') {
+    if (action === 'delete' || action === 'permanent') {
+      setConfirmation({ item, action, method });
+      return;
+    }
+    void executeAction(item, action, method);
   }
   return (
     <section className="panel table-panel">
@@ -1037,6 +1141,15 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
       </div>
       {editing && <EditContent item={editing} admin={admin} permissions={permissions} close={() => setEditing(null)} done={() => { setEditing(null); refresh(); }} toast={toast} />}
       {qrItem && <QrShareModal item={qrItem} close={() => setQrItem(null)} toast={toast} />}
+      {confirmation && <ConfirmModal
+        open
+        title={confirmation.action === 'permanent' ? t('confirm.permanentDeleteTitle') : t('confirm.deleteTitle')}
+        message={confirmation.action === 'permanent' ? t('confirm.permanentDeleteMessage') : t('confirm.deleteMessage')}
+        confirmLabel={confirmation.action === 'permanent' ? t('content.permanentDelete') : t('content.delete')}
+        destructive
+        onClose={() => setConfirmation(null)}
+        onConfirm={async () => { const current = confirmation; setConfirmation(null); await executeAction(current.item, current.action, current.method); }}
+      />}
     </section>
   );
 }
@@ -1061,8 +1174,7 @@ function EditContent({ item, admin, permissions, close, done, toast }: { item: C
     }
   }
   return (
-    <div className="modal"><div className="dialog">
-      <div className="panel-head"><h2>{admin ? (language === 'en-US' ? 'Admin content edit' : 'Admin 修改内容') : (language === 'en-US' ? 'Edit content' : '编辑内容')}</h2><button className="icon" onClick={close} aria-label={t('common.close')}><X /></button></div>
+    <ModalShell close={close} className="edit-content-dialog" title={<h2>{admin ? t('content.adminEdit') : t('content.editTitle')}</h2>}>
       {!admin && <Field label={t('text.title')}><input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></Field>}
       <Field label={t('visibility.label')}><VisibilitySegment value={form.visibility} permissions={permissions} onChange={(visibility) => setForm({ ...form, visibility })} /></Field>
       <ExpiryDatePicker className="expire-field" value={form.expire_at || ''} onChange={(expire_at) => setForm({ ...form, expire_at })} />
@@ -1070,7 +1182,7 @@ function EditContent({ item, admin, permissions, close, done, toast }: { item: C
       {!admin && item.type !== 'file' && <Field label={language === 'en-US' ? 'Text content' : '文本内容'}><textarea className="short" value={form.text_content} onChange={(e) => setForm({ ...form, text_content: e.target.value })} /></Field>}
       {!admin && <Field label={t('text.remark')}><input value={form.remark} onChange={(e) => setForm({ ...form, remark: e.target.value })} /></Field>}
       <div className="right"><button className="soft" onClick={close}>{t('common.cancel')}</button><button className="primary" onClick={save}>{t('common.save')}</button></div>
-    </div></div>
+    </ModalShell>
   );
 }
 
@@ -1078,11 +1190,20 @@ function MyContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind
   const { t } = useI18n();
   const [items, setItems] = useState<Content[]>([]);
   const [filter, setFilter] = useState({ q: '', type: '', status: '' });
-  const load = (next = filter) => {
+  const [loading, setLoading] = useState(false);
+  async function load(next = filter) {
     const qs = new URLSearchParams(Object.entries(next).filter(([, v]) => v));
-    api<{ items: Content[] }>(`/api/contents?${qs}`).then((r) => setItems(r.items)).catch((e) => toast(e.message, 'error'));
-  };
-  useEffect(load, [filter.type, filter.status]);
+    setLoading(true);
+    try {
+      const r = await api<{ items: Content[] }>(`/api/contents?${qs}`);
+      setItems(r.items);
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void load(); }, [filter.type, filter.status]);
   return (
     <div className="stack no-page-x">
       <section className="panel filters">
@@ -1099,6 +1220,7 @@ function MyContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind
         <button className="soft" onClick={() => load()}>{t('common.search')}</button>
       </section>
       <ContentTable title={t('content.my')} items={items} toast={toast} refresh={load} permissions={permissions} />
+      {loading && <QueryLoading />}
     </div>
   );
 }
@@ -1108,7 +1230,19 @@ function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
   const [items, setItems] = useState<any[]>([]);
   const [form, setForm] = useState({ remark: '', expire_at: '' });
   const [newKey, setNewKey] = useState('');
-  const load = () => api<{ items: any[] }>('/api/api-keys').then((r) => setItems(r.items)).catch((e) => toast(e.message, 'error'));
+  const [loading, setLoading] = useState(false);
+  const [confirmation, setConfirmation] = useState<{ id: string; action: 'rotate' | 'revoke' } | null>(null);
+  async function load() {
+    setLoading(true);
+    try {
+      const r = await api<{ items: any[] }>('/api/api-keys');
+      setItems(r.items);
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
   useEffect(() => { void load(); }, []);
   async function create() {
     try {
@@ -1116,21 +1250,23 @@ function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
       setNewKey(res.key);
       toast(language === 'en-US' ? 'API key created. The full value is shown once.' : 'API Key 已创建，完整值仅显示一次');
       setForm({ remark: '', expire_at: '' });
-      load();
+      await load();
     } catch (err) {
       toast((err as Error).message, 'error');
     }
   }
-  async function mutate(id: string, action: 'rotate' | 'revoke') {
-    if (action === 'revoke' && !confirm(language === 'en-US' ? 'Revoke this API key?' : '确认吊销这个 API Key？')) return;
+  async function executeMutation(id: string, action: 'rotate' | 'revoke') {
     try {
       const res = await api<any>(`/api/api-keys/${id}/${action}`, { method: 'POST' });
       if (res.key) setNewKey(res.key);
       toast(action === 'rotate' ? (language === 'en-US' ? 'Rotated. The new key is shown once.' : '已旋转，新 key 仅显示一次') : (language === 'en-US' ? 'Revoked' : '已吊销'));
-      load();
+      await load();
     } catch (err) {
       toast((err as Error).message, 'error');
     }
+  }
+  function mutate(id: string, action: 'rotate' | 'revoke') {
+    setConfirmation({ id, action });
   }
   return (
     <div className="stack">
@@ -1144,10 +1280,20 @@ function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
       </section>
       <section className="panel table-panel">
         <div className="table-scroll"><table><thead><tr><th>{t('keys.remark')}</th><th>{t('keys.key')}</th><th>{t('keys.status')}</th><th>{t('keys.expire')}</th><th>{t('keys.lastUsed')}</th><th>{t('keys.calls')}</th><th>{t('keys.actions')}</th></tr></thead><tbody>
-          {items.map((k) => <tr key={k.id}><td>{k.remark || '-'}</td><td><code>{k.key_prefix}...{k.key_suffix}</code></td><td><Badge text={k.status} danger={k.status !== 'active'} /></td><td>{fmtDate(k.expire_at)}</td><td>{fmtDate(k.last_used_at)}</td><td>{k.usage_count}</td><td><div className="actions"><button className="icon" title={language === 'en-US' ? 'Rotate' : '旋转'} aria-label={language === 'en-US' ? 'Rotate' : '旋转'} onClick={() => mutate(k.id, 'rotate')}><RotateCw size={16} /></button><button className="icon danger" title={language === 'en-US' ? 'Revoke' : '吊销'} aria-label={language === 'en-US' ? 'Revoke' : '吊销'} onClick={() => mutate(k.id, 'revoke')}><Trash2 size={16} /></button></div></td></tr>)}
+          {items.map((k) => <tr key={k.id}><td>{k.remark || '-'}</td><td><code>{mergeKeyFingerprint(k.key_prefix, k.key_suffix)}</code></td><td><Badge text={k.status} danger={k.status !== 'active'} /></td><td>{fmtDate(k.expire_at)}</td><td>{fmtAuditDate('last_used_at', k.last_used_at, language)}</td><td>{k.usage_count}</td><td><div className="actions"><button className="icon" title={t('admin.rotateKey')} aria-label={t('admin.rotateKey')} onClick={() => mutate(k.id, 'rotate')}><RotateCw size={16} /></button><button className="icon danger" title={t('admin.revokeKey')} aria-label={t('admin.revokeKey')} onClick={() => mutate(k.id, 'revoke')}><Trash2 size={16} /></button></div></td></tr>)}
           {!items.length && <tr><td colSpan={7} className="empty">{t('keys.empty')}</td></tr>}
         </tbody></table></div>
+        {loading && <QueryLoading />}
       </section>
+      {confirmation && <ConfirmModal
+        open
+        title={confirmation.action === 'revoke' ? t('confirm.revokeKeyTitle') : t('confirm.rotateKeyTitle')}
+        message={confirmation.action === 'revoke' ? t('confirm.revokeKeyMessage') : t('confirm.rotateKeyMessage')}
+        confirmLabel={confirmation.action === 'revoke' ? t('admin.revokeKey') : t('admin.rotateKey')}
+        destructive={confirmation.action === 'revoke'}
+        onClose={() => setConfirmation(null)}
+        onConfirm={async () => { const current = confirmation; setConfirmation(null); await executeMutation(current.id, current.action); }}
+      />}
     </div>
   );
 }
@@ -1228,8 +1374,11 @@ function AdminPanel({ toast, permissions }: { toast: (s: string, k?: Toast['kind
 function AdminDashboard({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
   const { t } = useI18n();
   const [data, setData] = useState<any>(null);
-  useEffect(() => { api('/api/admin/dashboard').then(setData).catch((e) => toast(e.message, 'error')); }, []);
-  if (!data) return <section className="panel">{t('common.loading')}</section>;
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    api('/api/admin/dashboard').then(setData).catch((e) => toast(e.message, 'error')).finally(() => setLoading(false));
+  }, []);
+  if (!data) return <section className="panel">{loading ? <QueryLoading /> : t('common.noData')}</section>;
   const s = data.summary || {};
   const cards = [
     [t('admin.contentCount'), s.total || 0],
@@ -1264,9 +1413,20 @@ function Chart({ title, rows }: { title: string; rows: any[] }) {
 function AdminContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
   const { t } = useI18n();
   const [items, setItems] = useState<Content[]>([]);
-  const load = () => api<{ items: Content[] }>('/api/admin/contents').then((r) => setItems(r.items)).catch((e) => toast(e.message, 'error'));
+  const [loading, setLoading] = useState(false);
+  async function load() {
+    setLoading(true);
+    try {
+      const r = await api<{ items: Content[] }>('/api/admin/contents');
+      setItems(r.items);
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
   useEffect(() => { void load(); }, []);
-  return <ContentTable title={`${t('nav.admin')} · ${t('admin.contents')}`} items={items} toast={toast} refresh={load} admin permissions={permissions} />;
+  return <><ContentTable title={`${t('nav.admin')} · ${t('admin.contents')}`} items={items} toast={toast} refresh={load} admin permissions={permissions} />{loading && <QueryLoading />}</>;
 }
 
 function adminColumns(kind: string) {
@@ -1287,7 +1447,14 @@ function labelOf(key: string, language = getInitialLanguage()) {
     used_bytes: translate(language, 'admin.usedStorage'),
     reserved_bytes: translate(language, 'admin.reservedStorage'),
     total_views: translate(language, 'admin.totalViews'),
-    created_at: translate(language, 'admin.time'),
+    created_at: translate(language, 'admin.createdAt'),
+    id: translate(language, 'admin.logId'),
+    content_id: translate(language, 'admin.contentId'),
+    key_id: translate(language, 'admin.keyId'),
+    user_agent: translate(language, 'admin.userAgent'),
+    lock_reason: translate(language, 'admin.lockReason'),
+    locked_by: translate(language, 'admin.lockedBy'),
+    locked_at: translate(language, 'admin.lockedAt'),
     action: translate(language, 'admin.action'),
     slug: 'slug',
     ip: translate(language, 'admin.ip'),
@@ -1313,6 +1480,10 @@ function labelOf(key: string, language = getInitialLanguage()) {
 }
 
 function formatCell(key: string, value: any) {
+  if (value === null || value === undefined || value === '') {
+    if (key === 'last_used_at' || key === 'locked_at') return auditNullLabel(key, getInitialLanguage());
+    return '-';
+  }
   if (key.includes('size')) return fmtBytes(Number(value || 0));
   if (key === 'quota_bytes' || key === 'used_bytes' || key === 'reserved_bytes') return fmtBytes(Number(value || 0));
   if (key.includes('_at') || key === 'created_at') return fmtDate(value);
@@ -1336,7 +1507,7 @@ function CopyFullValue({ value, className = '' }: { value: string; className?: s
 }
 
 function isLongAuditKey(key: string): boolean {
-  return ['ip', 'user_agent', 'userAgent', 'browser', 'device', 'device_info'].includes(key);
+  return ['id', 'content_id', 'key_id', 'log_id', 'ip', 'user_agent', 'userAgent', 'browser', 'device', 'device_info', 'key_prefix'].includes(key);
 }
 
 function AdminAuditValue({ value, keyName, maxLength = 28 }: { value: unknown; keyName: string; maxLength?: number }) {
@@ -1348,11 +1519,25 @@ function AdminAuditValue({ value, keyName, maxLength = 28 }: { value: unknown; k
 
 function AdminCell({ keyName, value }: { keyName: string; value: any }) {
   if (keyName === 'status') return <Badge text={formatCell(keyName, value)} danger={value !== 'active'} />;
-  if (keyName === 'key_prefix') {
-    const fingerprint = String(value || '-');
-    return <span className="admin-audit-value"><code title={fingerprint}>{compactAuditValue(fingerprint, 22)}</code><CopyFullValue value={fingerprint} /></span>;
-  }
   return <AdminAuditValue keyName={keyName} value={formatCell(keyName, value)} />;
+}
+
+type AdminDetailKind = 'users' | 'logs' | 'keys';
+const ADMIN_DETAIL_FIELDS: Record<AdminDetailKind, string[]> = {
+  users: ['username', 'role', 'permission_group_name', 'total_count', 'text_count', 'file_count', 'mixed_count', 'public_count', 'internal_count', 'private_count', 'expired_count', 'deleted_count', 'total_file_size', 'used_bytes', 'reserved_bytes', 'total_views', 'last_publish_at', 'can_public_publish', 'can_api', 'can_internal_access', 'can_upload', 'can_comment', 'quota_bytes'],
+  logs: ['id', 'content_id', 'slug', 'username', 'action', 'ip', 'user_agent', 'created_at'],
+  keys: ['id', 'owner_username', 'remark', 'key_prefix', 'status', 'expire_at', 'last_used_at', 'usage_count', 'created_at', 'locked_at', 'lock_reason', 'locked_by'],
+};
+
+function adminDetailEntries(kind: AdminDetailKind, row: Record<string, any>): Array<[string, any]> {
+  return ADMIN_DETAIL_FIELDS[kind]
+    .filter((key) => key !== 'permission_group_id' && key !== 'key_suffix' && Object.prototype.hasOwnProperty.call(row, key))
+    .map((key) => [key, key === 'key_prefix' ? mergeKeyFingerprint(row.key_prefix, row.key_suffix) : row[key]]);
+}
+
+function adminLabelOf(key: string, kind: AdminDetailKind, language: Language) {
+  if (key === 'id') return translate(language, kind === 'logs' ? 'admin.logId' : 'admin.keyId');
+  return labelOf(key, language);
 }
 
 type AdminUserRow = {
@@ -1417,7 +1602,9 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
   const [selected, setSelected] = useState<AdminUserRow | null>(null);
   const [query, setQuery] = useState('');
   const [groupFilter, setGroupFilter] = useState('');
+  const [loading, setLoading] = useState(false);
   const load = async () => {
+    setLoading(true);
     try {
       const [users, groupResponse] = await Promise.all([
         api<{ items: AdminUserRow[] }>('/api/admin/users'),
@@ -1427,6 +1614,8 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
       setGroups(groupResponse.items || []);
     } catch (err) {
       toast((err as Error).message, 'error');
+    } finally {
+      setLoading(false);
     }
   };
   useEffect(() => { void load(); }, []);
@@ -1468,7 +1657,7 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
             <div className="admin-row users-row">
               <button className="expand-btn" onClick={() => setExpanded({ ...expanded, [row.username]: !isExpanded })} aria-label={t('admin.expandDetail')} title={t('admin.toggleDetail')}>{isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</button>
               <span title={row.username}>{row.username}</span>
-              <span><Badge text={row.permission_group_name || '-'} /></span>
+              <span className="permission-group-cell"><Badge text={row.permission_group_name || '-'} /></span>
               <span>{row.total_count}</span>
               <span>{fmtBytes(row.used_bytes)}</span>
               <span>{row.total_views}</span>
@@ -1476,15 +1665,14 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
               <button className="icon" onClick={() => setSelected({ ...row })} aria-label={t('admin.manageUser')} title={t('admin.manageUser')}><Settings size={16} /></button>
             </div>
             {isExpanded && <div className="admin-detail user-detail-grid">
-              {Object.entries(row).map(([key, value]) => <div key={key}><span>{labelOf(key, language)}</span><strong>{isLongAuditKey(key) ? <AdminAuditValue keyName={key} value={value} /> : formatCell(key, value)}</strong></div>)}
+              {adminDetailEntries('users', row).map(([key, value]) => <div key={key}><span>{adminLabelOf(key, 'users', language)}</span><strong>{isLongAuditKey(key) ? <AdminAuditValue keyName={key} value={formatCell(key, value)} /> : formatCell(key, value)}</strong></div>)}
             </div>}
           </div>;
         })}
         {!filtered.length && <div className="empty">{t('common.noData')}</div>}
       </div></div>
-      {selected && <div className="modal" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
-        <section className="dialog user-group-dialog" onMouseDown={(event) => event.stopPropagation()}>
-          <div className="panel-head"><div><h2>{t('admin.manageUser')}</h2><p className="muted">{selected.username}</p></div><button className="icon" onClick={() => setSelected(null)} aria-label={t('common.close')} title={t('common.close')}><X size={18} /></button></div>
+      {loading && <QueryLoading />}
+      {selected && <ModalShell close={() => setSelected(null)} className="user-group-dialog" title={<div className="modal-heading"><h2>{t('admin.manageUser')}</h2><p className="muted">{selected.username}</p></div>}>
           <div className="admin-user-usage">
             <div><span>{t('admin.contentCount')}</span><strong>{selected.total_count}</strong></div>
             <div><span>{t('admin.usedStorage')}</span><strong>{fmtBytes(selected.used_bytes)}</strong></div>
@@ -1497,8 +1685,7 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
             return group ? <div className="permission-chip-list">{permissionKeys.map((key) => <span className={permissionEnabled(group, key) ? 'allowed' : 'denied'} key={key}>{permissionEnabled(group, key) ? <Check size={13} /> : <X size={13} />} {t(permissionLabels[key])}</span>)}<span className="allowed"><Check size={13} /> {t('permission.storageQuota')}: {fmtBytes(group.quota_bytes)}</span></div> : null;
           })()}
           <div className="right"><button className="soft" onClick={() => setSelected(null)}>{t('common.cancel')}</button><button className="primary" onClick={() => void assignGroup()}><Save size={16} /> {t('common.save')}</button></div>
-        </section>
-      </div>}
+      </ModalShell>}
     </section>
   );
 }
@@ -1519,7 +1706,19 @@ function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind'])
   const [draft, setDraft] = useState<PermissionDraft | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<PermissionGroup | null>(null);
   const [replacementId, setReplacementId] = useState('');
-  const load = () => api<{ items: PermissionGroup[] }>('/api/admin/permission-groups').then((r) => setGroups(r.items || [])).catch((e) => toast((e as Error).message, 'error'));
+  const [loading, setLoading] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState(false);
+  async function load() {
+    setLoading(true);
+    try {
+      const r = await api<{ items: PermissionGroup[] }>('/api/admin/permission-groups');
+      setGroups(r.items || []);
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
   useEffect(() => { void load(); }, []);
   function setDraftValue<K extends keyof PermissionDraft>(key: K, value: PermissionDraft[K]) {
     setDraft((current) => current ? { ...current, [key]: value } : current);
@@ -1540,7 +1739,6 @@ function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind'])
   }
   async function remove() {
     if (!deleteTarget || !replacementId) return;
-    if (!confirm(language === 'en-US' ? 'Delete this group and reassign its users?' : '删除此权限组并重新分配组内用户？')) return;
     try {
       await api(`/api/admin/permission-groups/${encodeURIComponent(deleteTarget.id)}`, { method: 'DELETE', body: JSON.stringify({ replacement_group_id: replacementId }) });
       toast(language === 'en-US' ? 'Permission group deleted' : '权限组已删除并完成重新分配');
@@ -1556,24 +1754,24 @@ function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind'])
     <div className="permission-group-list">
       {groups.map((group) => <article className="permission-group-card" key={group.id}>
         <div className="permission-group-head"><div><h3>{group.name}</h3><div className="group-meta"><Badge text={group.is_system ? t('admin.builtIn') : t('admin.custom')} /><Badge text={group.is_default ? t('admin.default') : t('admin.notDefault')} /></div></div><div className="actions"><button className="icon" onClick={() => setDraft(draftFromGroup(group))} aria-label={t('admin.editGroup')} title={t('admin.editGroup')}><Pencil size={16} /></button><button className="icon danger" disabled={Boolean(group.is_system)} onClick={() => { setDeleteTarget(group); setReplacementId(groups.find((candidate) => candidate.id !== group.id)?.id || ''); }} aria-label={t('admin.deleteGroup')} title={group.is_system ? t('admin.builtInCannotDelete') : t('admin.deleteGroup')}><Trash2 size={16} /></button></div></div>
-        <div className="permission-chip-list">{permissionKeys.map((key) => <span className={permissionEnabled(group, key) ? 'allowed' : 'denied'} key={key}>{permissionEnabled(group, key) ? <Check size={13} /> : <X size={13} />} {t(permissionLabels[key])}</span>)}<span className="allowed"><Check size={13} /> {t('permission.storageQuota')}: {fmtBytes(group.quota_bytes)}</span></div>
+        <div className="permission-chip-list">{permissionKeys.map((key) => <span className={permissionEnabled(group, key) ? 'allowed' : 'denied'} key={key}>{permissionEnabled(group, key) ? <Check size={13} /> : <X size={13} />} {t(permissionLabels[key])}</span>)}<span className="allowed"><Check size={13} /> {t('permission.storageSpace')}: {Number(group.quota_bytes || 0) / 1024 ** 3} GB</span></div>
       </article>)}
       {!groups.length && <p className="empty">{t('common.noData')}</p>}
     </div>
-    {draft && <div className="modal" onMouseDown={(event) => { if (event.target === event.currentTarget) setDraft(null); }}><section className="dialog permission-editor" onMouseDown={(event) => event.stopPropagation()}>
-      <div className="panel-head"><h2>{draft.id ? t('admin.editGroup') : t('admin.createGroup')}</h2><button className="icon" onClick={() => setDraft(null)} aria-label={t('common.close')} title={t('common.close')}><X size={18} /></button></div>
+    {loading && <QueryLoading />}
+    {draft && <ModalShell close={() => setDraft(null)} className="permission-editor" title={<h2>{draft.id ? t('admin.editGroup') : t('admin.createGroup')}</h2>}>
       <Field label={t('admin.groupName')}><input value={draft.name} disabled={Boolean(draft.is_system)} onChange={(event) => setDraftValue('name', event.target.value)} /></Field>
-      <Field label={t('permission.storageQuota')}><input type="number" min="0" step="0.1" value={draft.quota_gib} onChange={(event) => setDraftValue('quota_gib', event.target.value)} /></Field>
-      <label className="checkbox-field"><input type="checkbox" checked={Boolean(draft.is_default)} onChange={(event) => setDraftValue('is_default', event.target.checked)} /><span>{t('admin.makeDefault')}</span></label>
-      <div className="permission-editor-grid">{permissionKeys.map((key) => <label className="checkbox-field" key={key}><input type="checkbox" checked={Boolean(draft[key])} onChange={(event) => setDraftValue(key, event.target.checked)} /><span>{t(permissionLabels[key])}</span></label>)}</div>
+      <Field label={t('permission.storageSpace')}><div className="unit-input"><input type="number" min="0" step="0.1" value={draft.quota_gib} onChange={(event) => setDraftValue('quota_gib', event.target.value)} /><span>GB</span></div></Field>
+      <div className="checkbox-field"><input type="checkbox" checked={Boolean(draft.is_default)} onChange={(event) => setDraftValue('is_default', event.target.checked)} /><span>{t('admin.makeDefault')}</span></div>
+      <div className="permission-editor-grid">{permissionKeys.map((key) => <div className="checkbox-field" key={key}><input type="checkbox" checked={Boolean(draft[key])} onChange={(event) => setDraftValue(key, event.target.checked)} /><span>{t(permissionLabels[key])}</span></div>)}</div>
       <div className="right"><button className="soft" onClick={() => setDraft(null)}>{t('common.cancel')}</button><button className="primary" onClick={() => void save()}><Save size={16} /> {t('common.save')}</button></div>
-    </section></div>}
-    {deleteTarget && <div className="modal" onMouseDown={(event) => { if (event.target === event.currentTarget) setDeleteTarget(null); }}><section className="dialog permission-editor" onMouseDown={(event) => event.stopPropagation()}>
-      <div className="panel-head"><h2>{t('admin.deleteGroup')}</h2><button className="icon" onClick={() => setDeleteTarget(null)} aria-label={t('common.close')} title={t('common.close')}><X size={18} /></button></div>
-      <p>{language === 'en-US' ? `Users in ${deleteTarget.name} must be moved to another group.` : `${deleteTarget.name} 中的用户需要重新分配到其他组。`}</p>
+    </ModalShell>}
+    {deleteTarget && <ModalShell close={() => setDeleteTarget(null)} className="permission-editor" title={<h2>{t('admin.deleteGroup')}</h2>}>
+      <p>{t('admin.groupUsersWillReassign')}</p>
       <Field label={t('admin.replacementGroup')}><select value={replacementId} onChange={(event) => setReplacementId(event.target.value)}>{groups.filter((group) => group.id !== deleteTarget.id).map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></Field>
-      <div className="right"><button className="soft" onClick={() => setDeleteTarget(null)}>{t('common.cancel')}</button><button className="primary danger-fill" disabled={!replacementId} onClick={() => void remove()}><Trash2 size={16} /> {t('admin.deleteGroup')}</button></div>
-    </section></div>}
+      <div className="right"><button className="soft" onClick={() => setDeleteTarget(null)}>{t('common.cancel')}</button><button className="primary danger-fill" disabled={!replacementId} onClick={() => setDeleteConfirmation(true)}><Trash2 size={16} /> {t('admin.deleteGroup')}</button></div>
+    </ModalShell>}
+    {deleteConfirmation && deleteTarget && <ConfirmModal open title={t('confirm.deleteGroupTitle')} message={t('confirm.deleteGroupMessage')} confirmLabel={t('admin.deleteGroup')} destructive onClose={() => setDeleteConfirmation(false)} onConfirm={async () => { setDeleteConfirmation(false); await remove(); setDeleteTarget(null); }} />}
   </section>;
 }
 
@@ -1584,8 +1782,20 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('');
   const [newKey, setNewKey] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [confirmation, setConfirmation] = useState<{ row: any; action: 'rotate' | 'lock' | 'unlock' | 'revoke' } | null>(null);
   const columns = adminColumns(kind);
-  const load = () => api<{ items: any[] }>(endpoint).then((r) => setItems(r.items)).catch((e) => toast(e.message, 'error'));
+  async function load() {
+    setLoading(true);
+    try {
+      const r = await api<{ items: any[] }>(endpoint);
+      setItems(r.items);
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
   useEffect(() => { load(); }, [endpoint]);
   const filtered = items.filter((row) => {
     const text = JSON.stringify(row).toLowerCase();
@@ -1603,9 +1813,7 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
     URL.revokeObjectURL(url);
   };
   const showAction = kind === 'keys';
-  async function keyAction(row: any, action: 'rotate' | 'lock' | 'unlock' | 'revoke') {
-    const destructive = action !== 'unlock';
-    if (destructive && !confirm(language === 'en-US' ? `${action} this API key?` : `确认${action === 'rotate' ? '旋转' : action === 'lock' ? '锁定' : '吊销'}这个 API Key？`)) return;
+  async function executeKeyAction(row: any, action: 'rotate' | 'lock' | 'unlock' | 'revoke') {
     try {
       const result = await api<any>(`/api/admin/api-keys/${encodeURIComponent(row.id)}/${action}`, { method: 'POST' });
       if (result.key) setNewKey(result.key);
@@ -1614,6 +1822,9 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
     } catch (err) {
       toast((err as Error).message, 'error');
     }
+  }
+  function keyAction(row: any, action: 'rotate' | 'lock' | 'unlock' | 'revoke') {
+    setConfirmation({ row, action });
   }
   return (
     <section className="panel admin-list">
@@ -1641,7 +1852,7 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
               <button className="expand-btn" onClick={() => setExpanded({ ...expanded, [index]: !expanded[index] })} aria-label={t('admin.expandDetail')} title={t('admin.toggleDetail')}>
                 {expanded[index] ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
               </button>
-              {columns.map((key) => <span key={key}><AdminCell keyName={key} value={key === 'key_prefix' ? `${row.key_prefix || '-'}...${row.key_suffix || ''}` : row[key]} /></span>)}
+          {columns.map((key) => <span key={key}><AdminCell keyName={key} value={key === 'key_prefix' ? mergeKeyFingerprint(row.key_prefix, row.key_suffix) : row[key]} /></span>)}
               {showAction && <span className="admin-key-actions">{adminKeyActions(Boolean(row.locked_at)).map((action) => {
                 const Icon = action === 'rotate' ? RotateCw : action === 'lock' ? Lock : action === 'unlock' ? Unlock : Trash2;
                 const labelKey = action === 'rotate' ? 'admin.rotateKey' : action === 'lock' ? 'admin.lockKey' : action === 'unlock' ? 'admin.unlockKey' : 'admin.revokeKey';
@@ -1650,13 +1861,23 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
             </div>
             {expanded[index] && (
               <div className="admin-detail">
-                {Object.entries(row).map(([key, value]) => <div key={key}><span>{labelOf(key, language)}</span><strong>{isLongAuditKey(key) ? <AdminAuditValue keyName={key} value={value} maxLength={38} /> : formatCell(key, value)}</strong></div>)}
+                {adminDetailEntries(kind, row).map(([key, value]) => <div key={key}><span>{adminLabelOf(key, kind, language)}</span><strong>{isLongAuditKey(key) ? <AdminAuditValue keyName={key} value={formatCell(key, value)} maxLength={38} /> : formatCell(key, value)}</strong></div>)}
               </div>
             )}
           </div>
         ))}
         {!filtered.length && <div className="empty">{t('common.noData')}</div>}
       </div></div>
+      {loading && <QueryLoading />}
+      {confirmation && <ConfirmModal
+        open
+        title={t(`confirm.${confirmation.action}KeyTitle`)}
+        message={t(`confirm.${confirmation.action}KeyMessage`)}
+        confirmLabel={t(`admin.${confirmation.action === 'revoke' ? 'revokeKey' : confirmation.action === 'rotate' ? 'rotateKey' : confirmation.action === 'lock' ? 'lockKey' : 'unlockKey'}`)}
+        destructive={confirmation.action !== 'unlock'}
+        onClose={() => setConfirmation(null)}
+        onConfirm={async () => { const current = confirmation; setConfirmation(null); await executeKeyAction(current.row, current.action); }}
+      />}
     </section>
   );
 }
@@ -1667,9 +1888,23 @@ function AdminSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => voi
   const [bg, setBg] = useState<any>(null);
   const [file, setFile] = useState<File | null>(null);
   const [opacity, setOpacity] = useState(0.32);
-  useEffect(() => { api<{ item: any }>('/api/admin/settings').then((r) => setItem(r.item)).catch((e) => toast(e.message, 'error')); }, []);
-  const loadBg = () => api<{ item: any }>('/api/admin/background').then((r) => { setBg(r.item); setOpacity(Number(r.item?.opacity ?? 0.32)); }).catch((e) => toast(e.message, 'error'));
-  useEffect(() => { loadBg(); }, []);
+  const [settingsLoading, setSettingsLoading] = useState(true);
+  const [backgroundLoading, setBackgroundLoading] = useState(true);
+  const [confirmClear, setConfirmClear] = useState(false);
+  useEffect(() => { api<{ item: any }>('/api/admin/settings').then((r) => setItem(r.item)).catch((e) => toast(e.message, 'error')).finally(() => setSettingsLoading(false)); }, []);
+  async function loadBg() {
+    setBackgroundLoading(true);
+    try {
+      const r = await api<{ item: any }>('/api/admin/background');
+      setBg(r.item);
+      setOpacity(Number(r.item?.opacity ?? 0.32));
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    } finally {
+      setBackgroundLoading(false);
+    }
+  }
+  useEffect(() => { void loadBg(); }, []);
   async function uploadBg() {
     if (!file) return toast(language === 'en-US' ? 'Choose a background image' : '请选择背景图片', 'error');
     const fd = new FormData();
@@ -1694,7 +1929,6 @@ function AdminSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => voi
     }
   }
   async function clearBg() {
-    if (!confirm(language === 'en-US' ? 'Clear the landing page background?' : '确认清除落地页背景图？')) return;
     try {
       await api('/api/admin/background', { method: 'DELETE' });
       setBg(null);
@@ -1718,12 +1952,14 @@ function AdminSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => voi
             <div className="right wrap-actions">
               <button className="primary roomy-btn" onClick={uploadBg}><Upload size={16} /> {t('admin.uploadReplace')}</button>
               <button className="soft roomy-btn" onClick={() => saveOpacity()} disabled={!bg}><RefreshCw size={16} /> {t('admin.saveOpacity')}</button>
-              <button className="soft danger roomy-btn" onClick={clearBg} disabled={!bg}><Trash2 size={16} /> {t('admin.clear')}</button>
+              <button className="soft danger roomy-btn" onClick={() => setConfirmClear(true)} disabled={!bg}><Trash2 size={16} /> {t('admin.clear')}</button>
             </div>
             {bg && <p className="muted">R2: {bg.object_key} / {fmtBytes(bg.size)}</p>}
           </div>
         </div>
       </section>
+      {(settingsLoading || backgroundLoading) && <QueryLoading />}
+      <ConfirmModal open={confirmClear} title={t('confirm.clearBackgroundTitle')} message={t('confirm.clearBackgroundMessage')} confirmLabel={t('admin.clear')} destructive onClose={() => setConfirmClear(false)} onConfirm={async () => { setConfirmClear(false); await clearBg(); }} />
     </div>
   );
 }
@@ -2170,7 +2406,7 @@ function SharePreviewPage({ item, password, adminPreview, toast }: { item: Conte
   const info = selectedAttachment ? attachmentPreviewInfo(selectedAttachment, adminPreview) : null;
   const backQs = new URLSearchParams();
   if (adminPreview) backQs.set('admin_preview', '1');
-  if (item.share_ticket) backQs.set('access', item.share_ticket);
+  if (item.share_ticket && !item.password_required) backQs.set('access', item.share_ticket);
   const backUrl = `/s/${item.slug}${backQs.toString() ? `?${backQs}` : ''}`;
   return (
     <div className="preview-page share-preview-page">
@@ -2240,7 +2476,7 @@ function NoteComposer({ mode, replyingTo, onCancel, onSubmit, disabled }: { mode
   );
 }
 
-function NoteItem({ note, mode, onReply, activeReply, clearReply, submit, canManage, onDelete }: { note: ShareNote; mode: 'comment' | 'memo'; onReply: (n: ShareNote) => void; activeReply: string; clearReply: () => void; submit: (body: string, visibility: 'public' | 'private', parentId?: string | null) => Promise<void>; canManage: boolean; onDelete: (noteId: string) => Promise<void> }) {
+function NoteItem({ note, mode, onReply, activeReply, clearReply, submit, canManage, onDelete }: { note: ShareNote; mode: 'comment' | 'memo'; onReply: (n: ShareNote) => void; activeReply: string; clearReply: () => void; submit: (body: string, visibility: 'public' | 'private', parentId?: string | null) => Promise<void>; canManage: boolean; onDelete: (noteId: string) => void | Promise<void> }) {
   const { t, language } = useI18n();
   const [menuOpen, setMenuOpen] = useState(false);
   return (
@@ -2287,6 +2523,7 @@ function ShareNotesPanel({ item, password, adminPreview, toast }: { item: Conten
   const [me, setMe] = useState<User | null>(null);
   const [error, setError] = useState('');
   const [replying, setReplying] = useState('');
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const qs = () => {
     const params = new URLSearchParams();
     if (adminPreview) params.set('admin_preview', '1');
@@ -2320,11 +2557,13 @@ function ShareNotesPanel({ item, password, adminPreview, toast }: { item: Conten
     setReplying('');
     toast(mode === 'memo' ? (language === 'en-US' ? 'Memo saved' : '备忘已保存') : (language === 'en-US' ? 'Comment sent' : '评论已发送'));
   }
-  async function deleteNote(noteId: string) {
-    if (!confirm(language === 'en-US' ? 'Delete this comment?' : '确认删除这条评论？')) return;
+  async function executeDeleteNote(noteId: string) {
     const res = await api<{ items: ShareNote[] }>(`/api/share/${item.slug}/notes/${noteId}${qs()}`, { method: 'DELETE', headers: shareHeaders(password, item.share_ticket) });
     setNotes(res.items);
     toast(mode === 'memo' ? (language === 'en-US' ? 'Memo deleted' : '备忘已删除') : (language === 'en-US' ? 'Comment deleted' : '评论已删除'));
+  }
+  function deleteNote(noteId: string) {
+    setPendingDelete(noteId);
   }
   const canMemo = mode !== 'memo' || me?.username === item.owner_username;
   const canManageNotes = me?.username === item.owner_username;
@@ -2349,6 +2588,7 @@ function ShareNotesPanel({ item, password, adminPreview, toast }: { item: Conten
           </div>
         </>
       )}
+      <ConfirmModal open={Boolean(pendingDelete)} title={mode === 'memo' ? t('confirm.deleteMemoTitle') : t('confirm.deleteCommentTitle')} message={mode === 'memo' ? t('confirm.deleteMemoMessage') : t('confirm.deleteCommentMessage')} confirmLabel={t('notes.delete')} destructive onClose={() => setPendingDelete(null)} onConfirm={async () => { const noteId = pendingDelete; setPendingDelete(null); if (noteId) await executeDeleteNote(noteId); }} />
     </section>
   );
 }
@@ -2358,34 +2598,60 @@ function ContentPreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) =
   const { slug, preview } = parseShareRoute();
   const [password, setPassword] = useState('');
   const [item, setItem] = useState<Content | null>(null);
-  const [error, setError] = useState('');
+  const [error, setError] = useState<{ message: string; code?: string; attempted: boolean } | null>(null);
+  const [contactUrl, setContactUrl] = useState('');
   const adminPreview = new URLSearchParams(location.search).get('admin_preview') === '1';
-  async function load(pass = password) {
+  async function load(pass = password, attempted = Boolean(pass)) {
     try {
-      setError('');
+      setError(null);
       const qs = new URLSearchParams();
       if (adminPreview) qs.set('admin_preview', '1');
       const existingAccess = new URLSearchParams(location.search).get('access') || '';
       const res = await api<{ item: Content }>(`/api/share/${slug}${qs.toString() ? `?${qs}` : ''}`, { headers: shareHeaders(pass, existingAccess) });
       setItem(res.item);
+      setError(null);
     } catch (err) {
-      setError((err as Error).message);
+      setError({ message: (err as Error).message, code: err instanceof UploadRequestError ? err.code : undefined, attempted });
     }
   }
-  useEffect(() => { load(''); }, [slug]);
+  useEffect(() => { void load('', false); }, [slug]);
+  const accessPresentation: ShareAccessPresentation = error ? classifyShareAccessError(error.code, error.message) : 'generic';
+  useEffect(() => {
+    if (accessPresentation !== 'permission') {
+      setContactUrl('');
+      return;
+    }
+    let cancelled = false;
+    api<{ href: string }>('/api/public/admin-contact').then((res) => { if (!cancelled) setContactUrl(res.href); }).catch(() => { if (!cancelled) setContactUrl(''); });
+    return () => { cancelled = true; };
+  }, [accessPresentation]);
   if (error && !item) {
-    const needsPassword = error.includes('Password') || error.includes('密码');
+    const isPassword = accessPresentation === 'password';
+    const title = accessPresentation === 'login' ? t('share.loginRequiredTitle') : accessPresentation === 'permission' ? t('share.permissionTitle') : isPassword ? t('share.passwordTitle') : t('share.genericTitle');
+    const message = accessPresentation === 'login' ? t('share.loginRequiredMessage') : accessPresentation === 'permission' ? t('share.permissionMessage') : isPassword ? t('share.passwordMessage') : t('share.genericMessage');
     return (
       <div className="share-shell">
-        <section className="panel share-error">
-          <h1>{t('share.noAccess')}</h1>
-          <p>{error}</p>
-          {needsPassword ? (
-            <div className="password-row">
-              <input type="password" placeholder={t('share.password')} value={password} onChange={(e) => setPassword(e.target.value)} />
-              <button className="primary" onClick={() => load(password)}>{t('share.submitPassword')}</button>
+        <section className="panel share-access-state">
+          <div className="share-access-language"><LanguageSwitcher /></div>
+          <div className="share-access-mark" aria-hidden="true"><CircleX size={38} /></div>
+          <h1>{title}</h1>
+          <p>{message}</p>
+          {isPassword ? (
+            <div className="share-password-form">
+              {error.attempted && <p className="share-password-error">{t('share.passwordIncorrect')}</p>}
+              <input type="password" autoComplete="off" placeholder={t('share.password')} value={password} onChange={(e) => setPassword(e.target.value)} />
+              <button className="primary" onClick={() => void load(password, true)}>{t('share.submitPassword')}</button>
             </div>
-          ) : token() ? null : <button className="primary" onClick={login}>{t('share.login')}</button>}
+          ) : (
+            <div className="share-access-actions">
+              {accessPresentation === 'login' && <button className="primary" onClick={login}>{t('share.login')}</button>}
+              {accessPresentation === 'permission' && <button className="primary" onClick={switchLogin}>{t('share.switchLogin')}</button>}
+              {accessPresentation === 'permission' && contactUrl && <a className="soft" href={contactUrl}>{t('share.contactAdmin')}</a>}
+              {accessPresentation === 'permission' && !contactUrl && <span className="muted share-access-secondary">{t('share.contactUnavailable')}</span>}
+              {accessPresentation === 'generic' && <button className="primary" onClick={() => void load('', false)}>{t('share.tryAgain')}</button>}
+              {accessPresentation === 'login' && token() && <button className="soft" onClick={switchLogin}>{t('share.switchLogin')}</button>}
+            </div>
+          )}
         </section>
       </div>
     );
@@ -2394,7 +2660,7 @@ function ContentPreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) =
   if (preview) return <SharePreviewPage item={item} password={password} adminPreview={adminPreview} toast={toast} />;
   const previewQs = new URLSearchParams();
   if (adminPreview) previewQs.set('admin_preview', '1');
-  if (item.share_ticket) previewQs.set('access', item.share_ticket);
+  if (item.share_ticket && !item.password_required) previewQs.set('access', item.share_ticket);
   if (item.attachments?.[0]) previewQs.set('file', item.attachments[0].id);
   const previewUrl = `/s/${item.slug}/preview${previewQs.toString() ? `?${previewQs}` : ''}`;
   return (
@@ -2442,6 +2708,7 @@ function LandingPage({ background }: { background: any }) {
     : undefined;
   return (
     <div className={`login landing ${background?.url ? 'with-bg' : ''}`} style={style}>
+      <div className="landing-brand"><BrandMark compact /><span>ShareWorker</span></div>
       <div className="landing-language"><LanguageSwitcher /></div>
       <section className="landing-hero">
         <div className="landing-copy">
@@ -2502,7 +2769,7 @@ function SsoCallbackLoading({ toasts }: { toasts: Toast[] }) {
   return (
     <div className="sso-loading-page" role="status" aria-live="polite">
       <section className="sso-loading-card">
-        <div className="sso-loading-mark" aria-hidden="true"><Share2 size={22} /></div>
+        <div className="sso-loading-mark" aria-hidden="true"><BrandMark compact /></div>
         <h1>ShareWorker</h1>
         <p>{t('sso.completing')}</p>
         <div className="sso-loading-track" aria-hidden="true"><i /></div>

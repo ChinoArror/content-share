@@ -5,6 +5,9 @@ import {
   middleEllipsis,
   normalizeVisibility,
   quotaGiBToBytes,
+  auditNullLabel,
+  mergeKeyFingerprint,
+  visibilitySegmentMetrics,
   withAllowedVisibility,
 } from './admin-display';
 
@@ -47,5 +50,23 @@ describe('admin display helpers', () => {
     expect(adminKeyActions(true)).toEqual(expect.arrayContaining(['rotate', 'unlock', 'revoke']));
     expect(adminKeyActions(false)).not.toContain('unlock');
     expect(adminKeyActions(true)).not.toContain('lock');
+  });
+
+  it('sizes visibility segments to the permissions that are actually available', () => {
+    expect(visibilitySegmentMetrics(3, 1)).toEqual({ count: 3, index: 1 });
+    expect(visibilitySegmentMetrics(2, 1)).toEqual({ count: 2, index: 1 });
+    expect(visibilitySegmentMetrics(0, 9)).toEqual({ count: 1, index: 0 });
+  });
+
+  it('does not label unused or unlocked audit timestamps as permanent', () => {
+    expect(auditNullLabel('last_used_at', 'zh-CN')).toBe('从未使用');
+    expect(auditNullLabel('locked_at', 'zh-CN')).toBe('未锁定');
+    expect(auditNullLabel('last_used_at', 'en-US')).toBe('Never used');
+    expect(auditNullLabel('locked_at', 'en-US')).toBe('Not locked');
+  });
+
+  it('merges API key prefix and suffix into one display fingerprint', () => {
+    expect(mergeKeyFingerprint('sw_live_', '7f42')).toBe('sw_live_...7f42');
+    expect(mergeKeyFingerprint('', '')).toBe('-');
   });
 });

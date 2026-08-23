@@ -53,3 +53,20 @@ export type AdminKeyAction = 'rotate' | 'lock' | 'unlock' | 'revoke';
 export function adminKeyActions(locked: boolean): AdminKeyAction[] {
   return locked ? ['rotate', 'unlock', 'revoke'] : ['rotate', 'lock', 'revoke'];
 }
+
+export function visibilitySegmentMetrics(optionCount: number, selectedIndex: number): { count: number; index: number } {
+  const count = Math.max(1, Math.floor(optionCount));
+  return { count, index: Math.min(Math.max(0, Math.floor(selectedIndex)), count - 1) };
+}
+
+export function auditNullLabel(key: string, language: 'zh-CN' | 'en-US' = 'zh-CN'): string {
+  if (key === 'last_used_at') return language === 'en-US' ? 'Never used' : '从未使用';
+  if (key === 'locked_at') return language === 'en-US' ? 'Not locked' : '未锁定';
+  return language === 'en-US' ? 'Permanent' : '永久';
+}
+
+export function mergeKeyFingerprint(prefix?: string | null, suffix?: string | null): string {
+  const left = String(prefix || '').trim();
+  const right = String(suffix || '').trim();
+  return left || right ? `${left || '-'}...${right}` : '-';
+}

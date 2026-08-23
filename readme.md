@@ -44,6 +44,7 @@ Important environment variables:
 - `SSO_URL=https://accounts.aryuki.com`
 - `SSO_APP_ID=content-share`
 - `PUBLIC_BASE_URL=https://content.aryuki.com`
+- `ADMIN_CONTACT_EMAIL=` optional administrator address used by protected-share contact actions; leave empty to hide that action
 - `R2_ACCOUNT_ID=...`
 - `R2_BUCKET_NAME=content-share-save`
 
@@ -116,6 +117,8 @@ Useful checks:
 npx tsc --noEmit
 npm run build
 ```
+
+Protected share pages are bilingual. Internal access failures can offer account switching and, when `ADMIN_CONTACT_EMAIL` is configured, a controlled contact link. Password input remains in the current document only; password-protected preview URLs do not carry reusable access tickets, so a new tab asks for the password again.
 
 ## CLI Upload
 

@@ -44,6 +44,7 @@ Content Share 是运行在 Cloudflare Workers 上的内容发布与文件分享�
 - `SSO_URL=https://accounts.aryuki.com`
 - `SSO_APP_ID=content-share`
 - `PUBLIC_BASE_URL=https://content.aryuki.com`
+- `ADMIN_CONTACT_EMAIL=` 可选的管理员邮箱，用于受保护分享页的联系管理员操作；留空则隐藏该操作
 - `R2_ACCOUNT_ID=...`
 - `R2_BUCKET_NAME=content-share-save`
 
@@ -116,6 +117,8 @@ npx wrangler secret put R2_DOWNLOAD_SECRET_ACCESS_KEY
 npx tsc --noEmit
 npm run build
 ```
+
+内部分享和加密分享的拒绝页面支持中英文切换。内部权限不足时可切换登录账户；配置 `ADMIN_CONTACT_EMAIL` 后还会显示受控的联系管理员入口。密码只保留在当前文档内，受密码保护的预览链接不携带可复用访问票据，因此新标签页会再次要求输入密码。
 
 ## 命令行上传
 

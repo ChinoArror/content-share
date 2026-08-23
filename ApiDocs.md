@@ -300,4 +300,5 @@ File and mixed uploads may additionally return `queued: true` while Queue finish
 - A single CLI request accepts at most 20 files.
 - Legacy upload endpoints limit a single file to 100 MiB; resumable upload sessions support a single file up to 5 GiB.
 - Unfinished direct uploads are limited to 50 sessions per user; storage quota comes from the assigned permission group.
+- `ADMIN_CONTACT_EMAIL` is optional. When configured, protected-share pages can open a bilingual contact link; when empty, the contact action is omitted.
 - Do not expose API Keys, R2 credentials, signed URLs, or password values in logs.
