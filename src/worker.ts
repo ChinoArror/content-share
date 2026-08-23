@@ -1643,6 +1643,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   if (path === '/api/public/admin-contact' && method === 'GET') {
+    await verifySso(req, env);
     const email = String(env.ADMIN_CONTACT_EMAIL || '').trim();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       throw new HttpError(404, 'Administrator contact is not configured', 'ADMIN_CONTACT_UNAVAILABLE');

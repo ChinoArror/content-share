@@ -20,6 +20,7 @@ import { MAX_UPLOAD_SIZE } from './transfer-policy';
 import { getInitialLanguage, I18nProvider, LanguageSwitcher, translate, useI18n, type Language } from './i18n';
 import {
   adminKeyActions,
+  adminEnumMessageKey,
   adminFieldLabelKey,
   allowedVisibilityOptions,
   compactAuditValue,
@@ -34,7 +35,7 @@ import {
 } from './admin-display';
 import { classifyShareAccessError, type ShareAccessPresentation } from './share-access';
 import { classifyShareResourceError, shareResourceMode, type ShareResourceFailure } from './share-resource';
-import { currentReturnTo, safeReturnTo } from './sso-redirect';
+import { buildSsoLoginUrl, safeReturnTo } from './sso-redirect';
 import {
   ChevronDown,
   ChevronRight,
@@ -348,6 +349,11 @@ function publicLink(slug: string) {
   return `${location.origin}/s/${slug}`;
 }
 
+function localizedAdminEnum(t: (key: string) => string, field: string, value: unknown): string {
+  const key = adminEnumMessageKey(field, value);
+  return key ? t(key) : String(value ?? '-');
+}
+
 function avatarSrc(url?: string | null) {
   const value = String(url || '').trim();
   if (!value) return defaultAvatarUrl;
@@ -481,13 +487,11 @@ function TextPreviewBox({ html, rawText, className = '' }: { html: string; rawTe
 }
 
 function login() {
-  location.href = `${SSO_URL}/?client_id=${APP_ID}&redirect=${encodeURIComponent(`${location.origin}/sso-callback`)}`;
+  location.href = buildSsoLoginUrl(SSO_URL, APP_ID, location.origin, location);
 }
 
 function switchLogin() {
-  const returnTo = currentReturnTo(location);
-  const callback = `${location.origin}/sso-callback?return_to=${encodeURIComponent(returnTo)}`;
-  const loginUrl = `${SSO_URL}/?client_id=${APP_ID}&redirect=${encodeURIComponent(callback)}`;
+  const loginUrl = buildSsoLoginUrl(SSO_URL, APP_ID, location.origin, location);
   localStorage.removeItem('sso_token');
   location.href = `${SSO_URL}/logout?redirect=${encodeURIComponent(loginUrl)}`;
 }
@@ -1225,9 +1229,9 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
               <tr key={item.id}>
                 <td>{item.title}</td>
                 <td><a href={`/s/${item.slug}`} target="_blank" rel="noreferrer">{item.slug}</a></td>
-                <td><Badge text={item.type} /></td>
-                <td><Badge text={item.visibility} /></td>
-                <td><Badge text={item.status} danger={item.status !== 'active'} /></td>
+                <td><Badge text={localizedAdminEnum(t, 'type', item.type)} /></td>
+                <td><Badge text={localizedAdminEnum(t, 'visibility', item.visibility)} /></td>
+                <td><Badge text={localizedAdminEnum(t, 'status', item.status)} danger={item.status !== 'active'} /></td>
                 <td>{fmtBytes(item.file_size)}</td>
                 <td>{item.view_count}</td>
                 <td>{item.max_views || (language === 'en-US' ? 'Unlimited' : '无限')}</td>
@@ -1323,8 +1327,8 @@ function MyContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind
         <FilterMenu
           values={{ type: filter.type, status: filter.status }}
           items={[
-            { key: 'type', label: t('filters.type'), options: [{ value: 'text', label: 'text' }, { value: 'file', label: 'file' }, { value: 'mixed', label: 'mixed' }] },
-            { key: 'status', label: t('filters.status'), options: [{ value: 'active', label: 'active' }, { value: 'processing', label: t('content.processing') }, { value: 'expired', label: 'expired' }, { value: 'deleted', label: 'deleted' }] }
+            { key: 'type', label: t('filters.type'), options: ['text', 'file', 'mixed'].map((value) => ({ value, label: localizedAdminEnum(t, 'type', value) })) },
+            { key: 'status', label: t('filters.status'), options: ['active', 'processing', 'expired', 'deleted'].map((value) => ({ value, label: localizedAdminEnum(t, 'status', value) })) }
           ]}
           onChange={(key, value) => { const next = { ...filter, [key]: value }; setFilter(next); load(next); }}
           onClear={() => { const next = { q: '', type: '', status: '' }; setFilter(next); load(next); }}
@@ -1392,7 +1396,7 @@ function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
       </section>
       <section className="panel table-panel">
         <div className="table-scroll"><table><thead><tr><th>{t('keys.remark')}</th><th>{t('keys.key')}</th><th>{t('keys.status')}</th><th>{t('keys.expire')}</th><th>{t('keys.lastUsed')}</th><th>{t('keys.calls')}</th><th>{t('keys.actions')}</th></tr></thead><tbody>
-          {items.map((k) => <tr key={k.id}><td>{k.remark || '-'}</td><td><code>{mergeKeyFingerprint(k.key_prefix, k.key_suffix)}</code></td><td><Badge text={k.status} danger={k.status !== 'active'} /></td><td>{fmtDate(k.expire_at)}</td><td>{fmtAuditDate('last_used_at', k.last_used_at, language)}</td><td>{k.usage_count}</td><td><div className="actions"><button className="icon" title={t('admin.rotateKey')} aria-label={t('admin.rotateKey')} onClick={() => mutate(k.id, 'rotate')}><RotateCw size={16} /></button><button className="icon danger" title={t('admin.revokeKey')} aria-label={t('admin.revokeKey')} onClick={() => mutate(k.id, 'revoke')}><Trash2 size={16} /></button></div></td></tr>)}
+            {items.map((k) => <tr key={k.id}><td>{k.remark || '-'}</td><td><code>{mergeKeyFingerprint(k.key_prefix, k.key_suffix)}</code></td><td><Badge text={localizedAdminEnum(t, 'status', k.status)} danger={k.status !== 'active'} /></td><td>{fmtDate(k.expire_at)}</td><td>{fmtAuditDate('last_used_at', k.last_used_at, language)}</td><td>{k.usage_count}</td><td><div className="actions"><button className="icon" title={t('admin.rotateKey')} aria-label={t('admin.rotateKey')} onClick={() => mutate(k.id, 'rotate')}><RotateCw size={16} /></button><button className="icon danger" title={t('admin.revokeKey')} aria-label={t('admin.revokeKey')} onClick={() => mutate(k.id, 'revoke')}><Trash2 size={16} /></button></div></td></tr>)}
           {!items.length && <tr><td colSpan={7} className="empty">{t('keys.empty')}</td></tr>}
         </tbody></table></div>
         {loading && <QueryLoading />}

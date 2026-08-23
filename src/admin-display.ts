@@ -34,6 +34,26 @@ export function adminFieldLabelKey(key: string): string | null {
   return adminFieldLabelKeys[key] || null;
 }
 
+const adminStatusValues = new Set(['active', 'expired', 'revoked', 'processing', 'deleted']);
+const adminRoleValues = new Set(['admin', 'user']);
+const adminVisibilityValues = new Set(['public', 'internal', 'private']);
+const adminActionValues = new Set(['view', 'preview', 'download', 'denied']);
+
+export function adminEnumMessageKey(field: string, value: unknown): string | null {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) return null;
+  if (field === 'status' && adminStatusValues.has(normalized)) return `admin.status.${normalized}`;
+  if (field === 'role' && adminRoleValues.has(normalized)) return `admin.role.${normalized}`;
+  if (field === 'visibility' && adminVisibilityValues.has(normalized)) return `visibility.${normalized}`;
+  if (field === 'action' && adminActionValues.has(normalized)) return `admin.action.${normalized}`;
+  if (field === 'type') {
+    if (normalized === 'text') return 'admin.text';
+    if (normalized === 'file') return 'admin.file';
+    if (normalized === 'mixed') return 'admin.mixed';
+  }
+  return null;
+}
+
 export type AdminVisibility = 'public' | 'internal' | 'private';
 const allVisibilityOptions: AdminVisibility[] = ['public', 'internal', 'private'];
 

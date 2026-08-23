@@ -366,6 +366,27 @@ describe('route-level business permissions', () => {
     await expect(errorBody(response)).resolves.toMatchObject({ code: 'LOGIN_REQUIRED' });
   });
 
+  it('requires SSO before returning the configured administrator mailto address', async () => {
+    const configuredEnv = { ...env(testDb()), ADMIN_CONTACT_EMAIL: 'admin@example.com' };
+    const unauthenticated = await worker.fetch(
+      new Request('https://content.example.test/api/public/admin-contact'),
+      configuredEnv,
+      { waitUntil() {} } as unknown as ExecutionContext,
+    );
+    expect(unauthenticated.status).toBe(401);
+
+    const authenticated = await worker.fetch(
+      request('/api/public/admin-contact'),
+      configuredEnv,
+      { waitUntil() {} } as unknown as ExecutionContext,
+    );
+    expect(authenticated.status).toBe(200);
+    await expect(authenticated.json()).resolves.toMatchObject({
+      ok: true,
+      href: 'mailto:admin@example.com?subject=ShareWorker%20access%20request&body=Please%20help%20me%20access%20a%20ShareWorker%20share.',
+    });
+  });
+
   it.each([
     ['/api/share/shared-item', 'content'],
     ['/api/attachments/att_1/preview-info?media=', 'attachment-info'],

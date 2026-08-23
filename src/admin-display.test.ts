@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { translate } from './i18n';
 import {
   adminFieldLabelKey,
+  adminEnumMessageKey,
   adminKeyActions,
   compactAuditValue,
   middleEllipsis,
@@ -14,6 +15,17 @@ import {
 } from './admin-display';
 
 describe('admin display helpers', () => {
+  it('maps visible admin enum values to localized message keys', () => {
+    expect(adminEnumMessageKey('status', 'active')).toBe('admin.status.active');
+    expect(adminEnumMessageKey('status', 'processing')).toBe('admin.status.processing');
+    expect(adminEnumMessageKey('visibility', 'internal')).toBe('visibility.internal');
+    expect(adminEnumMessageKey('role', 'admin')).toBe('admin.role.admin');
+    expect(adminEnumMessageKey('action', 'download')).toBe('admin.action.download');
+    expect(translate('zh-CN', adminEnumMessageKey('status', 'expired')!)).toBe('已过期');
+    expect(translate('en-US', adminEnumMessageKey('role', 'user')!)).toBe('User');
+    expect(adminEnumMessageKey('status', 'unknown')).toBe(null);
+  });
+
   it('maps admin detail fields to localized message keys', () => {
     expect(adminFieldLabelKey('slug')).toBe('admin.slug');
     expect(adminFieldLabelKey('key_prefix')).toBe('keys.key');
