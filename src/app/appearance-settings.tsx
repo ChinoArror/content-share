@@ -4,12 +4,10 @@ import type { CSSProperties } from 'react';
 import { useI18n } from '../i18n';
 import type { UiSettings } from '../ui-settings';
 import { useFeedback } from './feedback';
+import { rangeFill } from './select';
 import { ACCENT_SPECS, useTheme } from './theme';
 
 type Option<T extends string> = readonly [T, string];
-
-// Percent position of a value within a range, used to paint the filled part of the track.
-const fillPct = (value: number, min: number, max: number) => `${max > min ? ((value - min) / (max - min)) * 100 : 0}%`;
 
 function Segmented<T extends string>({ label, value, options, onChange }: { label: string; value: T; options: ReadonlyArray<Option<T>>; onChange: (next: T) => void }) {
   return (
@@ -144,11 +142,26 @@ export function AppearanceSettings() {
                 step={1}
                 value={settings.radius}
                 aria-label={t('appearance.radius')}
-                style={{ ['--fill' as any]: fillPct(settings.radius, 4, 16) } as CSSProperties}
+                style={{ ['--fill' as any]: rangeFill(settings.radius, 4, 16) } as CSSProperties}
                 onChange={(e) => update({ radius: Number(e.target.value) })}
               />
               <output style={{ fontVariantNumeric: 'tabular-nums' }}>{settings.radius}px</output>
             </div>
+          </div>
+          <div className="setting-row">
+            <div>
+              <strong>{t('appearance.pdfViewer')}</strong>
+              <small>{t('appearance.pdfViewerDesc')}</small>
+            </div>
+            <Segmented<UiSettings['pdfViewer']>
+              label={t('appearance.pdfViewer')}
+              value={settings.pdfViewer}
+              onChange={(pdfViewer) => update({ pdfViewer })}
+              options={[
+                ['adobe', t('pdf.adobe')],
+                ['pdfjs', t('pdf.classic')],
+              ]}
+            />
           </div>
         </div>
 
@@ -179,7 +192,7 @@ export function AppearanceSettings() {
                 step={1}
                 value={seconds}
                 aria-label={t('appearance.feedback')}
-                style={{ ['--fill' as any]: fillPct(seconds, 3, 10) } as CSSProperties}
+                style={{ ['--fill' as any]: rangeFill(seconds, 3, 10) } as CSSProperties}
                 onChange={(e) => update({ feedbackDurationMs: Number(e.target.value) * 1000 })}
               />
               <output style={{ fontVariantNumeric: 'tabular-nums' }}>{t('appearance.seconds', { count: seconds })}</output>

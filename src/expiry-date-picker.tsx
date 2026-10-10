@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarDays, Check, ChevronLeft, ChevronRight, Clock3, X } from 'lucide-react';
 import { useI18n } from './i18n';
+import { Select } from './app/select';
 
 type CalendarDay = {
   key: string;
@@ -90,7 +91,9 @@ export function ExpiryDatePicker({ value, onChange, label = '过期日期', clas
   useEffect(() => {
     if (!open) return undefined;
     const close = (event: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Element;
+      // The hour/minute dropdowns are portaled to <body>; picking an option there is still "inside".
+      if (rootRef.current && !rootRef.current.contains(target) && !target.closest?.('.cs-select-menu')) setOpen(false);
     };
     const escape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') setOpen(false);
@@ -163,8 +166,18 @@ export function ExpiryDatePicker({ value, onChange, label = '过期日期', clas
           </div>}
           <div className="date-picker-time">
             <Clock3 size={15} />
-            <select aria-label={language === 'en-US' ? 'Hour' : '小时'} value={hour} onChange={(event) => chooseTime(Number(event.target.value), minute)}>{Array.from({ length: 24 }, (_, value) => <option key={value} value={value}>{language === 'en-US' ? `${pad(value)} h` : `${pad(value)} 时`}</option>)}</select>
-            <select aria-label={language === 'en-US' ? 'Minute' : '分钟'} value={minute} onChange={(event) => chooseTime(hour, Number(event.target.value))}>{Array.from({ length: 60 }, (_, value) => <option key={value} value={value}>{language === 'en-US' ? `${pad(value)} min` : `${pad(value)} 分`}</option>)}</select>
+            <Select
+              ariaLabel={language === 'en-US' ? 'Hour' : '小时'}
+              value={String(hour)}
+              onChange={(next) => chooseTime(Number(next), minute)}
+              options={Array.from({ length: 24 }, (_, value) => ({ value: String(value), label: language === 'en-US' ? `${pad(value)} h` : `${pad(value)} 时` }))}
+            />
+            <Select
+              ariaLabel={language === 'en-US' ? 'Minute' : '分钟'}
+              value={String(minute)}
+              onChange={(next) => chooseTime(hour, Number(next))}
+              options={Array.from({ length: 60 }, (_, value) => ({ value: String(value), label: language === 'en-US' ? `${pad(value)} min` : `${pad(value)} 分` }))}
+            />
           </div>
           <div className="date-picker-footer">
             <button type="button" className="soft" onClick={() => { onChange(''); setOpen(false); }}><X size={14} /> {language === 'en-US' ? 'Clear' : '清除'}</button>

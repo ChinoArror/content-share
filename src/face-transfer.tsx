@@ -14,6 +14,7 @@ import { createQRTransferProfile } from '@raptorqr/core/protocol/profiles';
 import { createRaptorQPlaybackOrders } from '@raptorqr/core/sender/raptorq_playback';
 import { renderQRCodeImageData } from '@raptorqr/core/qr/qr_encoder_browser';
 import { useI18n } from './i18n';
+import { rangeFill } from './app/select';
 
 type Toast = (text: string, kind?: 'ok' | 'error') => void;
 type Mode = 'send' | 'receive';
@@ -257,6 +258,7 @@ function SendFile({ toast }: { toast: Toast }) {
                 max="320"
                 step="20"
                 value={frameDelay}
+                style={{ ['--fill' as any]: rangeFill(frameDelay, 100, 320) }}
                 onChange={(event) => {
                   const value = Number(event.target.value);
                   frameDelayRef.current = value;

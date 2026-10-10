@@ -1,0 +1,262 @@
+/* Landing background crop editor + admin area card. Uses SnowLuma tokens from styles.css only. */
+
+.bg-crop-scroll { display: grid; gap: 16px; }
+
+/* ---- Preview frame (final 16:9 crop) ---- */
+.bg-crop-frame {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 720px;
+  aspect-ratio: 16 / 9;
+  margin-inline: auto;
+  overflow: hidden;
+  border-radius: calc(var(--radius) + 2px);
+  background: var(--muted-surface);
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--border) 80%, transparent),
+    var(--shadow-float);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.bg-crop-frame.is-dragging { cursor: grabbing; }
+.bg-crop-frame:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.bg-crop-image {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  max-width: none;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+  will-change: transform;
+}
+
+.bg-crop-status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+/* ---- Controls ---- */
+.bg-crop-controls { display: grid; gap: 10px; }
+
+.bg-zoom-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+.bg-zoom-label { font-size: 13px; font-weight: 600; color: var(--foreground); white-space: nowrap; }
+.bg-zoom-btn {
+  width: 40px;
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.bg-zoom-value {
+  min-width: 4.5ch;
+  text-align: right;
+  font-size: 13px;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.bg-zoom-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  min-width: 0;
+  height: 6px;
+  margin: 0;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--primary) 0,
+    var(--primary) var(--fill, 0%),
+    var(--muted-surface) var(--fill, 0%),
+    var(--muted-surface) 100%
+  );
+  cursor: pointer;
+}
+.bg-zoom-range:disabled { cursor: not-allowed; }
+.bg-zoom-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--card);
+  border: 2px solid var(--primary);
+  box-shadow: 0 1px 2px oklch(0% 0 0 / 0.12);
+}
+.bg-zoom-range::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--card);
+  border: 2px solid var(--primary);
+  box-shadow: 0 1px 2px oklch(0% 0 0 / 0.12);
+}
+.bg-zoom-range:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+
+.bg-crop-hint {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--muted-foreground);
+  text-align: center;
+}
+.bg-crop-error {
+  margin: 0;
+  font-size: 13px;
+  color: var(--destructive);
+}
+
+/* ---- Footer ---- */
+.bg-crop-footer {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.bg-crop-footer > button {
+  min-height: 40px;
+  min-width: 96px;
+}
+
+/* ---- Admin area card ---- */
+.bg-area-card {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+  min-width: 0;
+  padding: 14px;
+  background: var(--card);
+  border: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+  border-radius: calc(var(--radius) + 2px);
+  box-shadow:
+    0 1px 2px oklch(0% 0 0 / 0.04),
+    0 4px 12px -6px oklch(0% 0 0 / 0.08);
+}
+
+.bg-area-thumb {
+  position: relative;
+  width: 160px;
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: calc(var(--radius) - 2px);
+  background: var(--muted-surface);
+  color: var(--muted-foreground);
+  display: grid;
+  place-items: center;
+}
+.bg-area-thumb img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.bg-area-meta { display: grid; gap: 4px; min-width: 0; }
+.bg-area-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--foreground);
+  overflow-wrap: anywhere;
+}
+.bg-area-restore {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--muted-foreground);
+  overflow-wrap: anywhere;
+}
+
+.bg-area-actions {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+.bg-area-actions > * {
+  min-width: 0;
+  min-height: 40px;
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: calc(var(--radius) - 2px);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+.bg-area-actions > button { cursor: pointer; }
+.bg-area-actions > button:disabled { cursor: not-allowed; }
+
+.bg-upload-label {
+  cursor: pointer;
+  position: relative;
+}
+.bg-upload-label:focus-within {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+/* Visually hidden but focusable and clickable through the label. */
+.bg-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+@media (max-width: 560px) {
+  .bg-zoom-row { gap: 8px; }
+  .bg-zoom-value { min-width: 4.5ch; }
+  .bg-area-card { grid-template-columns: minmax(0, 1fr); }
+  .bg-area-thumb { width: 100%; }
+  .bg-area-actions { grid-template-columns: minmax(0, 1fr); }
+  .bg-crop-footer > button { flex: 1 1 0; }
+}
+
+@media (pointer: coarse) {
+  .bg-zoom-btn,
+  .bg-crop-footer > button,
+  .bg-area-actions > * { min-height: 44px; }
+  .bg-zoom-range { height: 8px; }
+}

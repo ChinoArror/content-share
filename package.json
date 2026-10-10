@@ -8,7 +8,7 @@
     "build": "vite build",
     "test": "vitest run",
     "test:fountain": "node scripts/fountain-self-check.mjs",
-    "deploy": "npm run build && npx wrangler deploy",
+    "deploy": "npm run build && npx wrangler d1 migrations apply content-share-db --remote && npx wrangler deploy",
     "db:apply": "npx wrangler d1 migrations apply content-share-db --remote",
     "db:migrate": "npx wrangler d1 migrations apply content-share-db --remote",
     "queue:create": "npx wrangler queues create content-share-upload-queue",

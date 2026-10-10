@@ -14,6 +14,7 @@ describe('UI settings defaults', () => {
       disableMotion: false,
       sidebarCollapsed: false,
       feedbackDurationMs: 5000,
+      pdfViewer: 'adobe',
     });
   });
 
@@ -76,6 +77,27 @@ describe('UI settings validation', () => {
     const result = sanitizeUiSettings({ radius: Number.NaN, feedbackDurationMs: Number.POSITIVE_INFINITY });
     expect(result.radius).toBe(10);
     expect(result.feedbackDurationMs).toBe(5000);
+  });
+});
+
+describe('UI settings PDF viewer', () => {
+  it('defaults to the Adobe engine and accepts the classic pdf.js engine', () => {
+    expect(DEFAULT_UI_SETTINGS.pdfViewer).toBe('adobe');
+    expect(sanitizeUiSettings({ pdfViewer: 'pdfjs' }).pdfViewer).toBe('pdfjs');
+    expect(sanitizeUiSettings({ pdfViewer: 'adobe' }).pdfViewer).toBe('adobe');
+  });
+
+  it('rejects unknown engines and keeps the base value', () => {
+    for (const value of ['chrome', 'PDFJS', '', null, 1, true]) {
+      expect(sanitizeUiSettings({ pdfViewer: value }).pdfViewer).toBe('adobe');
+      expect(sanitizeUiSettings({ pdfViewer: value }, { ...DEFAULT_UI_SETTINGS, pdfViewer: 'pdfjs' }).pdfViewer).toBe('pdfjs');
+    }
+  });
+
+  it('merges the engine choice from a partial patch', () => {
+    expect(mergeUiSettings({ pdfViewer: 'pdfjs' }, { density: 'compact' }).pdfViewer).toBe('pdfjs');
+    expect(mergeUiSettings({ pdfViewer: 'pdfjs' }, { pdfViewer: 'adobe' }).pdfViewer).toBe('adobe');
+    expect(mergeUiSettings({ pdfViewer: 'pdfjs' }, { pdfViewer: 'bogus' }).pdfViewer).toBe('pdfjs');
   });
 });
 

@@ -9,6 +9,7 @@ export type UiSettings = {
   disableMotion: boolean;
   sidebarCollapsed: boolean;
   feedbackDurationMs: number;
+  pdfViewer: 'adobe' | 'pdfjs';
 };
 
 export const ACCENT_PRESETS = ['sky', 'blue', 'violet', 'rose', 'emerald', 'amber', 'orange'] as const;
@@ -24,11 +25,13 @@ export const DEFAULT_UI_SETTINGS: UiSettings = {
   disableMotion: false,
   sidebarCollapsed: false,
   feedbackDurationMs: 5000,
+  pdfViewer: 'adobe',
 };
 
 const MODES: readonly UiSettings['mode'][] = ['light', 'dark', 'system'];
 const ACCENT_MODES: readonly UiSettings['accentMode'][] = ['preset', 'custom'];
 const DENSITIES: readonly UiSettings['density'][] = ['comfortable', 'compact'];
+const PDF_VIEWERS: readonly UiSettings['pdfViewer'][] = ['adobe', 'pdfjs'];
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 
 function pickEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
@@ -62,6 +65,7 @@ export function sanitizeUiSettings(input: unknown, base: UiSettings = DEFAULT_UI
     disableMotion: pickBoolean(src.disableMotion, base.disableMotion),
     sidebarCollapsed: pickBoolean(src.sidebarCollapsed, base.sidebarCollapsed),
     feedbackDurationMs: pickClampedInt(src.feedbackDurationMs, 3000, 10000, base.feedbackDurationMs),
+    pdfViewer: pickEnum(src.pdfViewer, PDF_VIEWERS, base.pdfViewer),
   };
 }
 

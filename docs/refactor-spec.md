@@ -22,6 +22,7 @@ export type UiSettings = {
   disableMotion: boolean;                     // default false
   sidebarCollapsed: boolean;                  // default false
   feedbackDurationMs: number;                 // 3000..10000 integer, default 5000 (notice + undo countdown)
+  pdfViewer: 'adobe' | 'pdfjs';              // default 'adobe'; PDF preview engine (round 4), Adobe falls back to pdf.js automatically
 };
 ```
 Sanitizer `sanitizeUiSettings(input: unknown, base = DEFAULT_UI_SETTINGS): UiSettings` lives in `src/ui-settings.ts`

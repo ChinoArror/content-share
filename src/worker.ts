@@ -7,6 +7,21 @@ import { previewKind } from './preview-policy';
 import { ensureUserGroup, loadUserAccessProfile, reserveStorage } from './worker-permissions';
 import { PERMISSION_KEYS, PolicyError, type PermissionKey, type UserAccessProfile } from './permission-policy';
 import { mergeUiSettings, sanitizeUiSettings } from './ui-settings';
+import {
+  backgroundKeys,
+  backgroundKeysOf,
+  backgroundPublicUrl,
+  BACKGROUND_DEFAULT_OPACITY,
+  BACKGROUND_ORIGINAL_ENDPOINT,
+  BACKGROUND_RESTORE_MS,
+  BackgroundInputError,
+  clampOpacity,
+  normalizeBackgroundValue,
+  normalizeCrop,
+  parseImageDataUrl,
+  unreferencedKeys,
+  type BackgroundValue
+} from './background-store';
 
 type Env = {
   DB: D1Database;
@@ -18,6 +33,7 @@ type Env = {
   MEDIA_TICKET_SECRET: string;
   PUBLIC_BASE_URL: string;
   ADMIN_CONTACT_EMAIL?: string;
+  ADOBE_PDF_CLIENT_ID?: string;
   R2_ACCOUNT_ID?: string;
   R2_BUCKET_NAME?: string;
   R2_UPLOAD_ACCESS_KEY_ID?: string;
@@ -197,11 +213,15 @@ function publicBase(env: Env, req: Request): string {
   return env.PUBLIC_BASE_URL || new URL(req.url).origin;
 }
 
-function normalizeSlug(input?: string | null): string {
+// Cleans a user-supplied slug. Returns '' when nothing usable is left (no random fallback).
+function slugFromInput(input?: string | null): string {
   const raw = (input || '').trim();
-  if (!raw) return randomSlug();
-  const slug = raw.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
-  return slug || randomSlug();
+  if (!raw) return '';
+  return raw.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+}
+
+function normalizeSlug(input?: string | null): string {
+  return slugFromInput(input) || randomSlug();
 }
 
 function numberField(value: FormDataEntryValue | string | number | null | undefined, fallback = 0): number {
@@ -597,7 +617,26 @@ function requireAdmin(user: User): void {
   if (user.role !== 'admin') throw new HttpError(403, 'Admin permission required');
 }
 
+// The user_ui_settings migration was not applied on some deployments, so the table is created
+// once per isolate before first use. A failed attempt is retried on the next call.
+let uiSettingsTableReady: Promise<void> | null = null;
+
+async function ensureUiSettingsTable(db: D1Database): Promise<void> {
+  if (!uiSettingsTableReady) {
+    uiSettingsTableReady = db
+      .prepare('CREATE TABLE IF NOT EXISTS user_ui_settings (username TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL)')
+      .run()
+      .then(() => undefined)
+      .catch((err) => {
+        uiSettingsTableReady = null;
+        throw err;
+      });
+  }
+  await uiSettingsTableReady;
+}
+
 async function loadUiSettingsRow(db: D1Database, username: string): Promise<{ stored: unknown; updated_at: string | null }> {
+  await ensureUiSettingsTable(db);
   const row = await db.prepare('SELECT settings_json, updated_at FROM user_ui_settings WHERE username = ?1')
     .bind(username)
     .first<{ settings_json: string; updated_at: string }>();
@@ -638,9 +677,19 @@ async function upsertUser(db: D1Database, user: User): Promise<void> {
     .run();
 }
 
+// A requested slug is used as-is (after normalization) or rejected: no silent random replacement.
+// Only when no slug is requested is a random one generated, retrying on collision.
 async function uniqueSlug(db: D1Database, preferred?: string | null): Promise<string> {
+  const requested = preferred === null || preferred === undefined ? '' : String(preferred).trim();
+  if (requested) {
+    const candidate = slugFromInput(requested);
+    if (!candidate) throw new HttpError(400, 'Invalid slug', 'INVALID_SLUG');
+    const taken = await db.prepare('SELECT id FROM contents WHERE slug = ?').bind(candidate).first();
+    if (taken) throw new HttpError(409, 'Slug already in use', 'SLUG_TAKEN');
+    return candidate;
+  }
   for (let i = 0; i < 8; i++) {
-    const candidate = normalizeSlug(i === 0 ? preferred : null);
+    const candidate = randomSlug();
     const hit = await db.prepare('SELECT id FROM contents WHERE slug = ?').bind(candidate).first();
     if (!hit) return candidate;
   }
@@ -1674,6 +1723,72 @@ async function setSystemSetting(db: D1Database, key: string, value: unknown, use
     .run();
 }
 
+const LANDING_BACKGROUND_KEY = 'landing_background';
+const LANDING_BACKGROUND_PENDING_KEY = 'landing_background_pending';
+
+type PendingBackground = { value: BackgroundValue; deadline: string };
+
+async function loadLandingBackground(db: D1Database): Promise<BackgroundValue | null> {
+  return normalizeBackgroundValue(await systemSetting(db, LANDING_BACKGROUND_KEY));
+}
+
+async function loadPendingBackground(db: D1Database): Promise<PendingBackground | null> {
+  const raw = await systemSetting(db, LANDING_BACKGROUND_PENDING_KEY);
+  const value = normalizeBackgroundValue(raw?.value);
+  if (!value) return null;
+  return { value, deadline: typeof raw?.deadline === 'string' ? raw.deadline : '' };
+}
+
+// The restore window is active only while its deadline is in the future.
+function restoreWindow(pending: PendingBackground | null): { deadline: string } | null {
+  if (!pending) return null;
+  const deadline = Date.parse(pending.deadline);
+  return Number.isFinite(deadline) && deadline > Date.now() ? { deadline: pending.deadline } : null;
+}
+
+function backgroundAdminItem(value: BackgroundValue) {
+  return {
+    url: value.url ?? '',
+    original_url: value.original_key ? `${BACKGROUND_ORIGINAL_ENDPOINT}?v=${encodeURIComponent(value.updated_at)}` : null,
+    opacity: value.opacity,
+    crop: value.crop,
+    updated_at: value.updated_at
+  };
+}
+
+// Public shape: never exposes original_url or any original key.
+function backgroundPublicItem(value: BackgroundValue) {
+  return { url: value.url ?? '', opacity: value.opacity, updated_at: value.updated_at || null };
+}
+
+// Best-effort R2 deletes. Failures are logged and never thrown.
+async function deleteBackgroundObjects(env: Env, keys: string[]): Promise<void> {
+  const results = await Promise.allSettled(keys.map((key) => env.BUCKET.delete(key)));
+  results.forEach((result, i) => {
+    if (result.status === 'rejected') {
+      console.log(JSON.stringify({ event: 'background_object_delete_failed', key: keys[i], error: String(result.reason) }));
+    }
+  });
+}
+
+// Removes the pending deletion (and its objects, unless still referenced by `keep`).
+async function purgePendingBackground(env: Env, keep: BackgroundValue | null): Promise<void> {
+  const pending = await loadPendingBackground(env.DB);
+  if (!pending) return;
+  await deleteBackgroundObjects(env, unreferencedKeys(backgroundKeysOf(pending.value), keep));
+  await env.DB.prepare('DELETE FROM system_settings WHERE key = ?').bind(LANDING_BACKGROUND_PENDING_KEY).run();
+}
+
+// Cron: purges a pending background deletion once its restore deadline has passed.
+async function purgeExpiredBackgroundPending(env: Env): Promise<void> {
+  const pending = await loadPendingBackground(env.DB);
+  if (!pending) return;
+  const deadline = Date.parse(pending.deadline);
+  if (Number.isFinite(deadline) && deadline > Date.now()) return;
+  await purgePendingBackground(env, await loadLandingBackground(env.DB));
+  console.log(JSON.stringify({ event: 'background_pending_purged' }));
+}
+
 type PermissionGroupRow = {
   id: string;
   name: string;
@@ -1742,7 +1857,13 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   if (path === '/api/public/settings' && method === 'GET') {
-    return json({ ok: true, item: { landing_background: await systemSetting(env.DB, 'landing_background') } });
+    const background = await loadLandingBackground(env.DB);
+    return json({ ok: true, item: { landing_background: background ? backgroundPublicItem(background) : null } });
+  }
+
+  if (path === '/api/public/pdf-embed-config' && method === 'GET') {
+    const clientId = env.ADOBE_PDF_CLIENT_ID?.trim().replace(/^\{|\}$/g, '') || null;
+    return json({ ok: true, client_id: clientId }, 200, { 'cache-control': 'public, max-age=300' });
   }
 
   if (path === '/api/public/admin-contact' && method === 'GET') {
@@ -1775,12 +1896,14 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (path === '/api/me/ui-settings' && method === 'GET') {
     const user = await verifySso(req, env);
+    await ensureUiSettingsTable(env.DB);
     const row = await loadUiSettingsRow(env.DB, user.username);
     return json({ ok: true, item: sanitizeUiSettings(row.stored), updated_at: row.updated_at });
   }
 
   if (path === '/api/me/ui-settings' && method === 'PUT') {
     const user = await verifySso(req, env);
+    await ensureUiSettingsTable(env.DB);
     const body = await readJson<unknown>(req);
     if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new HttpError(400, 'UI settings body must be an object');
     if (JSON.stringify(body).length > 4096) throw new HttpError(400, 'UI settings body is too large');
@@ -2369,7 +2492,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
         numberField(body.default_max_views),
         ALLOWED_FORMAT.has(body.default_format) ? body.default_format : 'markdown',
         publicBase(env, req),
-        body.default_slug_mode === 'custom' ? 'custom' : 'random',
+        'random',
         now()
       )
       .run();
@@ -2724,58 +2847,134 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
   if (path === '/api/admin/background' && method === 'GET') {
     const admin = await verifySso(req, env);
     requireAdmin(admin);
-    return json({ ok: true, item: await systemSetting(env.DB, 'landing_background') });
+    const [current, pending] = await Promise.all([loadLandingBackground(env.DB), loadPendingBackground(env.DB)]);
+    return json({ ok: true, item: current ? backgroundAdminItem(current) : null, restore: restoreWindow(pending) });
   }
 
   if (path === '/api/admin/background' && method === 'POST') {
     const admin = await verifySso(req, env);
     requireAdmin(admin);
-    const form = await req.formData();
-    const file = form.get('file');
-    const opacity = Math.min(1, Math.max(0, Number(form.get('opacity') || 0.32)));
-    if (!(file instanceof File) || !file.size) throw new HttpError(400, 'Background image file is required');
-    if (!file.type.startsWith('image/')) throw new HttpError(400, 'Background must be an image');
-    const old = await systemSetting(env.DB, 'landing_background');
-    if (old?.object_key) await env.BUCKET.delete(old.object_key);
-    const ext = file.name.includes('.') ? file.name.split('.').pop() : 'img';
-    const objectKey = `background/${Date.now()}-${crypto.randomUUID()}.${ext}`;
-    await env.BUCKET.put(objectKey, file.stream(), {
-      httpMetadata: { contentType: file.type },
-      customMetadata: { uploadedBy: admin.username, purpose: 'landing-background' }
-    });
-    const value = {
-      object_key: objectKey,
-      filename: file.name,
-      content_type: file.type,
-      size: file.size,
+    const body = await readJson<any>(req);
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new HttpError(400, 'Background body must be an object');
+    const crop = normalizeCrop(body.crop);
+    if (!crop) throw new HttpError(400, 'Invalid background crop', 'INVALID_CROP');
+    const hasOriginal = body.original_data !== undefined && body.original_data !== null && body.original_data !== '';
+    let cropped: ReturnType<typeof parseImageDataUrl>;
+    let original: ReturnType<typeof parseImageDataUrl> | null = null;
+    try {
+      cropped = parseImageDataUrl(body.cropped_data);
+      original = hasOriginal ? parseImageDataUrl(body.original_data) : null;
+    } catch (err) {
+      if (err instanceof BackgroundInputError) throw new HttpError(400, err.message, 'INVALID_BACKGROUND_IMAGE');
+      throw err;
+    }
+    const current = await loadLandingBackground(env.DB);
+    if (!original && !current?.original_key) throw new HttpError(400, 'Original background image is required', 'ORIGINAL_REQUIRED');
+    const opacity = clampOpacity(body.opacity, current?.opacity ?? BACKGROUND_DEFAULT_OPACITY);
+    const ts = Date.now();
+    const keys = backgroundKeys(ts, original?.ext ?? 'png', cropped.ext);
+    const originalKey = original ? keys.original_key : (current?.original_key ?? null);
+    const newKeys = original ? [keys.original_key, keys.cropped_key] : [keys.cropped_key];
+    const meta = { uploadedBy: admin.username, purpose: 'landing-background' };
+    const writes: Promise<unknown>[] = [
+      env.BUCKET.put(keys.cropped_key, cropped.bytes, { httpMetadata: { contentType: cropped.mime }, customMetadata: meta })
+    ];
+    if (original) {
+      writes.push(env.BUCKET.put(keys.original_key, original.bytes, {
+        httpMetadata: { contentType: original.mime },
+        customMetadata: { ...meta, purpose: 'landing-background-original' }
+      }));
+    }
+    await Promise.all(writes);
+    const value: BackgroundValue = {
+      original_key: originalKey,
+      cropped_key: keys.cropped_key,
+      url: backgroundPublicUrl(keys.cropped_key),
       opacity,
-      url: `/api/background/${encodeURIComponent(objectKey.split('/').slice(1).join('/'))}`
+      crop,
+      updated_at: new Date(ts).toISOString()
     };
-    await setSystemSetting(env.DB, 'landing_background', value, admin);
-    await adminAction(env, admin, 'update_background', 'system_settings', 'landing_background', value);
-    return json({ ok: true, item: value });
+    try {
+      await setSystemSetting(env.DB, LANDING_BACKGROUND_KEY, value, admin);
+    } catch (err) {
+      await deleteBackgroundObjects(env, newKeys);
+      throw err;
+    }
+    // Replaced objects are removed only after the new value is stored.
+    await deleteBackgroundObjects(env, unreferencedKeys(backgroundKeysOf(current), value));
+    try {
+      await purgePendingBackground(env, value);
+    } catch (err) {
+      console.log(JSON.stringify({ event: 'background_pending_purge_failed', error: String(err) }));
+    }
+    await adminAction(env, admin, 'update_background', 'system_settings', LANDING_BACKGROUND_KEY, {
+      original_key: value.original_key,
+      cropped_key: value.cropped_key,
+      opacity,
+      crop
+    });
+    return json({ ok: true, item: backgroundAdminItem(value) });
   }
 
   if (path === '/api/admin/background' && method === 'PATCH') {
     const admin = await verifySso(req, env);
     requireAdmin(admin);
     const body = await readJson<any>(req);
-    const current = (await systemSetting(env.DB, 'landing_background')) || {};
-    const opacity = Math.min(1, Math.max(0, Number(body.opacity ?? current.opacity ?? 0.32)));
-    const value = { ...current, opacity };
-    await setSystemSetting(env.DB, 'landing_background', value, admin);
-    await adminAction(env, admin, 'update_background_opacity', 'system_settings', 'landing_background', value);
-    return json({ ok: true, item: value });
+    const current = await loadLandingBackground(env.DB);
+    if (!current) throw new HttpError(404, 'Background not found', 'BACKGROUND_NOT_FOUND');
+    const value: BackgroundValue = { ...current, opacity: clampOpacity(body?.opacity, current.opacity) };
+    await setSystemSetting(env.DB, LANDING_BACKGROUND_KEY, value, admin);
+    await adminAction(env, admin, 'update_background_opacity', 'system_settings', LANDING_BACKGROUND_KEY, { opacity: value.opacity });
+    return json({ ok: true, item: backgroundAdminItem(value) });
   }
 
   if (path === '/api/admin/background' && method === 'DELETE') {
     const admin = await verifySso(req, env);
     requireAdmin(admin);
-    const current = await systemSetting(env.DB, 'landing_background');
-    if (current?.object_key) await env.BUCKET.delete(current.object_key);
-    await env.DB.prepare('DELETE FROM system_settings WHERE key = ?').bind('landing_background').run();
-    await adminAction(env, admin, 'clear_background', 'system_settings', 'landing_background', current);
-    return json({ ok: true });
+    const current = await loadLandingBackground(env.DB);
+    if (!current) {
+      return json({ ok: true, item: null, restore: restoreWindow(await loadPendingBackground(env.DB)) });
+    }
+    const deadline = new Date(Date.now() + BACKGROUND_RESTORE_MS).toISOString();
+    // An older pending deletion is superseded: its objects go now unless still referenced.
+    await purgePendingBackground(env, current);
+    await setSystemSetting(env.DB, LANDING_BACKGROUND_PENDING_KEY, { value: current, deadline }, admin);
+    await env.DB.prepare('DELETE FROM system_settings WHERE key = ?').bind(LANDING_BACKGROUND_KEY).run();
+    await adminAction(env, admin, 'clear_background', 'system_settings', LANDING_BACKGROUND_KEY, {
+      original_key: current.original_key,
+      cropped_key: current.cropped_key,
+      deadline
+    });
+    return json({ ok: true, item: null, restore: { deadline } });
+  }
+
+  if (path === '/api/admin/background/restore' && method === 'POST') {
+    const admin = await verifySso(req, env);
+    requireAdmin(admin);
+    const pending = await loadPendingBackground(env.DB);
+    if (!pending || !restoreWindow(pending)) throw new HttpError(410, 'Restore window has expired', 'RESTORE_EXPIRED');
+    if (await loadLandingBackground(env.DB)) throw new HttpError(409, 'A background is already set', 'BACKGROUND_EXISTS');
+    await setSystemSetting(env.DB, LANDING_BACKGROUND_KEY, pending.value, admin);
+    await env.DB.prepare('DELETE FROM system_settings WHERE key = ?').bind(LANDING_BACKGROUND_PENDING_KEY).run();
+    await adminAction(env, admin, 'restore_background', 'system_settings', LANDING_BACKGROUND_KEY, {
+      original_key: pending.value.original_key,
+      cropped_key: pending.value.cropped_key
+    });
+    return json({ ok: true, item: backgroundAdminItem(pending.value) });
+  }
+
+  if (path === '/api/admin/background/original' && method === 'GET') {
+    const admin = await verifySso(req, env);
+    requireAdmin(admin);
+    const current = await loadLandingBackground(env.DB);
+    const object = current?.original_key ? await env.BUCKET.get(current.original_key) : null;
+    if (!object) return json({ ok: false, message: 'Original background not found' }, 404);
+    return new Response(object.body, {
+      headers: {
+        'content-type': object.httpMetadata?.contentType || 'application/octet-stream',
+        'cache-control': 'private, no-store'
+      }
+    });
   }
 
   return json({ ok: false, message: 'API route not found' }, 404);
@@ -2857,6 +3056,9 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(cleanupStaleUploadSessions(env).then((cleaned) => {
       if (cleaned > 0) console.log(JSON.stringify({ event: 'stale_upload_cleanup', cleaned }));
+    }));
+    ctx.waitUntil(purgeExpiredBackgroundPending(env).catch((err) => {
+      console.log(JSON.stringify({ event: 'background_pending_cleanup_failed', error: String(err) }));
     }));
   }
 };

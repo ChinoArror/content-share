@@ -38,6 +38,10 @@ import { classifyShareResourceError, shareResourceMode, type ShareResourceFailur
 import { buildSsoLoginUrl, safeReturnTo } from './sso-redirect';
 import { FeedbackProvider, useFeedback, type FeedbackLabels } from './app/feedback';
 import { AppearanceSettings } from './app/appearance-settings';
+import { Select, rangeFill } from './app/select';
+import { LandingTerminal, DEFAULT_LANDING_LINES } from './app/landing-terminal';
+import { PdfPreview } from './app/adobe-pdf-viewer';
+import { BackgroundAreaCard, BackgroundCropModal, readFileAsDataUrl, type BackgroundCrop, type BackgroundCropResult, type BackgroundEditorLabels, type BackgroundItem, type BackgroundRestore, type BackgroundSource } from './app/background-editor';
 import { ThemeProvider, resolveMode, useTheme } from './app/theme';
 import { isAppPath, navigate, useAppRoute, type AppPage } from './app/router';
 import {
@@ -87,6 +91,7 @@ import {
 } from 'lucide-react';
 import './styles.css';
 import './app/feedback.css';
+import './app/background-editor.css';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -241,6 +246,16 @@ async function fetchShareResourceBlob(url: string, password: string): Promise<Bl
   const response = await fetch(url, { headers: shareHeaders(password), credentials: 'include' });
   if (!response.ok) throw new ShareResourceRequestError(await shareResourceFailure(response));
   return response.blob();
+}
+
+// Same authorization path as the pdf.js fallback: password-protected shares use the blob fetch, others use cookies or media tickets.
+async function fetchPdfBytes(url: string, password: string, mediaTicket?: string | null): Promise<ArrayBuffer> {
+  if (shareResourceMode(password, mediaTicket) === 'protected-blob') {
+    return (await fetchShareResourceBlob(url, password)).arrayBuffer();
+  }
+  const response = await fetch(url, { credentials: 'include' });
+  if (!response.ok) throw new ShareResourceRequestError(await shareResourceFailure(response));
+  return response.arrayBuffer();
 }
 
 function useShareResource(url: string, password: string, mediaTicket?: string | null, enabled = true) {
@@ -936,7 +951,7 @@ function UploadFloating({ state, onClose }: { state: UploadProgress; onClose: ()
         <h2>{t('upload.queue')}</h2>
         {(state.progress >= 100 || state.failed) && <button className="icon" onClick={onClose} aria-label={t('upload.closeStatus')}><X size={16} /></button>}
       </div>
-      <strong title={state.fileName}>{state.fileName}</strong>
+      <strong className="file-name" title={state.fileName}>{state.fileName}</strong>
       <span>{state.stage} · {t('upload.remaining', { count: state.remaining })}</span>
       <div className="progress"><i style={{ width: `${state.progress}%` }} /></div>
       {(state.speed || state.eta) && (
@@ -1317,7 +1332,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
           <strong>{t('file.drag')}</strong>
           <label className="primary as-label">{t('file.choose')}<input type="file" multiple onChange={(e) => void acceptFiles(Array.from(e.target.files || []))} /></label>
         </div>
-        {!!files.length && <div className="file-list">{files.map((f, i) => <div key={`${f.name}-${i}`}><span>{f.name}</span><small>{fmtBytes(f.size)}</small><button className="icon" onClick={() => setFiles(files.filter((_, idx) => idx !== i))}><X size={16} /></button></div>)}</div>}
+        {!!files.length && <div className="file-list">{files.map((f, i) => <div key={`${f.name}-${i}`}><span className="file-name" title={f.name}>{f.name}</span><small>{fmtBytes(f.size)}</small><button className="icon" onClick={() => setFiles(files.filter((_, idx) => idx !== i))}><X size={16} /></button></div>)}</div>}
         {!!uploadTasks.filter((task) => task.needsFileReselection).length && <div className="resume-hint">{t('file.resumeHint')}</div>}
         <OptionsGrid form={form} setForm={setForm} permissions={permissions} showDownloadSetting />
         <Field label={t('file.optionalText')}><textarea className="short" value={form.content} onChange={(e) => setForm({ ...form, content: e.target.value })} placeholder={t('file.mixedPlaceholder')} /></Field>
@@ -1593,7 +1608,7 @@ function UserSettings({ toast, profile }: { toast: (s: string, k?: Toast['kind']
   const feedback = useFeedback();
   const { t, language } = useI18n();
   const permissions = profile.permissions;
-  const [form, setForm] = useState<any>(() => ({ default_visibility: normalizeVisibility('public', permissions.can_public_publish), default_expire_days: 0, default_max_views: 0, default_format: 'markdown', default_endpoint: BASE_URL, default_slug_mode: 'random' }));
+  const [form, setForm] = useState<any>(() => ({ default_visibility: normalizeVisibility('public', permissions.can_public_publish), default_expire_days: 0, default_max_views: 0, default_format: 'markdown', default_endpoint: BASE_URL }));
   useEffect(() => {
     if (!permissions.can_api) return;
     api<{ item: any }>('/api/settings/cli')
@@ -1612,11 +1627,22 @@ function UserSettings({ toast, profile }: { toast: (s: string, k?: Toast['kind']
   }, [permissions.can_public_publish]);
   async function save() {
     try {
+      const { default_slug_mode: _retiredSlugMode, ...settings } = form;
       const default_visibility = normalizeVisibility(form.default_visibility, permissions.can_public_publish);
-      await feedback.run({ title: t('fb.saving'), successTitle: t('fb.settingsSaved') }, () => api('/api/settings/cli', { method: 'PATCH', body: JSON.stringify({ ...form, default_visibility }) }));
+      await feedback.run({ title: t('fb.saving'), successTitle: t('fb.settingsSaved') }, () => api('/api/settings/cli', { method: 'PATCH', body: JSON.stringify({ ...settings, default_visibility }) }));
     } catch {
       // The run card already shows the error.
     }
+  }
+  // Local only: the form goes back to the built-in defaults and the user still presses Save.
+  function restoreDefaults() {
+    const previous = form;
+    setForm({ ...form, default_visibility: normalizeVisibility('public', permissions.can_public_publish), default_expire_days: 0, default_max_views: 0, default_format: 'markdown', default_endpoint: BASE_URL });
+    feedback.notify({
+      title: t('settings.defaultsRestored'),
+      tone: 'info',
+      actions: [{ label: t('feedback.undo'), onClick: () => setForm(previous) }],
+    });
   }
   const example = `curl -X POST "${form.default_endpoint || BASE_URL}/api/cli/upload-text" \\
   -H "Authorization: Bearer YOUR_API_KEY" \\
@@ -1639,12 +1665,15 @@ function UserSettings({ toast, profile }: { toast: (s: string, k?: Toast['kind']
         <Field label={t('settings.defaultVisibility')} className="status-field"><VisibilitySegment value={form.default_visibility} permissions={permissions} onChange={(default_visibility) => setForm({ ...form, default_visibility })} /></Field>
         <Field label={t('settings.defaultExpireDays')}><input type="number" min="0" value={form.default_expire_days} onChange={(e) => setForm({ ...form, default_expire_days: Number(e.target.value) })} /></Field>
         <Field label={t('settings.defaultMaxViews')}><input type="number" min="0" value={form.default_max_views} onChange={(e) => setForm({ ...form, default_max_views: Number(e.target.value) })} /></Field>
-        <Field label={t('settings.defaultMarkdown')}><select value={form.default_format} onChange={(e) => setForm({ ...form, default_format: e.target.value })}><option value="markdown">markdown</option><option value="plain">plain</option></select></Field>
+        <Field label={t('settings.defaultMarkdown')}><Select value={form.default_format} ariaLabel={t('settings.defaultMarkdown')} onChange={(default_format) => setForm({ ...form, default_format })} options={[{ value: 'markdown', label: 'markdown' }, { value: 'plain', label: 'plain' }]} /></Field>
         <Field label={t('settings.endpoint')}><input readOnly value={form.default_endpoint || BASE_URL} /></Field>
-        <Field label={t('settings.slugMode')}><select value={form.default_slug_mode} onChange={(e) => setForm({ ...form, default_slug_mode: e.target.value })}><option value="random">{t('settings.random')}</option><option value="custom">{t('settings.custom')}</option></select></Field>
       </div>
       <pre className="code">{example}</pre>
-      <button className="primary" onClick={save}>{t('settings.save')}</button>
+      <p className="muted settings-hint">{t('settings.slugHint')}</p>
+      <div className="form-actions">
+        <button className="primary" onClick={save}>{t('settings.save')}</button>
+        <button className="soft" onClick={restoreDefaults}>{t('settings.restoreDefaults')}</button>
+      </div>
     </section>
   );
 }
@@ -1794,13 +1823,13 @@ function CopyFullValue({ value, className = '' }: { value: string; className?: s
     try {
       await navigator.clipboard.writeText(value);
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 5000);
+      window.setTimeout(() => setCopied(false), 1500);
     } catch {
       setCopied(false);
     }
   }
   const label = copied ? t('admin.copied') : t('admin.copyValue');
-  return <button type="button" className={`icon copy-value-btn ${copied ? 'copied' : ''} ${className}`} onClick={() => void copy()} aria-label={label} title={language === 'en-US' ? (copied ? 'Copied' : 'Copy full value') : label}>{copied ? <Check size={15} /> : <Clipboard size={15} />}</button>;
+  return <button type="button" className={`icon copy-value-btn copy-inline ${copied ? 'copied' : ''} ${className}`} onClick={() => void copy()} aria-label={label} title={language === 'en-US' ? (copied ? 'Copied' : 'Copy full value') : label}>{copied ? <Check size={15} /> : <Clipboard size={15} />}</button>;
 }
 
 function isLongAuditKey(key: string): boolean {
@@ -1975,7 +2004,7 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
             <div><span>{t('admin.reservedStorage')}</span><strong>{fmtBytes(selected.reserved_bytes)}</strong></div>
             <div><span>{t('admin.totalViews')}</span><strong>{selected.total_views}</strong></div>
           </div>
-          <Field label={t('admin.permissionGroup')}><select value={selected.permission_group_id} onChange={(event) => setSelected({ ...selected, permission_group_id: event.target.value })}>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}{group.is_default ? ` · ${t('admin.default')}` : ''}</option>)}</select></Field>
+          <Field label={t('admin.permissionGroup')}><Select value={selected.permission_group_id} ariaLabel={t('admin.permissionGroup')} onChange={(permission_group_id) => setSelected({ ...selected, permission_group_id })} options={groups.map((group) => ({ value: group.id, label: `${group.name}${group.is_default ? ` · ${t('admin.default')}` : ''}` }))} /></Field>
           {(() => {
             const group = groups.find((item) => item.id === selected.permission_group_id);
             return group ? <div className="permission-chip-list">{permissionKeys.map((key) => <span className={permissionEnabled(group, key) ? 'allowed' : 'denied'} key={key}>{permissionEnabled(group, key) ? <Check size={13} /> : <X size={13} />} {t(permissionLabels[key])}</span>)}<span className="allowed"><Check size={13} /> {t('permission.storageQuota')}: {fmtBytes(group.quota_bytes)}</span></div> : null;
@@ -2059,13 +2088,13 @@ function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind'])
     {draft && <ModalShell close={() => setDraft(null)} className="permission-editor" title={<h2>{draft.id ? t('admin.editGroup') : t('admin.createGroup')}</h2>}>
       <Field label={t('admin.groupName')}><input value={draft.name} disabled={Boolean(draft.is_system)} onChange={(event) => setDraftValue('name', event.target.value)} /></Field>
       <Field label={t('permission.storageSpace')}><div className="unit-input"><input type="number" min="0" step="0.1" value={draft.quota_gib} onChange={(event) => setDraftValue('quota_gib', event.target.value)} /><span>GB</span></div></Field>
-      <div className="checkbox-field"><input type="checkbox" checked={Boolean(draft.is_default)} onChange={(event) => setDraftValue('is_default', event.target.checked)} /><span>{t('admin.makeDefault')}</span></div>
-      <div className="permission-editor-grid">{permissionKeys.map((key) => <div className="checkbox-field" key={key}><input type="checkbox" checked={Boolean(draft[key])} onChange={(event) => setDraftValue(key, event.target.checked)} /><span>{t(permissionLabels[key])}</span></div>)}</div>
+      <div className="perm-grid perm-grid-single"><button type="button" role="checkbox" aria-checked={Boolean(draft.is_default)} className={`perm-tile${draft.is_default ? ' on' : ''}`} onClick={() => setDraftValue('is_default', !draft.is_default)}><span className="perm-check" aria-hidden="true">{Boolean(draft.is_default) && <Check size={12} strokeWidth={3} />}</span><span className="perm-label">{t('admin.makeDefault')}</span></button></div>
+      <div className="perm-grid">{permissionKeys.map((key) => { const on = Boolean(draft[key]); return <button type="button" role="checkbox" aria-checked={on} className={`perm-tile${on ? ' on' : ''}`} key={key} onClick={() => setDraftValue(key, !on)}><span className="perm-check" aria-hidden="true">{on && <Check size={12} strokeWidth={3} />}</span><span className="perm-label">{t(permissionLabels[key])}</span></button>; })}</div>
       <div className="right"><button className="soft" onClick={() => setDraft(null)}>{t('common.cancel')}</button><button className="primary" onClick={() => void save()}><Save size={16} /> {t('common.save')}</button></div>
     </ModalShell>}
     {deleteTarget && <ModalShell close={() => setDeleteTarget(null)} className="permission-editor" title={<h2>{t('admin.deleteGroup')}</h2>}>
       <p>{t('admin.groupUsersWillReassign')}</p>
-      <Field label={t('admin.replacementGroup')}><select value={replacementId} onChange={(event) => setReplacementId(event.target.value)}>{groups.filter((group) => group.id !== deleteTarget.id).map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></Field>
+      <Field label={t('admin.replacementGroup')}><Select value={replacementId} ariaLabel={t('admin.replacementGroup')} onChange={setReplacementId} options={groups.filter((group) => group.id !== deleteTarget.id).map((group) => ({ value: group.id, label: group.name }))} /></Field>
       <div className="right"><button className="soft" onClick={() => setDeleteTarget(null)}>{t('common.cancel')}</button><button className="primary danger-fill" disabled={!replacementId} onClick={() => setDeleteConfirmation(true)}><Trash2 size={16} /> {t('admin.deleteGroup')}</button></div>
     </ModalShell>}
     {deleteConfirmation && deleteTarget && <ConfirmModal open title={t('confirm.deleteGroupTitle')} message={t('confirm.deleteGroupMessage')} confirmLabel={t('admin.deleteGroup')} destructive onClose={() => setDeleteConfirmation(false)} onConfirm={async () => { setDeleteConfirmation(false); remove(); }} />}
@@ -2190,23 +2219,29 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
   );
 }
 
+const BG_MAX_BYTES = 15 * 1024 * 1024;
+type BgEditorState = { source: BackgroundSource; initialCrop: BackgroundCrop | null } | null;
+
 function AdminSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
   const feedback = useFeedback();
-  const undoDetail = useUndoDetail();
-  const { t, language } = useI18n();
-  const [item, setItem] = useState<any>(null);
-  const [bg, setBg] = useState<any>(null);
-  const [file, setFile] = useState<File | null>(null);
-  const [opacity, setOpacity] = useState(0.32);
+  const { t } = useI18n();
+  const [settingsItem, setSettingsItem] = useState<any>(null);
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [backgroundLoading, setBackgroundLoading] = useState(true);
-  const [confirmClear, setConfirmClear] = useState(false);
-  useEffect(() => { api<{ item: any }>('/api/admin/settings').then((r) => setItem(r.item)).catch((e) => toast(e.message, 'error')).finally(() => setSettingsLoading(false)); }, []);
+  const [item, setItem] = useState<BackgroundItem | null>(null);
+  const [restore, setRestore] = useState<BackgroundRestore | null>(null);
+  const [editor, setEditor] = useState<BgEditorState>(null);
+  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [opacity, setOpacity] = useState(0.32);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  useEffect(() => { api<{ item: any }>('/api/admin/settings').then((r) => setSettingsItem(r.item)).catch((e) => toast(e.message, 'error')).finally(() => setSettingsLoading(false)); }, []);
   async function loadBg() {
     setBackgroundLoading(true);
     try {
-      const r = await api<{ item: any }>('/api/admin/background');
-      setBg(r.item);
+      const r = await api<{ item: BackgroundItem | null; restore: BackgroundRestore | null }>('/api/admin/background');
+      setItem(r.item);
+      setRestore(r.restore);
       setOpacity(Number(r.item?.opacity ?? 0.32));
     } catch (e) {
       toast((e as Error).message, 'error');
@@ -2215,59 +2250,145 @@ function AdminSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => voi
     }
   }
   useEffect(() => { void loadBg(); }, []);
-  async function uploadBg() {
-    if (!file) return toast(language === 'en-US' ? 'Choose a background image' : '请选择背景图片', 'error');
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('opacity', String(opacity));
+  // The restore window is 30 minutes on the server; drop the restore affordance when it lapses.
+  useEffect(() => {
+    if (!restore) return undefined;
+    const remaining = new Date(restore.deadline).getTime() - Date.now();
+    if (!(remaining > 0)) {
+      setRestore(null);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setRestore(null), remaining);
+    return () => window.clearTimeout(timer);
+  }, [restore]);
+
+  async function pickFile(file: File) {
+    if (!file.type.startsWith('image/')) return toast(t('bg.invalidType'), 'error');
+    if (file.size > BG_MAX_BYTES) return toast(t('bg.tooLarge'), 'error');
     try {
-      const res = await feedback.run({ title: t('fb.uploadingBg'), successTitle: t('fb.bgUploaded') }, () => api<{ item: any }>('/api/admin/background', { method: 'POST', body: fd }));
-      setBg(res.item);
-      setFile(null);
+      const data = await readFileAsDataUrl(file);
+      setEditor({ source: { data }, initialCrop: null });
+    } catch {
+      toast(t('bg.readFailed'), 'error');
+    }
+  }
+  function openAdjust() {
+    if (!item) return;
+    setEditor({ source: { url: item.original_url || item.url }, initialCrop: item.crop });
+  }
+  async function saveBackground(result: BackgroundCropResult) {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const res = await feedback.run({ title: t('bg.saving'), successTitle: t('bg.saved') }, () => api<{ item: BackgroundItem }>('/api/admin/background', { method: 'POST', body: JSON.stringify({ ...result, opacity }) }));
+      setItem(res.item);
+      setOpacity(Number(res.item.opacity));
+      setRestore(null);
+      setEditor(null);
+    } catch {
+      // The run card shows the error; the editor stays open so the crop can be retried.
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function deleteBackground() {
+    setConfirmDelete(false);
+    setBusy(true);
+    try {
+      const res = await feedback.run({
+        title: t('bg.deleting'),
+        successTitle: t('bg.deleted'),
+        actions: (r) => (r.restore ? [{ label: t('bg.undo'), onClick: () => void restoreBackground() }] : []),
+      }, () => api<{ item: null; restore: BackgroundRestore | null }>('/api/admin/background', { method: 'DELETE' }));
+      setItem(null);
+      setRestore(res.restore);
+    } catch {
+      // The run card shows the error.
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function restoreBackground() {
+    setBusy(true);
+    try {
+      const res = await feedback.run({ title: t('bg.restoring'), successTitle: t('bg.restored'), errorTitle: t('bg.restoreFailed') }, () => api<{ item: BackgroundItem }>('/api/admin/background/restore', { method: 'POST' }));
+      setItem(res.item);
+      setOpacity(Number(res.item.opacity));
+      setRestore(null);
+    } catch (error) {
+      // 410 means the window closed; 409 means a background was set meanwhile. Either way resync with the server.
+      const code = error instanceof UploadRequestError ? error.code : undefined;
+      if (code === 'RESTORE_EXPIRED' || code === 'BACKGROUND_EXISTS') {
+        setRestore(null);
+        void loadBg();
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function saveOpacity() {
+    if (!item) return;
+    try {
+      const res = await feedback.run({ title: t('fb.savingOpacity'), successTitle: t('fb.opacitySaved') }, () => api<{ item: BackgroundItem }>('/api/admin/background', { method: 'PATCH', body: JSON.stringify({ opacity }) }));
+      setItem(res.item);
     } catch {
       // The run card already shows the error.
     }
   }
-  async function saveOpacity(next = opacity) {
-    try {
-      const res = await feedback.run({ title: t('fb.savingOpacity'), successTitle: t('fb.opacitySaved') }, () => api<{ item: any }>('/api/admin/background', { method: 'PATCH', body: JSON.stringify({ opacity: next }) }));
-      setBg(res.item);
-    } catch {
-      // The run card already shows the error.
-    }
-  }
-  function clearBg() {
-    feedback.confirmUndoable({
-      title: t('fb.clearBgTitle'),
-      detail: undoDetail,
-      successTitle: t('fb.bgClearedDone'),
-      commit: () => api('/api/admin/background', { method: 'DELETE' }),
-      onCommitted: () => setBg(null),
-    });
-  }
+  const bgLabels: BackgroundEditorLabels = {
+    title: t('bg.title'),
+    zoom: t('bg.zoom'),
+    zoomOut: t('bg.zoomOut'),
+    zoomIn: t('bg.zoomIn'),
+    dragHint: t('bg.dragHint'),
+    cancel: t('bg.cancel'),
+    save: t('bg.save'),
+    saving: t('bg.saving'),
+    customBackground: t('bg.customBackground'),
+    noBackground: t('bg.noBackground'),
+    restoreUntil: t('bg.restoreUntil'),
+    upload: t('bg.upload'),
+    adjust: t('bg.adjust'),
+    delete: t('bg.delete'),
+    restore: t('bg.restore'),
+    close: t('bg.close'),
+    loadError: t('bg.loadError'),
+  };
   return (
     <div className="stack">
-      <section className="panel"><h2>{t('admin.settings')}</h2>{item ? <div className="settings-grid">{Object.entries(item).map(([k, v]) => <div key={k}><span>{k}</span><strong>{String(v)}</strong></div>)}</div> : t('common.loading')}</section>
+      <section className="panel"><h2>{t('admin.settings')}</h2>{settingsItem ? <div className="settings-grid">{Object.entries(settingsItem).map(([k, v]) => <div key={k}><span>{k}</span><strong>{String(v)}</strong></div>)}</div> : t('common.loading')}</section>
       <section className="panel background-admin">
         <div className="panel-head"><h2>{t('admin.background')}</h2></div>
         <div className="background-grid">
-          <div className="background-preview" style={{ backgroundImage: bg?.url ? `url(${bg.url})` : undefined }}>
-            {!bg?.url && <span>{t('admin.noBackground')}</span>}
-          </div>
+          <BackgroundAreaCard
+            item={item}
+            restore={restore}
+            busy={saving || busy}
+            labels={bgLabels}
+            onPickFile={(file) => void pickFile(file)}
+            onAdjust={openAdjust}
+            onDelete={() => setConfirmDelete(true)}
+            onRestore={() => void restoreBackground()}
+          />
           <div className="background-controls">
-            <Field label={t('admin.replaceBackground')}><input type="file" accept="image/*" onChange={(e) => setFile(e.target.files?.[0] || null)} /></Field>
-            <Field label={t('admin.opacity', { value: Math.round(opacity * 100) })}><input type="range" min="0" max="1" step="0.01" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} onMouseUp={() => saveOpacity()} onTouchEnd={() => saveOpacity()} /></Field>
+            <Field label={t('admin.opacity', { value: Math.round(opacity * 100) })}><input type="range" min="0" max="1" step="0.01" value={opacity} disabled={!item} style={{ ['--fill' as any]: rangeFill(opacity, 0, 1) }} onChange={(e) => setOpacity(Number(e.target.value))} onMouseUp={() => void saveOpacity()} onTouchEnd={() => void saveOpacity()} /></Field>
             <div className="right wrap-actions">
-              <button className="primary roomy-btn" onClick={uploadBg}><Upload size={16} /> {t('admin.uploadReplace')}</button>
-              <button className="soft roomy-btn" onClick={() => saveOpacity()} disabled={!bg}><RefreshCw size={16} /> {t('admin.saveOpacity')}</button>
-              <button className="soft danger roomy-btn" onClick={() => setConfirmClear(true)} disabled={!bg}><Trash2 size={16} /> {t('admin.clear')}</button>
+              <button className="soft roomy-btn" onClick={() => void saveOpacity()} disabled={!item}><RefreshCw size={16} /> {t('admin.saveOpacity')}</button>
             </div>
-            {bg && <p className="muted">R2: {bg.object_key} / {fmtBytes(bg.size)}</p>}
           </div>
         </div>
       </section>
       {(settingsLoading || backgroundLoading) && <QueryLoading />}
-      <ConfirmModal open={confirmClear} title={t('confirm.clearBackgroundTitle')} message={t('confirm.clearBackgroundMessage')} confirmLabel={t('admin.clear')} destructive onClose={() => setConfirmClear(false)} onConfirm={() => { setConfirmClear(false); clearBg(); }} />
+      <BackgroundCropModal
+        open={editor !== null}
+        source={editor?.source ?? null}
+        initialCrop={editor?.initialCrop ?? null}
+        saving={saving}
+        labels={bgLabels}
+        onCancel={() => { if (!saving) setEditor(null); }}
+        onSave={(result) => void saveBackground(result)}
+      />
+      <ConfirmModal open={confirmDelete} title={t('bg.deleteTitle')} message={t('bg.deleteMessage')} confirmLabel={t('bg.delete')} destructive onClose={() => setConfirmDelete(false)} onConfirm={() => void deleteBackground()} />
     </div>
   );
 }
@@ -2627,9 +2748,7 @@ function ZipPagePreview({ info }: { info: PreviewInfo }) {
         <div className="zip-page-toolbar preview-inline-toolbar">
           <strong>{t('preview.actualPageTitle')}</strong>
           {entryNames.length > 1 && (
-            <select value={selectedEntry} onChange={(event) => changeEntry(event.target.value)} aria-label="选择 HTML 入口">
-              {entryNames.map((entryName) => <option key={entryName} value={entryName}>{entryName}</option>)}
-            </select>
+            <Select value={selectedEntry} onChange={(entryName) => changeEntry(entryName)} ariaLabel="选择 HTML 入口" options={entryNames.map((entryName) => ({ value: entryName, label: entryName }))} />
           )}
           <span className="muted">{t('preview.archiveTemp')}</span>
         </div>
@@ -2664,7 +2783,15 @@ function PreviewCanvas({ info, password = '', onPasswordRequired, toast }: { inf
       {info.kind === 'image' && <img src={src} alt={name} />}
       {info.kind === 'video' && <VideoPlayer src={src} />}
       {info.kind === 'audio' && <audio src={src} controls />}
-      {info.kind === 'pdf' && <PdfCanvasPreview info={{ ...info, preview_url: src }} password={password} onPasswordRequired={onPasswordRequired} />}
+      {info.kind === 'pdf' && (
+        <PdfPreview
+          variant="embedded"
+          fileName={name}
+          allowDownload={downloadsAllowed(info)}
+          loadBuffer={() => fetchPdfBytes(info.preview_url, password, info.media_ticket)}
+          renderPdfJs={() => <PdfCanvasPreview info={{ ...info, preview_url: src }} password={password} onPasswordRequired={onPasswordRequired} />}
+        />
+      )}
       {info.kind === 'html' && <HtmlPageFrame title={name} sourceUrl={src} />}
       {info.kind === 'text' && <iframe sandbox="" src={src} title={name} />}
       {info.kind === 'office' && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
@@ -2733,7 +2860,15 @@ function FilePreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) => v
         {info.kind === 'image' && <img src={src} alt={name} />}
         {info.kind === 'video' && <VideoPlayer src={src} />}
         {info.kind === 'audio' && <audio src={src} controls />}
-        {info.kind === 'pdf' && <PdfCanvasPreview info={info} />}
+        {info.kind === 'pdf' && (
+          <PdfPreview
+            variant="page"
+            fileName={name}
+            allowDownload={downloadsAllowed(info)}
+            loadBuffer={() => fetchPdfBytes(info.preview_url, '', info.media_ticket)}
+            renderPdfJs={() => <PdfCanvasPreview info={info} />}
+          />
+        )}
         {info.kind === 'html' && <HtmlPageFrame title={name} sourceUrl={src} />}
         {info.kind === 'text' && <iframe sandbox="" src={src} title={name} />}
         {info.kind === 'office' && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
@@ -2764,15 +2899,19 @@ function SharePreviewPage({ item, password, adminPreview, onPasswordRequired, to
       <header className="preview-topbar share-preview-topbar">
         <a className="soft back-link" href={backUrl} aria-label={language === 'en-US' ? 'Back' : '返回'}><ArrowLeft size={18} /><span>{language === 'en-US' ? 'Back' : '返回'}</span></a>
         <div className="preview-title">
-          <strong>{showText ? item.title : info?.filename}</strong>
+          <strong className="file-name">{showText ? item.title : info?.filename}</strong>
           <span>{item.visibility} / {item.type} / {fmtBytes(info?.size || item.file_size)}</span>
         </div>
         <LanguageSwitcher />
         {(attachments.length + (item.text_content ? 1 : 0)) > 1 && (
-          <select value={showText ? 'text' : selectedAttachment?.id || ''} onChange={(e) => setSelected(e.target.value)}>
-            {item.text_content && <option value="text">{t('share.text')}</option>}
-            {attachments.map((a) => <option key={a.id} value={a.id}>{a.filename}</option>)}
-          </select>
+          <Select
+            value={showText ? 'text' : selectedAttachment?.id || ''}
+            onChange={(next) => setSelected(next)}
+            options={[
+              ...(item.text_content ? [{ value: 'text', label: t('share.text') }] : []),
+              ...attachments.map((a) => ({ value: String(a.id), label: a.filename })),
+            ]}
+          />
         )}
         {info ? (downloadsAllowed(item) && <DownloadButton className="primary preview-download" url={info.download_url} password={password} mediaTicket={info.media_ticket} filename={info.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton>) : <button className="soft preview-copy-action" onClick={() => navigator.clipboard.writeText(location.href).then(() => toast(t('common.copied')))}>{t('common.copy')}</button>}
       </header>
@@ -3090,12 +3229,7 @@ function LandingPage({ background }: { background: any }) {
             <a className="soft" href="/face-transfer"><ScanLine size={18} /> {t('landing.face')}</a>
           </div>
         </div>
-        <div className="landing-console" aria-label={t('landing.cli')}>
-          <div><span /> <span /> <span /></div>
-          <pre>{`curl -X POST ${BASE_URL}/api/cli/upload-text
-  -H "Authorization: Bearer <API_KEY>"
-  -d '{"format":"markdown","visibility":"public"}'`}</pre>
-        </div>
+        <LandingTerminal className="landing-terminal-slot" lines={DEFAULT_LANDING_LINES(BASE_URL)} ariaLabel={t('landing.cli')} />
         <div className="landing-metrics">
           <div><strong>SSO</strong><span>{t('landing.sso')}</span></div>
           <div><strong>R2</strong><span>{t('landing.r2')}</span></div>

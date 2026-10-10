@@ -28,6 +28,7 @@ call npx wrangler deploy || goto :fail
 
 echo.
 echo [OK] Deployed to https://content.aryuki.com
+echo Note: Adobe PDF Embed needs the ADOBE_PDF_CLIENT_ID secret (run set-adobe-secret.bat once).
 pause
 exit /b 0
 

@@ -30,3 +30,4 @@ preview*.bin
 .env.*
 .dev.vars
 secret.txt
+set-adobe-secret.bat
