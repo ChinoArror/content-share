@@ -39,6 +39,7 @@ import { buildSsoLoginUrl, safeReturnTo } from './sso-redirect';
 import {
   ChevronDown,
   ChevronRight,
+  ArrowLeft,
   Check,
   CircleX,
   Bold,
@@ -107,6 +108,7 @@ type Content = {
   max_views: number;
   view_count: number;
   download_count: number;
+  allow_download?: boolean | number;
   file_size: number;
   password_required?: boolean;
   remark?: string;
@@ -117,7 +119,7 @@ type Content = {
 type Attachment = { id: string; filename: string; content_type: string; size: number; media_ticket?: string; office_preview_allowed?: boolean };
 type Toast = { id: number; text: string; kind?: 'ok' | 'error' };
 type UploadProgress = { visible: boolean; stage: string; fileName: string; remaining: number; progress: number; speed?: number; eta?: number; failed?: boolean };
-type PreviewInfo = { id: string; filename: string; content_type: string; size: number; kind: PreviewKind; preview_url: string; download_url: string; media_ticket?: string; office_embed_url?: string | null };
+type PreviewInfo = { id: string; filename: string; content_type: string; size: number; kind: PreviewKind; preview_url: string; download_url: string; allow_download?: boolean; media_ticket?: string; office_embed_url?: string | null };
 type ShareNote = {
   id: string;
   parent_id?: string | null;
@@ -308,6 +310,10 @@ function fmtBytes(n = 0) {
     i++;
   }
   return `${value.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+function downloadsAllowed(item: { allow_download?: boolean | number }): boolean {
+  return item.allow_download !== false && item.allow_download !== 0;
 }
 
 function localizedError(error: unknown, t: (key: string, values?: Record<string, string | number>) => string): string {
@@ -552,7 +558,7 @@ function ConfirmModal({ open, title, message, confirmLabel, destructive = false,
 
 function QueryLoading() {
   const { t } = useI18n();
-  return <div className="query-loading" role="status" aria-live="polite"><span>{t('common.refreshing')}</span><i /></div>;
+  return <div className="query-loading" role="status" aria-live="polite"><span>{t('common.refreshing')}</span></div>;
 }
 
 function Field({ label, children, className = '' }: { label: string; children: React.ReactNode; className?: string }) {
@@ -575,6 +581,15 @@ function VisibilitySegment({ value, onChange, permissions }: { value: Visibility
       ))}
     </div>
   );
+}
+
+function DownloadSetting({ checked, onChange, className = '' }: { checked: boolean; onChange: (value: boolean) => void; className?: string }) {
+  const { t } = useI18n();
+  return <label className={`download-setting ${className}`}>
+    <span>{t('file.allowDownload')}</span>
+    <input type="checkbox" role="switch" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+    <i aria-hidden="true" />
+  </label>;
 }
 
 type FilterMenuItem = { key: string; label: string; options: Array<{ value: string; label: string }> };
@@ -784,7 +799,7 @@ function PublishText({ toast, permissions }: { toast: (s: string, k?: Toast['kin
   );
 }
 
-function OptionsGrid({ form, setForm, permissions }: { form: any; setForm: (v: any) => void; permissions: PermissionSet }) {
+function OptionsGrid({ form, setForm, permissions, showDownloadSetting = false }: { form: any; setForm: (v: any) => void; permissions: PermissionSet; showDownloadSetting?: boolean }) {
   const { t } = useI18n();
   return (
     <div className="options-grid">
@@ -795,6 +810,7 @@ function OptionsGrid({ form, setForm, permissions }: { form: any; setForm: (v: a
       <Field label={t('text.maxViews')} className="max-views-field"><input type="number" min="0" value={form.max_views} onChange={(e) => setForm({ ...form, max_views: Number(e.target.value) })} /></Field>
       <Field label={t('visibility.label')} className="status-field"><VisibilitySegment value={form.visibility} permissions={permissions} onChange={(visibility) => setForm({ ...form, visibility })} /></Field>
       <Field label={t('text.remark')} className="remark-field"><input value={form.remark} onChange={(e) => setForm({ ...form, remark: e.target.value })} placeholder={t('text.optionalRemark')} /></Field>
+      {showDownloadSetting && <DownloadSetting checked={downloadsAllowed(form)} onChange={(allow_download) => setForm({ ...form, allow_download })} />}
     </div>
   );
 }
@@ -975,7 +991,7 @@ function QrShareModal({ item, close, toast }: { item: Content; close: () => void
 function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: Toast['kind']) => void; username: string; permissions: PermissionSet }) {
   const { t, language } = useI18n();
   const [files, setFiles] = useState<File[]>([]);
-  const [form, setForm] = useState(() => ({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, format: 'markdown' }));
+  const [form, setForm] = useState(() => ({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, allow_download: true, format: 'markdown' }));
   const [busy, setBusy] = useState(false);
   const [recent, setRecent] = useState<Content[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1165,7 +1181,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
       await clearCompletedTasks();
       toast(language === 'en-US' ? 'File transfer complete; the background queue is confirming the content.' : '文件传输完成，后台正在确认内容状态');
       setFiles([]);
-      setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, format: 'markdown' });
+      setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, allow_download: true, format: 'markdown' });
       window.setTimeout(() => void load(), 700);
     } catch (err) {
       const message = localizedError(err, t);
@@ -1185,18 +1201,17 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
         </div>
         {!!files.length && <div className="file-list">{files.map((f, i) => <div key={`${f.name}-${i}`}><span>{f.name}</span><small>{fmtBytes(f.size)}</small><button className="icon" onClick={() => setFiles(files.filter((_, idx) => idx !== i))}><X size={16} /></button></div>)}</div>}
         {!!uploadTasks.filter((task) => task.needsFileReselection).length && <div className="resume-hint">{t('file.resumeHint')}</div>}
-        <OptionsGrid form={form} setForm={setForm} permissions={permissions} />
+        <OptionsGrid form={form} setForm={setForm} permissions={permissions} showDownloadSetting />
         <Field label={t('file.optionalText')}><textarea className="short" value={form.content} onChange={(e) => setForm({ ...form, content: e.target.value })} placeholder={t('file.mixedPlaceholder')} /></Field>
         <button className="primary" onClick={upload} disabled={busy}><Upload size={16} /> {t('file.startUpload')}</button>
       </section>
-      <ContentTable title={t('content.recentFiles')} items={recent} toast={toast} refresh={load} compact permissions={permissions} />
-      {loading && <QueryLoading />}
+      <ContentTable title={t('content.recentFiles')} items={recent} toast={toast} refresh={load} compact permissions={permissions} loading={loading} />
       <UploadFloating state={progress} onClose={() => setProgress({ visible: false, stage: '', fileName: '', remaining: 0, progress: 0 })} />
     </div>
   );
 }
 
-function ContentTable({ title, items, toast, refresh, admin = false, compact = false, permissions }: { title: string; items: Content[]; toast: (s: string, k?: Toast['kind']) => void; refresh: () => void; admin?: boolean; compact?: boolean; permissions?: PermissionSet }) {
+function ContentTable({ title, items, toast, refresh, admin = false, compact = false, permissions, loading = false }: { title: string; items: Content[]; toast: (s: string, k?: Toast['kind']) => void; refresh: () => void; admin?: boolean; compact?: boolean; permissions?: PermissionSet; loading?: boolean }) {
   const { t, language } = useI18n();
   const [editing, setEditing] = useState<Content | null>(null);
   const [qrItem, setQrItem] = useState<Content | null>(null);
@@ -1221,7 +1236,7 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
   return (
     <section className="panel table-panel">
       <div className="panel-head"><h2>{title}</h2></div>
-      <div className="table-scroll">
+      {loading ? <QueryLoading /> : <div className="table-scroll">
         <table className={compact ? 'compact' : ''}>
           <thead><tr><th>{t('content.title')}</th><th>{t('content.slugLink')}</th><th>{t('content.type')}</th><th>{t('content.visibility')}</th><th>{t('content.status')}</th><th>{t('content.fileSize')}</th><th>{t('content.views')}</th><th>{t('content.max')}</th><th>{t('content.createdAt')}</th><th>{t('content.expireAt')}</th><th>{t('content.actions')}</th></tr></thead>
           <tbody>
@@ -1254,7 +1269,7 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
             {!items.length && <tr><td colSpan={11} className="empty">{t('common.noData')}</td></tr>}
           </tbody>
         </table>
-      </div>
+      </div>}
       {editing && <EditContent item={editing} admin={admin} permissions={permissions} close={() => setEditing(null)} done={() => { setEditing(null); refresh(); }} toast={toast} />}
       {qrItem && <QrShareModal item={qrItem} close={() => setQrItem(null)} toast={toast} />}
       {confirmation && <ConfirmModal
@@ -1272,7 +1287,7 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
 
 function EditContent({ item, admin, permissions, close, done, toast }: { item: Content; admin: boolean; permissions?: PermissionSet; close: () => void; done: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t, language } = useI18n();
-  const [form, setForm] = useState(() => ({ title: item.title, remark: item.remark || '', visibility: normalizeVisibility(item.visibility, permissions?.can_public_publish), expire_at: item.expire_at || '', max_views: item.max_views, text_content: item.text_content || '', format: item.format }));
+  const [form, setForm] = useState(() => ({ title: item.title, remark: item.remark || '', visibility: normalizeVisibility(item.visibility, permissions?.can_public_publish), expire_at: item.expire_at || '', max_views: item.max_views, allow_download: downloadsAllowed(item), text_content: item.text_content || '', format: item.format }));
   useEffect(() => {
     setForm((current) => {
       const visibility = normalizeVisibility(current.visibility, permissions?.can_public_publish);
@@ -1295,6 +1310,7 @@ function EditContent({ item, admin, permissions, close, done, toast }: { item: C
       <Field label={t('visibility.label')}><VisibilitySegment value={form.visibility} permissions={permissions} onChange={(visibility) => setForm({ ...form, visibility })} /></Field>
       <ExpiryDatePicker className="expire-field" value={form.expire_at || ''} onChange={(expire_at) => setForm({ ...form, expire_at })} />
       <Field label={t('text.maxViews')}><input type="number" min="0" value={form.max_views} onChange={(e) => setForm({ ...form, max_views: Number(e.target.value) })} /></Field>
+      {item.type !== 'text' && <DownloadSetting checked={form.allow_download} onChange={(allow_download) => setForm({ ...form, allow_download })} />}
       {!admin && item.type !== 'file' && <Field label={language === 'en-US' ? 'Text content' : '文本内容'}><textarea className="short" value={form.text_content} onChange={(e) => setForm({ ...form, text_content: e.target.value })} /></Field>}
       {!admin && <Field label={t('text.remark')}><input value={form.remark} onChange={(e) => setForm({ ...form, remark: e.target.value })} /></Field>}
       <div className="right"><button className="soft" onClick={close}>{t('common.cancel')}</button><button className="primary" onClick={save}>{t('common.save')}</button></div>
@@ -1335,8 +1351,7 @@ function MyContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind
         />
         <button className="soft" onClick={() => load()}>{t('common.search')}</button>
       </section>
-      <ContentTable title={t('content.my')} items={items} toast={toast} refresh={load} permissions={permissions} />
-      {loading && <QueryLoading />}
+      <ContentTable title={t('content.my')} items={items} toast={toast} refresh={load} permissions={permissions} loading={loading} />
     </div>
   );
 }
@@ -1542,7 +1557,7 @@ function AdminContents({ toast, permissions }: { toast: (s: string, k?: Toast['k
     }
   }
   useEffect(() => { void load(); }, []);
-  return <><ContentTable title={`${t('nav.admin')} · ${t('admin.contents')}`} items={items} toast={toast} refresh={load} admin permissions={permissions} />{loading && <QueryLoading />}</>;
+  return <ContentTable title={`${t('nav.admin')} · ${t('admin.contents')}`} items={items} toast={toast} refresh={load} admin permissions={permissions} loading={loading} />;
 }
 
 function adminColumns(kind: string) {
@@ -1763,7 +1778,7 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
         <button className="soft" onClick={() => void load()}><RefreshCw size={16} /> {t('common.refresh')}</button>
         <button className="soft" onClick={exportRows}><Download size={16} /> {t('common.export')}</button>
       </div>
-      <div className="admin-table-scroll"><div className="admin-table user-management-table">
+      {loading ? <QueryLoading /> : <div className="admin-table-scroll"><div className="admin-table user-management-table">
         <div className="admin-row admin-head users-head"><span /><strong>{t('admin.user')}</strong><strong>{t('admin.permissionGroup')}</strong><strong>{t('admin.contentCount')}</strong><strong>{t('admin.usedStorage')}</strong><strong>{t('admin.totalViews')}</strong><strong>{t('admin.lastPublish')}</strong><strong>{t('admin.manage')}</strong></div>
         {filtered.map((row) => {
           const isExpanded = Boolean(expanded[row.username]);
@@ -1784,8 +1799,7 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
           </div>;
         })}
         {!filtered.length && <div className="empty">{t('common.noData')}</div>}
-      </div></div>
-      {loading && <QueryLoading />}
+      </div></div>}
       {selected && <ModalShell close={() => setSelected(null)} className="user-group-dialog" title={<div className="modal-heading"><h2>{t('admin.manageUser')}</h2><p className="muted">{selected.username}</p></div>}>
           <div className="admin-user-usage">
             <div><span>{t('admin.contentCount')}</span><strong>{selected.total_count}</strong></div>
@@ -1865,14 +1879,13 @@ function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind'])
   }
   return <section className="panel permission-management">
     <div className="panel-head"><div><h2>{t('admin.permissions')}</h2><p className="muted">{t('admin.permissionHint')}</p></div><button className="primary" onClick={() => setDraft(defaultPermissionDraft())}><Plus size={16} /> {t('admin.createGroup')}</button></div>
-    <div className="permission-group-list">
+    {loading ? <QueryLoading /> : <div className="permission-group-list">
       {groups.map((group) => <article className="permission-group-card" key={group.id}>
         <div className="permission-group-head"><div><h3>{group.name}</h3><div className="group-meta"><Badge text={group.is_system ? t('admin.builtIn') : t('admin.custom')} /><Badge text={group.is_default ? t('admin.default') : t('admin.notDefault')} /></div></div><div className="actions"><button className="icon" onClick={() => setDraft(draftFromGroup(group))} aria-label={t('admin.editGroup')} title={t('admin.editGroup')}><Pencil size={16} /></button><button className="icon danger" disabled={Boolean(group.is_system)} onClick={() => { setDeleteTarget(group); setReplacementId(groups.find((candidate) => candidate.id !== group.id)?.id || ''); }} aria-label={t('admin.deleteGroup')} title={group.is_system ? t('admin.builtInCannotDelete') : t('admin.deleteGroup')}><Trash2 size={16} /></button></div></div>
         <div className="permission-chip-list">{permissionKeys.map((key) => <span className={permissionEnabled(group, key) ? 'allowed' : 'denied'} key={key}>{permissionEnabled(group, key) ? <Check size={13} /> : <X size={13} />} {t(permissionLabels[key])}</span>)}<span className="allowed"><Check size={13} /> {t('permission.storageSpace')}: {Number(group.quota_bytes || 0) / 1024 ** 3} GB</span></div>
       </article>)}
       {!groups.length && <p className="empty">{t('common.noData')}</p>}
-    </div>
-    {loading && <QueryLoading />}
+    </div>}
     {draft && <ModalShell close={() => setDraft(null)} className="permission-editor" title={<h2>{draft.id ? t('admin.editGroup') : t('admin.createGroup')}</h2>}>
       <Field label={t('admin.groupName')}><input value={draft.name} disabled={Boolean(draft.is_system)} onChange={(event) => setDraftValue('name', event.target.value)} /></Field>
       <Field label={t('permission.storageSpace')}><div className="unit-input"><input type="number" min="0" step="0.1" value={draft.quota_gib} onChange={(event) => setDraftValue('quota_gib', event.target.value)} /><span>GB</span></div></Field>
@@ -1954,7 +1967,7 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
         <button className="soft" onClick={exportRows}><Download size={16} /> {t('common.export')}</button>
       </div>
       {newKey && <div className="one-time admin-one-time"><strong>{t('keys.fullOnce')}</strong><code>{newKey}</code><CopyFullValue value={newKey} /></div>}
-      <div className="admin-table-scroll"><div className="admin-table">
+      {loading ? <QueryLoading /> : <div className="admin-table-scroll"><div className="admin-table">
         <div className={`admin-row admin-head ${showAction ? 'has-action' : 'no-action'}`}>
           <span />
           {columns.map((key) => <strong key={key}>{labelOf(key, language)}</strong>)}
@@ -1981,8 +1994,7 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
           </div>
         ))}
         {!filtered.length && <div className="empty">{t('common.noData')}</div>}
-      </div></div>
-      {loading && <QueryLoading />}
+      </div></div>}
       {confirmation && <ConfirmModal
         open
         title={t(`confirm.${confirmation.action}KeyTitle`)}
@@ -2199,10 +2211,18 @@ function PdfCanvasPreview({ info, password = '', onPasswordRequired }: { info: P
   return (
     <div className="pdf-canvas-preview">
       <div className="pdf-status">{error || status}</div>
-      {error && <DownloadButton url={info.download_url} password={password} mediaTicket={info.media_ticket} filename={info.filename} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton>}
+      {error && downloadsAllowed(info) && <DownloadButton url={info.download_url} password={password} mediaTicket={info.media_ticket} filename={info.filename} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton>}
       <div ref={hostRef} className="pdf-pages" />
     </div>
   );
+}
+
+function VideoPlayer({ src, className = '' }: { src: string; className?: string }) {
+  const { t } = useI18n();
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [src]);
+  if (failed) return <section className="share-resource-state" role="alert"><p>{t('preview.videoUnavailable')}</p></section>;
+  return <video className={className} src={src} controls playsInline preload="metadata" onError={() => setFailed(true)} />;
 }
 
 function HtmlPageFrame({
@@ -2442,7 +2462,7 @@ function ZipPagePreview({ info }: { info: PreviewInfo }) {
       <h1>{status === 'error' ? t('preview.noActualPage') : t('preview.zipDefault')}</h1>
       <p>{error || t('preview.zipMessage')}</p>
       {status !== 'error' && <button type="button" className="primary" onClick={() => void openActualPage()}>{t('preview.actualPage')}</button>}
-      {status === 'error' && <p className="muted">{t('preview.downloadArchive')}</p>}
+      {status === 'error' && <p className="muted">{downloadsAllowed(info) ? t('preview.downloadArchive') : t('preview.downloadDisabled')}</p>}
     </section>
   );
 }
@@ -2460,22 +2480,22 @@ function PreviewCanvas({ info, password = '', onPasswordRequired, toast }: { inf
   return (
     <>
       {info.kind === 'image' && <img src={src} alt={name} />}
-      {info.kind === 'video' && <video src={src} controls />}
+      {info.kind === 'video' && <VideoPlayer src={src} />}
       {info.kind === 'audio' && <audio src={src} controls />}
       {info.kind === 'pdf' && <PdfCanvasPreview info={{ ...info, preview_url: src }} password={password} onPasswordRequired={onPasswordRequired} />}
       {info.kind === 'html' && <HtmlPageFrame title={name} sourceUrl={src} />}
       {info.kind === 'text' && <iframe sandbox="" src={src} title={name} />}
       {info.kind === 'office' && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
       {info.kind === 'zip' && <ZipPagePreview info={{ ...info, preview_url: src }} />}
-      {info.kind === 'office' && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{t('preview.downloadLocal')}</p><DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton></section>}
-      {info.kind === 'download' && <section className="panel narrow"><h1>{t('preview.unsupportedTitle')}</h1><p>{t('preview.downloadLocal')}</p><DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton></section>}
+      {info.kind === 'office' && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{downloadsAllowed(info) ? t('preview.downloadLocal') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
+      {info.kind === 'download' && <section className="panel narrow"><h1>{t('preview.unsupportedTitle')}</h1><p>{downloadsAllowed(info) ? t('preview.downloadLocal') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
     </>
   );
 }
 
-function AttachmentPreview({ attachment, password, adminPreview, onPasswordRequired, toast }: { attachment: Attachment; password: string; adminPreview: boolean; onPasswordRequired?: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
+function AttachmentPreview({ attachment, password, adminPreview, allowDownload, onPasswordRequired, toast }: { attachment: Attachment; password: string; adminPreview: boolean; allowDownload: boolean; onPasswordRequired?: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
   const { t } = useI18n();
-  const info = attachmentPreviewInfo(attachment, adminPreview);
+  const info = { ...attachmentPreviewInfo(attachment, adminPreview), allow_download: allowDownload };
   const kind = previewKind(attachment.filename, attachment.content_type);
   const previewable = ['image', 'video', 'audio', 'text'].includes(kind);
   const resource = useShareResource(info.preview_url, password, info.media_ticket, previewable);
@@ -2487,16 +2507,16 @@ function AttachmentPreview({ attachment, password, adminPreview, onPasswordRequi
         <FileUp size={18} />
         <strong>{attachment.filename}</strong>
         <span>{fmtBytes(attachment.size)}</span>
-        <DownloadButton url={download} className="soft download-btn attachment-download" password={password} mediaTicket={info.media_ticket} filename={attachment.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton>
+        {allowDownload && <DownloadButton url={download} className="soft download-btn attachment-download" password={password} mediaTicket={info.media_ticket} filename={attachment.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton>}
       </div>
       {previewable && (resource.loading || resource.failure) && <ShareResourceState loading={resource.loading} failure={resource.failure} onRetry={resource.retry} onPasswordRequired={onPasswordRequired} />}
       {previewable && !resource.loading && !resource.failure && kind === 'image' && <img className="file-preview image-preview" src={preview} alt={attachment.filename} />}
-      {previewable && !resource.loading && !resource.failure && kind === 'video' && <video className="file-preview" controls src={preview} />}
+      {previewable && !resource.loading && !resource.failure && kind === 'video' && <VideoPlayer className="file-preview" src={preview} />}
       {previewable && !resource.loading && !resource.failure && kind === 'audio' && <audio className="audio-preview" controls src={preview} />}
       {previewable && !resource.loading && !resource.failure && kind === 'text' && <iframe sandbox="" className="file-preview frame-preview" src={preview} title={attachment.filename} />}
       {kind === 'download' && (
         <div className="preview-actions">
-          <p className="muted">{t('preview.downloadable')}</p>
+          <p className="muted">{allowDownload ? t('preview.downloadable') : t('preview.downloadDisabled')}</p>
         </div>
       )}
     </div>
@@ -2525,19 +2545,19 @@ function FilePreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) => v
         <strong>{name}</strong>
         <span>{fmtBytes(info.size)} / {info.content_type}</span>
         <LanguageSwitcher />
-        <DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton>
+        {downloadsAllowed(info) && <DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton>}
       </header>
       <main className={`preview-main ${info.kind === 'pdf' ? 'pdf-preview-main' : ''}`}>
         {info.kind === 'image' && <img src={src} alt={name} />}
-        {info.kind === 'video' && <video src={src} controls />}
+        {info.kind === 'video' && <VideoPlayer src={src} />}
         {info.kind === 'audio' && <audio src={src} controls />}
         {info.kind === 'pdf' && <PdfCanvasPreview info={info} />}
         {info.kind === 'html' && <HtmlPageFrame title={name} sourceUrl={src} />}
         {info.kind === 'text' && <iframe sandbox="" src={src} title={name} />}
         {info.kind === 'office' && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
         {info.kind === 'zip' && <ZipPagePreview info={info} />}
-        {info.kind === 'office' && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{t('preview.downloadLocal')}</p><DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton></section>}
-        {info.kind === 'download' && <section className="panel narrow"><h1>{t('preview.unsupportedTitle')}</h1><p>{t('preview.unsupported')}</p><DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton></section>}
+        {info.kind === 'office' && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{downloadsAllowed(info) ? t('preview.downloadLocal') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
+        {info.kind === 'download' && <section className="panel narrow"><h1>{t('preview.unsupportedTitle')}</h1><p>{downloadsAllowed(info) ? t('preview.unsupported') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
       </main>
     </div>
   );
@@ -2552,7 +2572,7 @@ function SharePreviewPage({ item, password, adminPreview, onPasswordRequired, to
   useEffect(() => { setSelected(firstTarget); }, [item.id, firstTarget]);
   const selectedAttachment = attachments.find((a) => a.id === selected) || (!item.text_content ? attachments[0] : undefined);
   const showText = selected === 'text' || (!selectedAttachment && !!item.text_content);
-  const info = selectedAttachment ? attachmentPreviewInfo(selectedAttachment, adminPreview) : null;
+  const info = selectedAttachment ? { ...attachmentPreviewInfo(selectedAttachment, adminPreview), allow_download: downloadsAllowed(item) } : null;
   const backQs = new URLSearchParams();
   if (adminPreview) backQs.set('admin_preview', '1');
   if (item.share_ticket && !item.password_required) backQs.set('access', item.share_ticket);
@@ -2560,7 +2580,7 @@ function SharePreviewPage({ item, password, adminPreview, onPasswordRequired, to
   return (
     <div className="preview-page share-preview-page">
       <header className="preview-topbar share-preview-topbar">
-        <a className="soft back-link" href={backUrl}>{language === 'en-US' ? 'Back' : '返回'}</a>
+        <a className="soft back-link" href={backUrl} aria-label={language === 'en-US' ? 'Back' : '返回'}><ArrowLeft size={18} /><span>{language === 'en-US' ? 'Back' : '返回'}</span></a>
         <div className="preview-title">
           <strong>{showText ? item.title : info?.filename}</strong>
           <span>{item.visibility} / {item.type} / {fmtBytes(info?.size || item.file_size)}</span>
@@ -2572,7 +2592,7 @@ function SharePreviewPage({ item, password, adminPreview, onPasswordRequired, to
             {attachments.map((a) => <option key={a.id} value={a.id}>{a.filename}</option>)}
           </select>
         )}
-        {info ? <DownloadButton url={info.download_url} password={password} mediaTicket={info.media_ticket} filename={info.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton> : <button className="soft" onClick={() => navigator.clipboard.writeText(location.href).then(() => toast(t('common.copied')))}>{t('common.copy')}</button>}
+        {info ? (downloadsAllowed(item) && <DownloadButton className="primary preview-download" url={info.download_url} password={password} mediaTicket={info.media_ticket} filename={info.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton>) : <button className="soft preview-copy-action" onClick={() => navigator.clipboard.writeText(location.href).then(() => toast(t('common.copied')))}>{t('common.copy')}</button>}
       </header>
       <main className={`preview-main ${showText ? 'text-preview-main' : ''} ${info?.kind === 'pdf' ? 'pdf-preview-main' : ''}`}>
         {showText ? (
@@ -2842,7 +2862,7 @@ function ContentPreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) =
           {!!item.attachments?.length && (
             <section className="panel share-files">
               <h2>{t('share.files')}</h2>
-              {item.attachments.map((a) => <AttachmentPreview key={a.id} attachment={a} password={password} adminPreview={adminPreview} onPasswordRequired={requestPasswordAgain} toast={toast} />)}
+              {item.attachments.map((a) => <AttachmentPreview key={a.id} attachment={a} password={password} adminPreview={adminPreview} allowDownload={downloadsAllowed(item)} onPasswordRequired={requestPasswordAgain} toast={toast} />)}
             </section>
           )}
           <ShareNotesPanel item={item} password={password} adminPreview={adminPreview} toast={toast} />

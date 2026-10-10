@@ -1,6 +1,7 @@
 import { buildPartPlan, buildPartWindow, chooseUploadMode, finalizedObjectKey, isContentReadyForActivation, MAX_PARTS_PER_WINDOW, MAX_UPLOAD_SIZE, normalizeUploadFilename, parseByteRange, safeObjectKey, safeStagingObjectKey } from './transfer-policy';
 import { presignR2Request } from './r2-signer';
 import { issueMediaTicket, verifyMediaTicket } from './media-ticket';
+import { parseCookie, serializeShareMediaCookie, serializeSharePasswordCookie, shareMediaCookieName, sharePasswordCookieName, SHARE_PASSWORD_TTL_SECONDS } from './share-cookie';
 import { isUploadSessionReusable, isUploadSessionStale, UPLOAD_INACTIVITY_MS } from './upload-resume';
 import { previewKind } from './preview-policy';
 import { ensureUserGroup, loadUserAccessProfile, reserveStorage } from './worker-permissions';
@@ -109,8 +110,10 @@ const MAX_PENDING_UPLOAD_SESSIONS_PER_USER = 50;
 const RESUMABLE_SESSION_STATUSES = '"pending","uploading","completing"';
 const CLEANUP_SESSION_STATUSES = '"pending","uploading","completing","failed"';
 
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
+function json(data: unknown, status = 200, extraHeaders?: HeadersInit): Response {
+  const headers = new Headers(JSON_HEADERS);
+  if (extraHeaders) new Headers(extraHeaders).forEach((value, key) => headers.set(key, value));
+  return new Response(JSON.stringify(data), { status, headers });
 }
 
 function noContent(): Response {
@@ -203,6 +206,13 @@ function normalizeSlug(input?: string | null): string {
 function numberField(value: FormDataEntryValue | string | number | null | undefined, fallback = 0): number {
   const n = Number(value ?? fallback);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+function allowDownloadField(value: unknown, fallback = 1): number {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (value === true || value === 1 || value === 'true' || value === '1') return 1;
+  if (value === false || value === 0 || value === 'false' || value === '0') return 0;
+  throw new HttpError(400, 'allow_download must be boolean', 'INVALID_DOWNLOAD_SETTING');
 }
 
 function textField(value: FormDataEntryValue | string | null | undefined): string {
@@ -539,6 +549,46 @@ function sharePassword(req: Request): string | null {
   return value?.trim() || null;
 }
 
+function passwordCookieKey(contentId: string): string {
+  return `password:${contentId}`;
+}
+
+async function sharePasswordCookieTicket(env: Env, req: Request, row: any): Promise<Awaited<ReturnType<typeof verifyMediaTicket>>> {
+  const value = parseCookie(req.headers.get('cookie'), sharePasswordCookieName(String(row.slug || '')));
+  if (!value) return null;
+  const ticket = await verifyMediaTicket(env.MEDIA_TICKET_SECRET, value, passwordCookieKey(String(row.id)));
+  if (!ticket || ticket.adminPreview || ticket.policyVersion !== row.updated_at) return null;
+  return ticket;
+}
+
+async function shareMediaCookieAccess(env: Env, req: Request, row: any): Promise<{ actor: string; adminPreview: boolean } | null> {
+  const value = parseCookie(req.headers.get('cookie'), shareMediaCookieName(String(row.slug || '')));
+  if (!value) return null;
+  const ticket = await verifyMediaTicket(env.MEDIA_TICKET_SECRET, value, contentTicketKey(String(row.id)));
+  if (!ticket?.actor || ticket.policyVersion !== row.updated_at) return null;
+  if (row.status === 'processing') throw new HttpError(409, 'Upload is still processing');
+  if (row.status === 'deleted' && !ticket.adminPreview) throw new HttpError(410, 'Content was deleted');
+  if (isExpiredIgnoringViews(row) && !ticket.adminPreview) throw new HttpError(410, 'Content expired');
+  if (row.visibility === 'internal') {
+    requirePermission(await loadUserAccessProfile(env.DB, ticket.actor), 'can_internal_access');
+  }
+  if (row.visibility === 'private' && ticket.actor !== row.owner_username && !ticket.adminPreview) {
+    throw new HttpError(403, 'Private content');
+  }
+  return { actor: ticket.actor, adminPreview: ticket.adminPreview };
+}
+
+async function issueShareMediaCookie(env: Env, row: any, actor: string, adminPreview: boolean): Promise<string> {
+  const ticket = await issueMediaTicket(env.MEDIA_TICKET_SECRET, {
+    attachmentId: contentTicketKey(row.id),
+    actor,
+    adminPreview,
+    policyVersion: row.updated_at,
+    expiresInSeconds: MEDIA_TICKET_TTL_SECONDS,
+  });
+  return serializeShareMediaCookie(shareMediaCookieName(row.slug), ticket, MEDIA_TICKET_TTL_SECONDS);
+}
+
 function requireAdmin(user: User): void {
   if (user.role !== 'admin') throw new HttpError(403, 'Admin permission required');
 }
@@ -667,7 +717,7 @@ async function contentWithAttachments(db: D1Database, contentId: string): Promis
 
 async function shareContentWithAttachments(env: Env, contentId: string, actor?: string, adminPreview = false): Promise<any> {
   const content = await env.DB.prepare(
-    'SELECT id, owner_username, title, slug, type, format, text_content, visibility, status, password_hash, expire_at, max_views, view_count, download_count, file_size, remark, created_at, updated_at FROM contents WHERE id = ?1'
+    'SELECT id, owner_username, title, slug, type, format, text_content, visibility, status, allow_download, password_hash, expire_at, max_views, view_count, download_count, file_size, remark, created_at, updated_at FROM contents WHERE id = ?1'
   ).bind(contentId).first<any>();
   if (!content) throw new HttpError(404, 'Content not found');
   const { results } = await env.DB.prepare(
@@ -691,7 +741,7 @@ async function shareContentWithAttachments(env: Env, contentId: string, actor?: 
     };
   }));
   const { password_hash: _passwordHash, ...safeContent } = content;
-  return { ...safeContent, password_required: Boolean(content.password_hash), attachments };
+  return { ...safeContent, allow_download: Boolean(content.allow_download), password_required: Boolean(content.password_hash), attachments };
 }
 
 async function assertRestorableContent(env: Env, row: any): Promise<void> {
@@ -716,13 +766,28 @@ async function assertShareAccess(env: Env, req: Request, row: any, user: User | 
   }
 }
 
+async function assertPasswordCookieAccess(env: Env, req: Request, row: any, user: User | null, adminPreview = false): Promise<boolean> {
+  const ticket = await sharePasswordCookieTicket(env, req, row);
+  if (!ticket) return false;
+  if (row.status === 'processing') throw new HttpError(409, 'Upload is still processing');
+  if (row.status === 'deleted' && !(user?.role === 'admin' && adminPreview)) throw new HttpError(410, 'Content was deleted');
+  if (isExpiredIgnoringViews(row) && !(user?.role === 'admin' && adminPreview)) throw new HttpError(410, 'Content expired');
+  await assertInternalShareAccess(env, row, user);
+  if (row.visibility === 'private' && user?.username !== row.owner_username && !(user?.role === 'admin' && adminPreview)) {
+    throw new HttpError(403, 'Private content');
+  }
+  return true;
+}
+
+type ShareAccess = { ticketAuthorized: boolean; adminPreview: boolean; actor?: string; passwordAuthorized?: boolean };
+
 async function authorizeShareRequest(
   env: Env,
   req: Request,
   row: any,
   user: User | null,
   requestedAdminPreview: boolean
-): Promise<{ ticketAuthorized: boolean; adminPreview: boolean; actor?: string }> {
+): Promise<ShareAccess> {
   const ticketValue = req.headers.get('x-share-ticket') || '';
   const ticket = ticketValue
     ? await verifyMediaTicket(env.MEDIA_TICKET_SECRET, ticketValue, contentTicketKey(row.id))
@@ -733,11 +798,16 @@ async function authorizeShareRequest(
     if (row.status === 'processing') throw new HttpError(409, 'Upload is still processing');
     if (row.status === 'deleted' && !adminPreview) throw new HttpError(410, 'Content was deleted');
     if (isExpiredIgnoringViews(row) && !adminPreview) throw new HttpError(410, 'Content expired');
+    if (row.visibility === 'private' && user?.username !== row.owner_username && !adminPreview) throw new HttpError(403, 'Private content');
     return { ticketAuthorized: true, adminPreview, actor: ticket.actor };
   }
   const adminPreview = requestedAdminPreview && user?.role === 'admin';
+  if (row.password_hash && await assertPasswordCookieAccess(env, req, row, user, adminPreview)) {
+    return { ticketAuthorized: true, adminPreview: false };
+  }
+  const directPassword = sharePassword(req);
   await assertShareAccess(env, req, row, user, sharePassword(req), adminPreview);
-  return { ticketAuthorized: false, adminPreview, actor: user?.username };
+  return { ticketAuthorized: false, adminPreview, actor: user?.username, passwordAuthorized: Boolean(row.password_hash && directPassword) };
 }
 
 type ActiveStorageReservation = {
@@ -1023,7 +1093,7 @@ async function createUploadContent(env: Env, req: Request, owner: string, form: 
   let objectKeys: string[] = [];
   try {
     await env.DB.prepare(
-      'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, text_size, file_size, password_hash, password_salt, expire_at, max_views, remark, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, "processing", 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?14)'
+      'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, text_size, file_size, password_hash, password_salt, expire_at, max_views, remark, allow_download, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, "processing", 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)'
     )
       .bind(
         contentId,
@@ -1039,6 +1109,7 @@ async function createUploadContent(env: Env, req: Request, owner: string, form: 
         nullableText(textField(form.get('expire_at'))),
         numberField(form.get('max_views')),
         nullableText(textField(form.get('remark'))),
+        allowDownloadField(form.get('allow_download')),
         t
       )
       .run();
@@ -1136,6 +1207,8 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
   const requestedFileBytes = files.reduce((total, file) => total + file.size, 0);
   const reusable = await findReusableUploadSessions(env, owner, files);
   if (reusable) {
+    await env.DB.prepare('UPDATE contents SET allow_download=?1 WHERE id=?2 AND status="processing"')
+      .bind(allowDownloadField(settings.allow_download), reusable.content.id).run();
     const reservationId = await ensureReusableReservation(
       env,
       owner,
@@ -1175,7 +1248,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
 
   try {
     await env.DB.prepare(
-      'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, text_size, file_size, password_hash, password_salt, expire_at, max_views, remark, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, "processing", 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?14)'
+      'INSERT INTO contents (id, owner_username, title, slug, type, format, text_content, visibility, status, text_size, file_size, password_hash, password_salt, expire_at, max_views, remark, allow_download, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, "processing", 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)'
     ).bind(
       contentId,
       owner,
@@ -1190,6 +1263,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       nullableText(settings.expire_at),
       numberField(settings.max_views),
       nullableText(settings.remark),
+      allowDownloadField(settings.allow_download),
       createdAt
     ).run();
     await reserveContentStorage(env, owner, contentId, requestedFileBytes + textSize(contentText));
@@ -1867,7 +1941,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
       requireVisibility(await loadUserAccessProfile(env.DB, user.username), visibility);
       const password = typeof body.password === 'string' && body.password ? await hashWithSalt(body.password) : { hash: row.password_hash, salt: row.password_salt };
       await env.DB.prepare(
-        'UPDATE contents SET title=?1, remark=?2, visibility=?3, expire_at=?4, max_views=?5, format=?6, text_content=?7, password_hash=?8, password_salt=?9, updated_at=?10 WHERE id=?11'
+        'UPDATE contents SET title=?1, remark=?2, visibility=?3, expire_at=?4, max_views=?5, format=?6, text_content=?7, password_hash=?8, password_salt=?9, allow_download=?10, updated_at=?11 WHERE id=?12'
       )
         .bind(
           body.title?.trim() || row.title,
@@ -1879,6 +1953,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
           body.text_content === undefined ? row.text_content : String(body.text_content),
           password.hash,
           password.salt,
+          allowDownloadField(body.allow_download, Number(row.allow_download ?? 1)),
           now(),
           contentId
         )
@@ -1995,7 +2070,19 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
             expiresInSeconds: MEDIA_TICKET_TTL_SECONDS
           });
     }
-    return json({ ok: true, item });
+    const response = json({ ok: true, item });
+    if (row.password_hash && access.passwordAuthorized) {
+      const passwordTicket = await issueMediaTicket(env.MEDIA_TICKET_SECRET, {
+        attachmentId: passwordCookieKey(row.id),
+        policyVersion: row.updated_at,
+        expiresInSeconds: SHARE_PASSWORD_TTL_SECONDS,
+      });
+      response.headers.append('set-cookie', serializeSharePasswordCookie(sharePasswordCookieName(row.slug), passwordTicket));
+    }
+    if (row.visibility !== 'public' && user) {
+      response.headers.append('set-cookie', await issueShareMediaCookie(env, row, user.username, access.adminPreview));
+    }
+    return response;
   }
 
   const infoMatch = path.match(/^\/api\/attachments\/([^/]+)\/preview-info$/);
@@ -2007,24 +2094,27 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     const user = await optionalUser(req, env);
     let adminPreview = url.searchParams.get('admin_preview') === '1' && user?.role === 'admin';
     if (att.status !== 'active') throw new HttpError(409, 'Attachment has not passed upload validation');
+    const mediaCookie = row.visibility !== 'public' ? await shareMediaCookieAccess(env, req, row) : null;
     const suppliedTicket = url.searchParams.get('media');
     const verifiedTicket = suppliedTicket ? await verifyMediaTicket(env.MEDIA_TICKET_SECRET, suppliedTicket, att.id) : null;
     const existingTicket = !row.password_hash && verifiedTicket?.policyVersion === row.updated_at ? verifiedTicket : null;
-    if (existingTicket) {
+    if (mediaCookie) {
+      adminPreview = mediaCookie.adminPreview;
+    } else if (existingTicket) {
       await assertInternalShareAccess(env, row, user);
       adminPreview = existingTicket.adminPreview;
       if (row.status === 'processing') throw new HttpError(409, 'Upload is still processing');
       if (row.status === 'deleted' && !adminPreview) throw new HttpError(410, 'Content was deleted');
       if (isExpiredIgnoringViews(row) && !adminPreview) throw new HttpError(410, 'Content expired');
     } else {
-      await assertShareAccess(env, req, row, user, sharePassword(req), adminPreview);
+      await authorizeShareRequest(env, req, row, user, adminPreview);
       if (row.password_hash) {
         throw new HttpError(409, 'Password-protected attachments must be reloaded from the password page', 'PASSWORD_ATTACHMENT_RELOAD_REQUIRED');
       }
     }
     const ticket = existingTicket ? suppliedTicket! : await issueMediaTicket(env.MEDIA_TICKET_SECRET, {
       attachmentId: att.id,
-      actor: user?.username,
+      actor: mediaCookie?.actor || user?.username,
       adminPreview,
       policyVersion: row.updated_at,
       expiresInSeconds: MEDIA_TICKET_TTL_SECONDS
@@ -2035,7 +2125,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     const downloadPath = `/api/attachments/${att.id}/download${suffix}`;
     const absolutePreviewUrl = `${publicBase(env, req)}${previewPath}`;
     const kind = previewKind(att.filename, att.content_type);
-    return json({
+    const response = json({
       ok: true,
       item: {
         id: att.id,
@@ -2043,11 +2133,16 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
         content_type: att.content_type || 'application/octet-stream',
         size: att.size,
         kind,
+        allow_download: Boolean(row.allow_download),
         preview_url: previewPath,
         download_url: downloadPath,
         office_embed_url: kind === 'office' && row.visibility === 'public' && !row.password_hash ? `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(absolutePreviewUrl)}` : null
       }
     });
+    if (row.visibility !== 'public' && user) {
+      response.headers.append('set-cookie', await issueShareMediaCookie(env, row, user.username, adminPreview));
+    }
+    return response;
   }
 
   const dlMatch = path.match(/^\/api\/attachments\/([^/]+)\/(download|preview)$/);
@@ -2056,6 +2151,10 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (!att) throw new HttpError(404, 'Attachment not found');
     const row = await env.DB.prepare('SELECT * FROM contents WHERE id = ?').bind(att.content_id).first<any>();
     if (!row) throw new HttpError(404, 'Content not found');
+    const mode = dlMatch[2];
+    if (mode === 'download' && !Boolean(row.allow_download)) {
+      throw new HttpError(403, 'Download is disabled for this share', 'DOWNLOAD_DISABLED');
+    }
     const session = await env.DB.prepare('SELECT * FROM upload_sessions WHERE attachment_id = ?1').bind(att.id).first<UploadSessionRow>();
     if (att.status !== 'active' || (session && session.status !== 'completed')) throw new HttpError(409, 'Attachment has not passed upload validation');
     const ticketValue = url.searchParams.get('media') || '';
@@ -2064,7 +2163,11 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     let user: User | null = null;
     let adminPreview = false;
     let actor: string | undefined;
-    if (ticket && !row.password_hash) {
+    const mediaCookie = row.visibility !== 'public' ? await shareMediaCookieAccess(env, req, row) : null;
+    if (mediaCookie) {
+      adminPreview = mediaCookie.adminPreview;
+      actor = mediaCookie.actor;
+    } else if (ticket && !row.password_hash) {
       if (row.visibility === 'internal') user = await optionalUser(req, env);
       await assertInternalShareAccess(env, row, user);
       adminPreview = ticket.adminPreview;
@@ -2075,10 +2178,10 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     } else {
       user = await optionalUser(req, env);
       adminPreview = url.searchParams.get('admin_preview') === '1' && user?.role === 'admin';
-      await assertShareAccess(env, req, row, user, sharePassword(req), adminPreview);
-      actor = user?.username;
+      const access = await authorizeShareRequest(env, req, row, user, adminPreview);
+      adminPreview = access.adminPreview;
+      actor = access.actor;
     }
-    const mode = dlMatch[2];
     if (mode === 'download' && method === 'GET') {
       let directUrl: string | null = null;
       if (att.completed_at) {
@@ -2455,12 +2558,12 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     if (!action && method === 'GET') return json({ ok: true, item: await contentWithAttachments(env.DB, contentId) });
     if (!action && method === 'PATCH') {
       const body = await readJson<any>(req);
-      const row = await env.DB.prepare('SELECT visibility FROM contents WHERE id=?1').bind(contentId).first<{ visibility: string }>();
+      const row = await env.DB.prepare('SELECT visibility, allow_download FROM contents WHERE id=?1').bind(contentId).first<{ visibility: string; allow_download: number }>();
       if (!row) throw new HttpError(404, 'Content not found');
       const visibility = ALLOWED_VISIBILITY.has(body.visibility) ? body.visibility : row.visibility;
       requireVisibility(await loadUserAccessProfile(env.DB, admin.username), visibility);
-      await env.DB.prepare('UPDATE contents SET visibility=COALESCE(?1, visibility), expire_at=?2, max_views=COALESCE(?3, max_views), updated_at=?4 WHERE id=?5')
-        .bind(visibility, body.expire_at === undefined ? null : nullableText(body.expire_at), body.max_views === undefined ? null : numberField(body.max_views), now(), contentId)
+      await env.DB.prepare('UPDATE contents SET visibility=COALESCE(?1, visibility), expire_at=?2, max_views=COALESCE(?3, max_views), allow_download=?4, updated_at=?5 WHERE id=?6')
+        .bind(visibility, body.expire_at === undefined ? null : nullableText(body.expire_at), body.max_views === undefined ? null : numberField(body.max_views), allowDownloadField(body.allow_download, Number(row.allow_download ?? 1)), now(), contentId)
         .run();
       await adminAction(env, admin, 'update_content', 'content', contentId, body);
       return json({ ok: true });

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GiB, MiB } from './transfer-policy';
 import worker from './worker';
 
-const NOW = Date.parse('2026-08-22T12:00:00.000Z');
+const NOW = Date.now();
 
 type RecordedStatement = {
   sql: string;
@@ -289,6 +289,7 @@ describe('Worker quota reservations and upload lifecycle', () => {
     const current = runtime(db, { timeline });
     const form = new FormData();
     form.set('visibility', 'private');
+    form.set('allow_download', 'false');
     form.set('content', 'é');
     form.set('file', new File([new Uint8Array([1, 2, 3])], 'small.bin'));
 
@@ -296,6 +297,8 @@ describe('Worker quota reservations and upload lifecycle', () => {
 
     expect(response.status).toBe(200);
     const placeholder = db.executed.find((item) => item.sql.startsWith('INSERT INTO contents'))!;
+    expect(placeholder.sql).toContain('allow_download');
+    expect(placeholder.values).toContain(0);
     const reservation = db.executed.find((item) => item.sql.includes('INSERT INTO storage_reservations'))!;
     expect(reservation.values.slice(1, 4)).toEqual(['alice', placeholder.values[0], 5]);
     expect(reservation.values[3]).toBe(5);
@@ -347,6 +350,7 @@ describe('Worker quota reservations and upload lifecycle', () => {
       method: 'POST',
       body: JSON.stringify({
         visibility: 'private',
+        allow_download: false,
         content: 'é',
         files: [{ client_id: 'client-1', name: 'five-gib.bin', size: 5 * GiB, fingerprint: 'a'.repeat(64) }],
       }),
@@ -358,6 +362,8 @@ describe('Worker quota reservations and upload lifecycle', () => {
     expect(body.files[0]).toMatchObject({ next_part_number: 9, has_more_parts: true });
     expect(db.executed.filter((item) => item.sql.includes('INSERT INTO storage_reservations'))).toHaveLength(1);
     const placeholder = db.executed.find((item) => item.sql.startsWith('INSERT INTO contents'))!;
+    expect(placeholder.sql).toContain('allow_download');
+    expect(placeholder.values).toContain(0);
     const reservation = db.executed.find((item) => item.sql.includes('INSERT INTO storage_reservations'))!;
     expect(reservation.values.slice(1, 4)).toEqual(['alice', placeholder.values[0], 5 * GiB + 2]);
     expect(db.prepared.some((item) => item.sql.includes('COALESCE(SUM(size), 0) bytes'))).toBe(false);

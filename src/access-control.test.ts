@@ -71,6 +71,7 @@ function contentRow(overrides: Record<string, unknown> = {}) {
     max_views: 0,
     view_count: 0,
     download_count: 0,
+    allow_download: 1,
     file_size: 0,
     remark: null,
     created_at: '2026-08-22T00:00:00.000Z',
@@ -110,7 +111,7 @@ function testDb(options: TestDbOptions = {}) {
     if (sql.includes('FROM permission_groups WHERE is_default = 1')) return { id: 'permission-group-user' };
     if (sql.startsWith('SELECT * FROM contents WHERE slug')) return currentContent;
     if (sql.startsWith('SELECT * FROM contents WHERE id')) return currentContent;
-    if (sql.startsWith('SELECT visibility FROM contents WHERE id')) return currentContent;
+    if (sql.startsWith('SELECT visibility, allow_download FROM contents WHERE id')) return currentContent;
     if (sql.startsWith('SELECT id, owner_username, title, slug')) return currentContent;
     if (sql.startsWith('SELECT * FROM attachments WHERE id')) return currentAttachment;
     if (sql.startsWith('SELECT * FROM upload_sessions WHERE attachment_id')) return null;
@@ -366,6 +367,111 @@ describe('route-level business permissions', () => {
     await expect(errorBody(response)).resolves.toMatchObject({ code: 'LOGIN_REQUIRED' });
   });
 
+  it('uses a short-lived share media cookie for browser preview and download navigation', async () => {
+    const db = testDb({ content: contentRow({ visibility: 'internal' }), attachment: attachmentRow() });
+    const bindings = env(db);
+    const share = await worker.fetch(request('/api/share/shared-item'), bindings, { waitUntil() {} } as unknown as ExecutionContext);
+    const cookie = share.headers.get('set-cookie') || '';
+
+    expect(share.status).toBe(200);
+    expect(cookie).toMatch(/^share_media_shared-item=.+; Max-Age=600; Path=\/api\/attachments; HttpOnly; Secure; SameSite=Lax$/);
+
+    const previewInfo = await worker.fetch(
+      new Request('https://content.example.test/api/attachments/att_1/preview-info', { headers: { cookie } }),
+      bindings,
+      { waitUntil() {} } as unknown as ExecutionContext,
+    );
+    expect(previewInfo.status).toBe(200);
+
+    const withoutCookie = await worker.fetch(
+      new Request('https://content.example.test/api/attachments/att_1/download'),
+      bindings,
+      { waitUntil() {} } as unknown as ExecutionContext,
+    );
+    expect(withoutCookie.status).toBe(401);
+
+    const withCookie = await worker.fetch(
+      new Request('https://content.example.test/api/attachments/att_1/download', { headers: { cookie } }),
+      bindings,
+      { waitUntil() {} } as unknown as ExecutionContext,
+    );
+    expect(withCookie.status).toBe(404);
+    await expect(errorBody(withCookie)).resolves.toMatchObject({ message: 'R2 object not found' });
+  });
+
+  it('streams an internal MOV range to native video using only the browser media cookie', async () => {
+    const db = testDb({
+      content: contentRow({ visibility: 'internal', type: 'file' }),
+      attachment: attachmentRow({ filename: 'clip.mov', content_type: 'video/quicktime', size: 6 }),
+    });
+    const bindings = env(db);
+    const share = await worker.fetch(request('/api/share/shared-item'), bindings, { waitUntil() {} } as unknown as ExecutionContext);
+    const cookie = share.headers.get('set-cookie') || '';
+    (bindings.BUCKET.get as any).mockResolvedValue({
+      body: new Blob([new Uint8Array([1, 2, 3])]).stream(),
+      size: 6,
+      httpEtag: '"mov-etag"',
+      writeHttpMetadata() {},
+    });
+
+    const response = await worker.fetch(
+      new Request('https://content.example.test/api/attachments/att_1/preview', {
+        headers: { cookie, range: 'bytes=0-2' },
+      }),
+      bindings,
+      { waitUntil() {} } as unknown as ExecutionContext,
+    );
+
+    expect(response.status).toBe(206);
+    expect(response.headers.get('content-type')).toBe('video/quicktime');
+    expect(response.headers.get('content-range')).toBe('bytes 0-2/6');
+    expect(response.headers.get('content-length')).toBe('3');
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it('rechecks internal permission when a browser media cookie is used', async () => {
+    const content = contentRow({ visibility: 'internal' });
+    const allowedDb = testDb({ content, attachment: attachmentRow() });
+    const share = await invoke(allowedDb, '/api/share/shared-item');
+    const cookie = share.headers.get('set-cookie') || '';
+    const deniedDb = testDb({ profile: { can_internal_access: 0 }, content, attachment: attachmentRow() });
+
+    const response = await worker.fetch(
+      new Request('https://content.example.test/api/attachments/att_1/preview', { headers: { cookie } }),
+      env(deniedDb),
+      { waitUntil() {} } as unknown as ExecutionContext,
+    );
+
+    expect(response.status).toBe(403);
+    await expect(errorBody(response)).resolves.toMatchObject({ code: 'INTERNAL_ACCESS_PERMISSION_REQUIRED' });
+  });
+
+  it('blocks download GET and HEAD while keeping preview metadata available', async () => {
+    const db = testDb({ content: contentRow({ allow_download: 0 }), attachment: attachmentRow() });
+    const metadata = await invoke(db, '/api/attachments/att_1/preview-info');
+    const download = await invoke(db, '/api/attachments/att_1/download');
+    const head = await invoke(db, '/api/attachments/att_1/download', { method: 'HEAD' });
+
+    expect(metadata.status).toBe(200);
+    await expect(metadata.json()).resolves.toMatchObject({ item: { allow_download: false } });
+    expect(download.status).toBe(403);
+    expect(head.status).toBe(403);
+    await expect(errorBody(download)).resolves.toMatchObject({ code: 'DOWNLOAD_DISABLED' });
+  });
+
+  it('persists the owner download setting through content edits', async () => {
+    const db = testDb({ content: contentRow({ type: 'file' }) });
+    const response = await invoke(db, '/api/contents/cnt_1', {
+      method: 'PATCH',
+      body: JSON.stringify({ allow_download: false }),
+    });
+
+    expect(response.status).toBe(200);
+    const update = db.executed.find((entry) => entry.sql.startsWith('UPDATE contents SET title='));
+    expect(update?.sql).toContain('allow_download=');
+    expect(update?.values).toContain(0);
+  });
+
   it('requires SSO before returning the configured administrator mailto address', async () => {
     const configuredEnv = { ...env(testDb()), ADMIN_CONTACT_EMAIL: 'admin@example.com' };
     const unauthenticated = await worker.fetch(
@@ -425,6 +531,24 @@ describe('route-level business permissions', () => {
     const body = await response.json() as { item: { share_ticket?: string; attachments: Array<{ media_ticket?: string }> } };
     expect(body.item.share_ticket).toBeUndefined();
     expect(body.item.attachments[0]?.media_ticket).toBeUndefined();
+  });
+
+  it('sets a 30 minute password cookie and accepts it on the preview request', async () => {
+    const password = 'secret';
+    const passwordSalt = 'test-salt';
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${passwordSalt}:${password}`));
+    const passwordHash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    const db = testDb({ content: contentRow({ password_hash: passwordHash, password_salt: passwordSalt }) });
+
+    const verified = await invoke(db, '/api/share/shared-item', { headers: { 'x-share-password': password } });
+    const cookie = verified.headers.get('set-cookie');
+
+    expect(verified.status).toBe(200);
+    expect(cookie).toBeTruthy();
+    expect(cookie || '').toMatch(/^share_access_shared-item=.+; Max-Age=1800; Path=\/; HttpOnly; Secure; SameSite=Lax$/);
+
+    const preview = await invoke(db, '/api/share/shared-item', { headers: { cookie: cookie || '' } });
+    expect(preview.status).toBe(200);
   });
 
   it('keeps comments readable while blocking comment and memo writes', async () => {

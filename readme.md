@@ -12,12 +12,14 @@ Content Share is a Cloudflare Workers based content publishing and file sharing 
 - Text formats: plain text and Markdown with a toolbar and live preview.
 - Visibility: `public`, `internal`, and `private`.
 - Access controls: optional password, optional expiry time, optional max views, soft delete, forced expiry, and admin preview without normal view increments.
+- File and mixed shares have an owner-controlled download switch, enabled by default. When disabled, download buttons are hidden and the Worker blocks its download endpoint; authorized inline preview remains available. This cannot prevent saving content by other means.
 - Public share pages can be viewed without login. Internal/private content still requires Worker-side permission checks.
 - Online preview for common file types: images, audio, video, text, PDF through PDF.js, Office documents through Office web embedding when public, and direct HTML pages in a sandboxed iframe with source-code and fullscreen controls.
 - ZIP archives remain download-first. On the preview page, viewers can explicitly try to open an archive's `index.html` or another HTML entry; archive-relative assets are temporarily mapped to Blob URLs and archives without a usable page show a clear download message.
 - Browser uploads use short-lived, object-scoped R2 URLs: files through 16 MiB use one PUT, 16 MiB to 100 MiB files use 8 MiB parts, and larger files up to 5 GiB use 64 MiB parts with IndexedDB queue persistence and real byte progress.
 - Resumable uploads use a SHA-256 file identity fingerprint made from metadata plus the first and last 1 MiB. The Worker resumes only an owner-scoped matching unfinished session, refreshes `last_activity_at` with progress heartbeats, and cleans multipart/staging remnants after 30 minutes without activity.
 - Preview remains behind Worker permission and Range checks. New direct-upload attachments download through a 60-second read-only R2 URL after Worker authorization; legacy objects safely fall back to Worker streaming.
+- Internal/private media uses a short-lived HttpOnly browser cookie issued after share authorization, so native video playback and download navigation can pass Worker access checks without exposing the auth-center JWT in the URL. QuickTime `.mov` files are offered to the browser's native video player; playback still depends on codec support.
 - Comments for public/internal content. Logged-in viewers can comment and choose public/private visibility. The publisher can delete any comment after confirmation.
 - Private content uses a publisher-only memo panel.
 - API Keys are for CLI upload endpoints only, never web login or admin access.

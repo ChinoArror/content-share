@@ -45,6 +45,7 @@ Successful responses use JSON. Errors use the same shape with an HTTP error stat
 | `max_views` | Optional non-negative integer. `0` means unlimited. |
 | `remark` | Optional note shown to the owner. |
 | `format` | `plain` or `markdown`; text and mixed uploads default to `plain`. |
+| `allow_download` | Optional boolean for file/mixed uploads; defaults to `true`. Set `false` to hide download controls and make `GET`/`HEAD /api/attachments/:id/download` return `403 DOWNLOAD_DISABLED`. Preview remains available to authorized viewers. |
 
 File MIME type is optional. When the client does not provide a useful MIME type, the Worker detects it from the filename extension. Common extensions such as `pdf`, `docx`, `xlsx`, `pptx`, images, video, audio, `txt`, `md`, `csv`, `json`, and `xml` are recognized. Unknown types are stored as `application/octet-stream` and the share page asks the viewer to download the file.
 
@@ -233,6 +234,7 @@ Initiation body:
 {
   "title": "Demo video",
   "visibility": "public",
+  "allow_download": false,
   "max_views": 0,
   "files": [
     {

@@ -15,4 +15,9 @@ describe('preview policy', () => {
   it('does not classify SVG as an executable inline preview', () => {
     expect(previewKind('icon.svg', 'image/svg+xml')).toBe('download');
   });
+
+  it('routes QuickTime MOV to native video even when upload metadata is generic', () => {
+    expect(previewKind('clip.mov', 'video/quicktime')).toBe('video');
+    expect(previewKind('clip.mov', 'application/octet-stream')).toBe('video');
+  });
 });

@@ -15,6 +15,7 @@ export function previewKind(filename: string, contentType?: string | null): Prev
   const type = (contentType || '').toLowerCase().split(';', 1)[0].trim();
   if (ZIP_TYPES.has(type) || ext === 'zip') return 'zip';
   if (type === 'image/svg+xml' || ext === 'svg') return 'download';
+  if (type === 'video/quicktime' || ext === 'mov') return 'video';
   if (type.startsWith('image/')) return 'image';
   if (type.startsWith('video/')) return 'video';
   if (type.startsWith('audio/')) return 'audio';
