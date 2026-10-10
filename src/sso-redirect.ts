@@ -7,7 +7,7 @@ export function currentReturnTo(locationParts: LocationParts): string {
 
 export function buildSsoLoginUrl(ssoUrl: string, appId: string, origin: string, locationParts: LocationParts): string {
   const callback = `${origin.replace(/\/+$/, '')}/sso-callback?return_to=${encodeURIComponent(currentReturnTo(locationParts))}`;
-  return `${ssoUrl.replace(/\/+$/, '')}/?client_id=${encodeURIComponent(appId)}&redirect=${encodeURIComponent(callback)}`;
+  return `${ssoUrl.replace(/\/+$/, '')}/login?app_id=${encodeURIComponent(appId)}&redirect=${encodeURIComponent(callback)}`;
 }
 
 export function safeReturnTo(value: string | null | undefined, origin: string): string {

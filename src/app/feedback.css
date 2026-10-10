@@ -1,0 +1,241 @@
+/* Action feedback: bottom-right notices, undo countdowns and running cards.
+   Recipe: SnowLuma design style B4 (floating layer) + F3 (result notice with countdown bar). */
+
+.cs-fb-viewport {
+  position: fixed;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: max(16px, env(safe-area-inset-bottom));
+  z-index: 1200;
+  width: min(360px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+  pointer-events: none;
+}
+
+.cs-fb-card {
+  --fb-tone: var(--primary, #38bdf8);
+  --fb-tone-glow: color-mix(in oklab, var(--fb-tone) 45%, transparent);
+  position: relative;
+  pointer-events: auto;
+  border-radius: 11px;
+  border: 1px solid color-mix(in oklab, var(--border, #e4e4e7) 80%, transparent);
+  background: color-mix(in oklab, var(--popover, var(--card, #ffffff)) 95%, transparent);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 16px 36px -18px rgb(0 0 0 / 0.5);
+  padding: 12px 14px 14px;
+  color: var(--foreground, inherit);
+  font-size: 13px;
+  line-height: 1.5;
+  animation: cs-fb-enter 240ms cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+
+.cs-fb-card[data-tone="success"] { --fb-tone: var(--success, #16a34a); }
+.cs-fb-card[data-tone="error"] { --fb-tone: var(--destructive, #dc2626); }
+.cs-fb-card[data-tone="warning"] { --fb-tone: var(--warning, #d97706); }
+.cs-fb-card[data-tone="info"] { --fb-tone: var(--primary, #38bdf8); }
+
+.cs-fb-card[data-tone="error"] {
+  border-color: color-mix(in oklab, var(--destructive, #dc2626) 30%, transparent);
+}
+
+.cs-fb-card[data-phase="closing"] {
+  animation: cs-fb-exit 160ms cubic-bezier(0.4, 0, 1, 1) forwards;
+  pointer-events: none;
+}
+
+.cs-fb-head {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.cs-fb-icon {
+  color: var(--fb-tone);
+  flex: none;
+}
+
+.cs-fb-title {
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+.cs-fb-side {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cs-fb-detail {
+  margin: 4px 0 0 26px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--muted-foreground, #71717a);
+  overflow-wrap: anywhere;
+}
+
+.cs-fb-undo,
+.cs-fb-action,
+.cs-fb-close {
+  font: inherit;
+  cursor: pointer;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cs-fb-undo {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 9999px;
+  background: var(--foreground, #18181b);
+  color: var(--background, #ffffff);
+  font-size: 12px;
+  font-weight: 500;
+  transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.cs-fb-undo:active { transform: scale(0.96); }
+
+.cs-fb-action {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border, #e4e4e7);
+  background: var(--background, #ffffff);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.cs-fb-close {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  color: var(--muted-foreground, #71717a);
+  margin: -2px -4px 0 0;
+}
+
+.cs-fb-close:hover,
+.cs-fb-action:hover {
+  background: color-mix(in oklab, var(--muted, #f4f4f5) 70%, transparent);
+}
+
+.cs-fb-undo:focus-visible,
+.cs-fb-action:focus-visible,
+.cs-fb-close:focus-visible {
+  outline: 3px solid color-mix(in oklab, var(--ring, #38bdf8) 40%, transparent);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  .cs-fb-undo,
+  .cs-fb-action,
+  .cs-fb-close {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+/* Countdown / running track along the bottom edge */
+.cs-fb-track {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 3px;
+  height: 3px;
+  border-radius: 9px;
+  background: color-mix(in oklab, var(--border, #e4e4e7) 45%, transparent);
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.cs-fb-fill {
+  display: block;
+  height: 100%;
+  border-radius: 9px;
+  transform-origin: left center;
+  background: var(--fb-tone);
+  box-shadow: 0 0 5px var(--fb-tone-glow);
+}
+
+.cs-fb-sweep {
+  animation: cs-fb-sweep var(--fb-dur, 5000ms) linear forwards;
+}
+
+.cs-fb-stepped {
+  transition: none;
+}
+
+/* Indeterminate: a 35% highlight sliding across the track */
+.cs-fb-indet {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  width: 35%;
+  height: 100%;
+  border-radius: 9px;
+  background: var(--fb-tone);
+  box-shadow: 0 0 5px var(--fb-tone-glow);
+  animation: cs-fb-indet 1.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.cs-fb-spin {
+  animation: cs-fb-spin 0.9s linear infinite;
+}
+
+/* Reduce / disable motion: no enter, exit or sweep animation.
+   The countdown still runs by timer and the bar steps in JS. */
+.cs-fb-viewport[data-motion="reduce"] .cs-fb-card,
+.cs-fb-viewport[data-motion="reduce"] .cs-fb-card[data-phase="closing"] {
+  animation: none;
+}
+
+.cs-fb-viewport[data-motion="reduce"] .cs-fb-sweep {
+  animation: none;
+}
+
+.cs-fb-viewport[data-motion="reduce"] .cs-fb-indet {
+  animation: none;
+  left: 32%;
+  opacity: 0.6;
+}
+
+.cs-fb-viewport[data-motion="reduce"] .cs-fb-undo {
+  transition: none;
+}
+
+@keyframes cs-fb-enter {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes cs-fb-exit {
+  to { opacity: 0; transform: translateY(8px) scale(0.98); }
+}
+
+@keyframes cs-fb-sweep {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
+@keyframes cs-fb-indet {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(300%); }
+}
+
+@keyframes cs-fb-spin {
+  to { transform: rotate(360deg); }
+}

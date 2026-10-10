@@ -36,6 +36,7 @@ max_batch_timeout = 5
 max_retries = 5
 dead_letter_queue = "content-share-upload-dlq"
 
+# Secret: ADOBE_PDF_CLIENT_ID (set with set-adobe-secret.bat / npx wrangler secret put ADOBE_PDF_CLIENT_ID)
 [vars]
 SSO_URL = "https://accounts.aryuki.com"
 SSO_APP_ID = "content-share"

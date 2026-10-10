@@ -27,7 +27,9 @@ describe('SSO return paths', () => {
     const callback = new URL(loginUrl.searchParams.get('redirect') || '');
 
     expect(loginUrl.origin).toBe('https://accounts.example.test');
-    expect(loginUrl.searchParams.get('client_id')).toBe('content-share');
+    expect(loginUrl.pathname).toBe('/login');
+    expect(loginUrl.searchParams.get('app_id')).toBe('content-share');
+    expect(loginUrl.searchParams.has('client_id')).toBe(false);
     expect(callback.origin).toBe('https://content.example.test');
     expect(callback.pathname).toBe('/sso-callback');
     expect(callback.searchParams.get('return_to')).toBe('/s/abc?file=1#comments');
