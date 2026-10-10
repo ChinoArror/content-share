@@ -36,6 +36,10 @@ import {
 import { classifyShareAccessError, type ShareAccessPresentation } from './share-access';
 import { classifyShareResourceError, shareResourceMode, type ShareResourceFailure } from './share-resource';
 import { buildSsoLoginUrl, safeReturnTo } from './sso-redirect';
+import { FeedbackProvider, useFeedback, type FeedbackLabels } from './app/feedback';
+import { AppearanceSettings } from './app/appearance-settings';
+import { ThemeProvider, resolveMode, useTheme } from './app/theme';
+import { isAppPath, navigate, useAppRoute, type AppPage } from './app/router';
 import {
   ChevronDown,
   ChevronRight,
@@ -82,6 +86,7 @@ import {
   X
 } from 'lucide-react';
 import './styles.css';
+import './app/feedback.css';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -276,11 +281,62 @@ function useShareResource(url: string, password: string, mediaTicket?: string | 
   return { ...state, protected: enabled && mode === 'protected-blob', retry: () => setRetry((value) => value + 1) };
 }
 
+// ─── Session expiry (auth-center token) ─────────────────────────────────────
+const BOUNCE_KEY = 'cs_sso_bounce';
+const BOUNCE_WINDOW_MS = 60_000;
+const EXPIRY_SKEW_MS = 30_000;
+// Becomes true once /api/me succeeds; only then may an expired session send the user back through SSO.
+let appSessionActive = false;
+// Set on pagehide (registered before React mounts, so it runs before pending undo commits are flushed)
+// so those last requests are sent with keepalive and survive the tab closing.
+let pageHiding = false;
+if (typeof window !== 'undefined') window.addEventListener('pagehide', () => { pageHiding = true; });
+if (typeof window !== 'undefined') window.addEventListener('pageshow', () => { pageHiding = false; });
+
+/** Reads the JWT `exp` claim. Undecodable tokens count as not expired; the server still decides. */
+function tokenExpired(tok: string): boolean {
+  try {
+    const payload = tok.split('.')[1];
+    if (!payload) return false;
+    const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const claims = JSON.parse(atob(b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '='))) as { exp?: unknown };
+    return typeof claims.exp === 'number' && claims.exp * 1000 < Date.now() + EXPIRY_SKEW_MS;
+  } catch {
+    return false;
+  }
+}
+
+/** Silent re-login through auth-center. Limited to one redirect per window so a rejected token cannot loop. */
+function autoLogin(): boolean {
+  try {
+    const last = Number(sessionStorage.getItem(BOUNCE_KEY) || 0);
+    if (last && Date.now() - last < BOUNCE_WINDOW_MS) return false;
+    sessionStorage.setItem(BOUNCE_KEY, String(Date.now()));
+  } catch {
+    // Storage blocked: still allow the redirect.
+  }
+  login();
+  return true;
+}
+
+/** Drops the stored token. Only logged-in console pages are forced back through SSO; public pages never are. */
+function endSession() {
+  localStorage.removeItem('sso_token');
+  const path = location.pathname;
+  if (appSessionActive && (path === '/' || isAppPath(path))) autoLogin();
+}
+
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  let sent = token();
+  if (sent && tokenExpired(sent)) {
+    endSession();
+    sent = '';
+  }
   const headers = new Headers(init.headers);
-  if (token()) headers.set('Authorization', `Bearer ${token()}`);
+  if (sent) headers.set('Authorization', `Bearer ${sent}`);
   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
-  const res = await fetch(path, { ...init, headers });
+  const res = await fetch(path, { ...init, headers, keepalive: init.keepalive ?? pageHiding });
+  if (res.status === 401 && sent) endSession();
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
   if (!res.ok || data.ok === false) {
@@ -502,20 +558,6 @@ function switchLogin() {
   location.href = `${SSO_URL}/logout?redirect=${encodeURIComponent(loginUrl)}`;
 }
 
-function useToast() {
-  const [toasts, setToasts] = useState<Toast[]>([]);
-  const push = (text: string, kind: Toast['kind'] = 'ok') => {
-    const item = { id: Date.now() + Math.random(), text, kind };
-    setToasts((items) => [...items, item]);
-    window.setTimeout(() => setToasts((items) => items.filter((t) => t.id !== item.id)), 3600);
-  };
-  return { toasts, push };
-}
-
-function Toasts({ items }: { items: Toast[] }) {
-  return <div className="toasts" aria-live="polite">{items.map((t) => <div className={`toast ${t.kind || 'ok'}`} key={t.id}>{t.text}</div>)}</div>;
-}
-
 function BrandMark({ compact = false }: { compact?: boolean }) {
   return <span className={`brand-mark${compact ? ' compact' : ''}`} aria-hidden="true"><Share2 size={compact ? 17 : 19} /><i /></span>;
 }
@@ -620,16 +662,20 @@ function FilterMenu({ items, values, onChange, onClear }: { items: FilterMenuIte
   );
 }
 
-function Sidebar({ page, setPage, user, profile, open, setOpen, collapsed, setCollapsed }: { page: string; setPage: (v: string) => void; user: User; profile: AccessProfile; open: boolean; setOpen: (v: boolean) => void; collapsed: boolean; setCollapsed: (v: boolean) => void }) {
+type NavEntry = readonly [AppPage, string, React.ElementType];
+
+function Sidebar({ page, setPage, user, profile, open, setOpen, collapsed, setCollapsed }: { page: AppPage; setPage: (v: AppPage) => void; user: User; profile: AccessProfile; open: boolean; setOpen: (v: boolean) => void; collapsed: boolean; setCollapsed: (v: boolean) => void }) {
   const { t } = useI18n();
-  const items = [
-    ['text', t('nav.publishText'), TextCursorInput],
-    ['file', t('nav.publishFile'), FileUp],
-    ['face', t('nav.faceTransfer'), ScanLine],
-    ['mine', t('nav.myContent'), Clipboard],
-    ['settings', t('nav.settings'), Settings]
-  ] as Array<readonly [string, string, React.ElementType]>;
-  if (profile.permissions.can_api) items.splice(4, 0, ['keys', t('nav.apiKeys'), KeyRound]);
+  const groups: Array<{ key: string; label: string; items: NavEntry[] }> = [
+    { key: 'publish', label: t('nav.section.publish'), items: [['text', t('nav.publishText'), TextCursorInput], ['file', t('nav.publishFile'), FileUp], ['face', t('nav.faceTransfer'), ScanLine]] },
+    { key: 'library', label: t('nav.section.library'), items: [['mine', t('nav.myContent'), Clipboard]] },
+    { key: 'developer', label: t('nav.section.developer'), items: profile.permissions.can_api ? [['keys', t('nav.apiKeys'), KeyRound]] : [] },
+    { key: 'account', label: t('nav.section.account'), items: [['settings', t('nav.settings'), Settings]] },
+    { key: 'admin', label: t('nav.section.admin'), items: user.role === 'admin' ? [['admin', t('nav.admin'), Shield]] : [] },
+  ];
+  const used = profile.storage?.used_bytes ?? 0;
+  const quota = profile.storage?.quota_bytes ?? 0;
+  const ratio = quota > 0 ? Math.min(1, used / quota) : 0;
   return (
     <aside className={`sidebar ${open ? 'open' : ''} ${collapsed ? 'collapsed' : ''}`}>
       <div className="brand">
@@ -640,25 +686,39 @@ function Sidebar({ page, setPage, user, profile, open, setOpen, collapsed, setCo
         <button className="icon sidebar-toggle" onClick={() => { if (open) { setOpen(false); return; } setCollapsed(!collapsed); }} aria-label={open ? t('nav.closeSidebar') : collapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')} title={open ? t('nav.closeSidebar') : collapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')}><Menu size={18} /></button>
       </div>
       <nav>
-        {items.map(([id, label, Icon]) => (
-          <button key={id} className={page === id ? 'active' : ''} onClick={() => { setPage(id); setOpen(false); }} title={label}>
-            <Icon size={18} /> <span>{label}</span>
-          </button>
+        {groups.filter((group) => group.items.length > 0).map((group) => (
+          <div key={group.key} className="nav-group">
+            <div className="nav-section-label">{group.label}</div>
+            {group.items.map(([id, label, Icon]) => (
+              <button key={id} className={page === id ? 'active' : ''} onClick={() => { setPage(id); setOpen(false); }} title={label}>
+                <Icon size={18} /> <span>{label}</span>
+              </button>
+            ))}
+          </div>
         ))}
-        {user.role === 'admin' && (
-          <button className={page === 'admin' ? 'active' : ''} onClick={() => { setPage('admin'); setOpen(false); }} title={t('nav.admin')}>
-            <Shield size={18} /> <span>{t('nav.admin')}</span>
-          </button>
-        )}
       </nav>
-      <div className="side-foot">{t('nav.sso')}</div>
+      <div className="side-foot">
+        <div className="storage-meter">
+          <div className="storage-meter-row">
+            <span>{t('nav.storage')}</span>
+            <span>{fmtBytes(used)} / {fmtBytes(quota)}</span>
+          </div>
+          <div className="storage-meter-bar" role="meter" aria-label={t('nav.storage')} aria-valuemin={0} aria-valuemax={quota} aria-valuenow={used}>
+            <i style={{ width: `${ratio * 100}%` }} />
+          </div>
+        </div>
+      </div>
     </aside>
   );
 }
 
-function Header({ title, onMenu, dark, setDark, user }: { title: string; onMenu: () => void; dark: boolean; setDark: (v: boolean) => void; user: User }) {
+function Header({ section, title, subtitle, onMenu, user }: { section: string; title: string; subtitle?: string; onMenu: () => void; user: User }) {
   const { t } = useI18n();
+  const { settings, update } = useTheme();
+  const dark = resolveMode(settings.mode) === 'dark';
   const [open, setOpen] = useState(false);
+  const [newOpen, setNewOpen] = useState(false);
+  const newItems: NavEntry[] = [['text', t('nav.publishText'), TextCursorInput], ['file', t('nav.publishFile'), FileUp], ['face', t('nav.faceTransfer'), ScanLine]];
   const logout = async () => {
     localStorage.removeItem('sso_token');
     await Promise.all([
@@ -670,10 +730,35 @@ function Header({ title, onMenu, dark, setDark, user }: { title: string; onMenu:
   return (
     <header className="topbar">
       <button className="icon mobile-only" onClick={onMenu} aria-label={t('nav.openSidebar')}><Menu /></button>
-      <h1>{title}</h1>
+      <div className="topbar-title">
+        <nav className="breadcrumb" aria-label={t('nav.breadcrumb')}>
+          <span>{section}</span>
+          <span aria-hidden="true">›</span>
+          <span aria-current={subtitle ? undefined : 'page'}>{title}</span>
+          {subtitle && <><span aria-hidden="true">›</span><span aria-current="page">{subtitle}</span></>}
+        </nav>
+        <h1>{title}</h1>
+      </div>
       <div className="top-actions">
+        <div className="new-area">
+          <button type="button" className="primary" onClick={() => setNewOpen(!newOpen)} aria-haspopup="menu" aria-expanded={newOpen} aria-label={t('nav.openNewMenu')}>
+            <Plus size={16} /> <span className="btn-label">{t('nav.new')}</span>
+          </button>
+          {newOpen && (
+            <>
+              <button type="button" className="user-menu-scrim" aria-label={t('nav.closeNewMenu')} onClick={() => setNewOpen(false)} />
+              <div className="user-menu new-menu" role="menu">
+                {newItems.map(([id, label, Icon]) => (
+                  <button key={id} type="button" role="menuitem" className="menu-link" onClick={() => { setNewOpen(false); navigate({ page: id }); }}>
+                    <Icon size={16} /> <span>{label}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         <LanguageSwitcher />
-        <button className="soft theme-toggle" onClick={() => setDark(!dark)}>{dark ? <Sun size={16} /> : <Moon size={16} />} {dark ? t('theme.light') : t('theme.dark')}</button>
+        <button className="soft theme-toggle" onClick={() => update({ mode: dark ? 'light' : 'dark' })} aria-label={dark ? t('theme.light') : t('theme.dark')} title={dark ? t('theme.light') : t('theme.dark')}>{dark ? <Sun size={16} /> : <Moon size={16} />} <span className="btn-label">{dark ? t('theme.light') : t('theme.dark')}</span></button>
         <div className="user-area">
           <span className="user-name">{user.name || user.username}</span>
           <button className="avatar-btn" onClick={() => setOpen(!open)} aria-label={t('user.openMenu')}>
@@ -742,7 +827,34 @@ function MarkdownToolbar({ textareaRef, content, setContent }: { textareaRef: Re
   );
 }
 
+/** Detail line for undo cards: the account's feedback duration, in whole seconds. */
+function useUndoDetail(): string {
+  const { t } = useI18n();
+  const { settings } = useTheme();
+  return t('fb.undoDetail', { seconds: Math.round(settings.feedbackDurationMs / 1000) });
+}
+
+/** Actions on a publish result card: open the public page, copy its link, or go to My content. */
+function publishedCardActions(t: (key: string) => string, toast: (s: string, k?: Toast['kind']) => void, url?: string): { label: string; onClick: () => void }[] {
+  const mine = { label: t('nav.myContent'), onClick: () => navigate({ page: 'mine' }) };
+  if (!url) return [mine];
+  const slug = url.split('/').filter(Boolean).pop() || '';
+  return [
+    { label: t('fb.open'), onClick: () => { window.open(`/s/${slug}`, '_blank', 'noopener'); } },
+    { label: t('fb.copyLink'), onClick: () => { void navigator.clipboard.writeText(url).then(() => toast(t('common.copied'))); } },
+    mine,
+  ];
+}
+
+/** Drops notes (and their replies) whose delete is still inside the undo window. */
+function withoutPendingNotes(list: ShareNote[], pending: Set<string>): ShareNote[] {
+  return list
+    .filter((note) => !pending.has(note.id))
+    .map((note) => (note.replies?.length ? { ...note, replies: withoutPendingNotes(note.replies, pending) } : note));
+}
+
 function PublishText({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
+  const feedback = useFeedback();
   const { t, language } = useI18n();
   const [format, setFormat] = useState<'markdown' | 'plain'>('plain');
   const [mobileTab, setMobileTab] = useState<'pure' | 'preview'>('pure');
@@ -761,11 +873,11 @@ function PublishText({ toast, permissions }: { toast: (s: string, k?: Toast['kin
     setBusy(true);
     try {
       const payload = withAllowedVisibility({ ...form, format, expire_at: form.expire_at || null }, permissions.can_public_publish);
-      const res = await api<{ url: string }>('/api/contents/text', { method: 'POST', body: JSON.stringify(payload) });
-      toast(language === 'en-US' ? `Created: ${res.url}` : `已创建：${res.url}`);
+      await feedback.run({ title: t('fb.publishing'), successTitle: t('fb.created'), successDetail: (r: { url: string }) => r.url, actions: (r) => publishedCardActions(t, toast, r.url) },
+        () => api<{ url: string }>('/api/contents/text', { method: 'POST', body: JSON.stringify(payload) }).catch((err) => { throw new Error(localizedError(err, t)); }));
       setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0 });
-    } catch (err) {
-      toast(localizedError(err, t), 'error');
+    } catch {
+      // The run card already shows the error.
     } finally {
       setBusy(false);
     }
@@ -989,6 +1101,7 @@ function QrShareModal({ item, close, toast }: { item: Content; close: () => void
 }
 
 function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: Toast['kind']) => void; username: string; permissions: PermissionSet }) {
+  const feedback = useFeedback();
   const { t, language } = useI18n();
   const [files, setFiles] = useState<File[]>([]);
   const [form, setForm] = useState(() => ({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, allow_download: true, format: 'markdown' }));
@@ -1153,6 +1266,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
     setProgress({ visible: true, stage: language === 'en-US' ? 'Preparing secure upload' : '准备安全直传', fileName: files[0].name, remaining: files.length, progress: 0 });
     const queue = queueRef.current!;
     let added: UploadTask[] = [];
+    let publishedUrl: string | undefined;
     try {
       added = await queue.enqueue(files.map((file, index) => ({
         file,
@@ -1163,7 +1277,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
         await queue.run();
       } catch (error) {
         if (!(error as Error).message.includes('Direct R2 upload is not configured')) throw error;
-        await legacyUpload();
+        publishedUrl = (await legacyUpload()).url;
         const removals = await Promise.allSettled(added.map((task) => queue.remove(task.id)));
         const removalFailure = removals.find((result): result is PromiseRejectedResult => result.status === 'rejected');
         if (removalFailure) throw removalFailure.reason;
@@ -1178,8 +1292,12 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
       if (!progress.visible || progress.progress < 100) {
         setProgress({ visible: true, stage: language === 'en-US' ? 'Transfer complete; Queue is confirming' : '传输完成，Queue 正在确认', fileName: files[files.length - 1].name, remaining: 0, progress: 100 });
       }
-      await clearCompletedTasks();
-      toast(language === 'en-US' ? 'File transfer complete; the background queue is confirming the content.' : '文件传输完成，后台正在确认内容状态');
+      try {
+        await feedback.run({ title: t('fb.finalizing'), successTitle: t('fb.transferDone'), successDetail: t('fb.backgroundConfirming'), actions: () => publishedCardActions(t, toast, publishedUrl) },
+          () => clearCompletedTasks());
+      } catch {
+        return; // The run card already shows the error.
+      }
       setFiles([]);
       setForm({ title: '', content: '', remark: '', slug: '', password: '', visibility: normalizeVisibility('public', permissions.can_public_publish), expire_at: '', max_views: 0, allow_download: true, format: 'markdown' });
       window.setTimeout(() => void load(), 700);
@@ -1213,12 +1331,15 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
 
 function ContentTable({ title, items, toast, refresh, admin = false, compact = false, permissions, loading = false }: { title: string; items: Content[]; toast: (s: string, k?: Toast['kind']) => void; refresh: () => void; admin?: boolean; compact?: boolean; permissions?: PermissionSet; loading?: boolean }) {
   const { t, language } = useI18n();
+  const feedback = useFeedback();
+  const undoDetail = useUndoDetail();
   const [editing, setEditing] = useState<Content | null>(null);
   const [qrItem, setQrItem] = useState<Content | null>(null);
   const [confirmation, setConfirmation] = useState<{ item: Content; action: string; method: string } | null>(null);
+  const [pendingIds, setPendingIds] = useState<Set<string>>(() => new Set());
+  const base = admin ? '/api/admin/contents' : '/api/contents';
   async function executeAction(item: Content, action: string, method = 'POST') {
     try {
-      const base = admin ? '/api/admin/contents' : '/api/contents';
       await api(`${base}/${item.id}/${action}`, { method });
       toast(language === 'en-US' ? 'Operation completed' : '操作完成');
       refresh();
@@ -1226,9 +1347,29 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
       toast((err as Error).message, 'error');
     }
   }
+  /** The undo card owns the countdown; the API call runs only when it ends without Undo. */
+  function startUndoable(item: Content, action: string, method: string) {
+    const removePending = () => setPendingIds((prev) => { const next = new Set(prev); next.delete(item.id); return next; });
+    const removing = action === 'delete' || action === 'permanent';
+    if (removing) setPendingIds((prev) => new Set(prev).add(item.id));
+    const name = item.title || item.slug;
+    feedback.confirmUndoable({
+      title: t(action === 'permanent' ? 'fb.permanentTitle' : action === 'delete' ? 'fb.deleteTitle' : 'fb.expireTitle', { title: name }),
+      detail: undoDetail,
+      successTitle: t(action === 'permanent' ? 'fb.permanentDone' : action === 'delete' ? 'fb.deletedTitle' : 'fb.expiredDone'),
+      commit: () => api(`${base}/${item.id}/${action}`, { method }),
+      onUndo: removePending,
+      onCommitted: () => { removePending(); refresh(); },
+      onError: removePending,
+    });
+  }
   function act(item: Content, action: string, method = 'POST') {
     if (action === 'delete' || action === 'permanent') {
       setConfirmation({ item, action, method });
+      return;
+    }
+    if (action === 'expire') {
+      startUndoable(item, action, method);
       return;
     }
     void executeAction(item, action, method);
@@ -1241,7 +1382,7 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
           <thead><tr><th>{t('content.title')}</th><th>{t('content.slugLink')}</th><th>{t('content.type')}</th><th>{t('content.visibility')}</th><th>{t('content.status')}</th><th>{t('content.fileSize')}</th><th>{t('content.views')}</th><th>{t('content.max')}</th><th>{t('content.createdAt')}</th><th>{t('content.expireAt')}</th><th>{t('content.actions')}</th></tr></thead>
           <tbody>
             {items.map((item) => (
-              <tr key={item.id}>
+              <tr key={item.id} className={pendingIds.has(item.id) ? 'row-pending' : undefined}>
                 <td>{item.title}</td>
                 <td><a href={`/s/${item.slug}`} target="_blank" rel="noreferrer">{item.slug}</a></td>
                 <td><Badge text={localizedAdminEnum(t, 'type', item.type)} /></td>
@@ -1279,13 +1420,14 @@ function ContentTable({ title, items, toast, refresh, admin = false, compact = f
         confirmLabel={confirmation.action === 'permanent' ? t('content.permanentDelete') : t('content.delete')}
         destructive
         onClose={() => setConfirmation(null)}
-        onConfirm={async () => { const current = confirmation; setConfirmation(null); await executeAction(current.item, current.action, current.method); }}
+        onConfirm={() => { const current = confirmation; setConfirmation(null); startUndoable(current.item, current.action, current.method); }}
       />}
     </section>
   );
 }
 
 function EditContent({ item, admin, permissions, close, done, toast }: { item: Content; admin: boolean; permissions?: PermissionSet; close: () => void; done: () => void; toast: (s: string, k?: Toast['kind']) => void }) {
+  const feedback = useFeedback();
   const { t, language } = useI18n();
   const [form, setForm] = useState(() => ({ title: item.title, remark: item.remark || '', visibility: normalizeVisibility(item.visibility, permissions?.can_public_publish), expire_at: item.expire_at || '', max_views: item.max_views, allow_download: downloadsAllowed(item), text_content: item.text_content || '', format: item.format }));
   useEffect(() => {
@@ -1297,11 +1439,10 @@ function EditContent({ item, admin, permissions, close, done, toast }: { item: C
   async function save() {
     try {
       const payload = withAllowedVisibility(form, permissions?.can_public_publish);
-      await api(`${admin ? '/api/admin/contents' : '/api/contents'}/${item.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
-      toast(language === 'en-US' ? 'Saved' : '已保存');
+      await feedback.run({ title: t('fb.saving'), successTitle: t('fb.saved') }, () => api(`${admin ? '/api/admin/contents' : '/api/contents'}/${item.id}`, { method: 'PATCH', body: JSON.stringify(payload) }));
       done();
-    } catch (err) {
-      toast((err as Error).message, 'error');
+    } catch {
+      // The run card already shows the error; the editor stays open.
     }
   }
   return (
@@ -1338,6 +1479,13 @@ function MyContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind
   useEffect(() => { void load(); }, [filter.type, filter.status]);
   return (
     <div className="stack no-page-x">
+      <div className="page-head">
+        <div><p>{t('mine.count', { count: items.length })}</p></div>
+        <div className="page-head-actions">
+          <button className="soft" onClick={() => navigate({ page: 'file' })}><FileUp size={16} /> {t('mine.uploadFile')}</button>
+          <button className="primary" onClick={() => navigate({ page: 'text' })}><TextCursorInput size={16} /> {t('mine.newText')}</button>
+        </div>
+      </div>
       <section className="panel filters">
         <input placeholder={t('content.searchPlaceholder')} value={filter.q} onChange={(e) => setFilter({ ...filter, q: e.target.value })} onKeyDown={(e) => e.key === 'Enter' && load()} />
         <FilterMenu
@@ -1357,6 +1505,8 @@ function MyContents({ toast, permissions }: { toast: (s: string, k?: Toast['kind
 }
 
 function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+  const feedback = useFeedback();
+  const undoDetail = useUndoDetail();
   const { t, language } = useI18n();
   const [items, setItems] = useState<any[]>([]);
   const [form, setForm] = useState({ remark: '', expire_at: '' });
@@ -1377,23 +1527,33 @@ function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
   useEffect(() => { void load(); }, []);
   async function create() {
     try {
-      const res = await api<{ key: string }>('/api/api-keys', { method: 'POST', body: JSON.stringify({ ...form, expire_at: form.expire_at || null }) });
+      const res = await feedback.run({ title: t('fb.creatingKey'), successTitle: t('fb.keyCreated'), successDetail: t('keys.fullOnce') },
+        () => api<{ key: string }>('/api/api-keys', { method: 'POST', body: JSON.stringify({ ...form, expire_at: form.expire_at || null }) }));
       setNewKey(res.key);
-      toast(language === 'en-US' ? 'API key created. The full value is shown once.' : 'API Key 已创建，完整值仅显示一次');
       setForm({ remark: '', expire_at: '' });
       await load();
-    } catch (err) {
-      toast((err as Error).message, 'error');
+    } catch {
+      // The run card already shows the error.
     }
   }
   async function executeMutation(id: string, action: 'rotate' | 'revoke') {
+    if (action === 'revoke') {
+      const target = items.find((k) => k.id === id);
+      feedback.confirmUndoable({
+        title: t('fb.revokeTitle', { title: target ? (target.remark || mergeKeyFingerprint(target.key_prefix, target.key_suffix)) : id }),
+        detail: undoDetail,
+        successTitle: t('fb.revokedDone'),
+        commit: () => api(`/api/api-keys/${id}/revoke`, { method: 'POST' }),
+        onCommitted: () => void load(),
+      });
+      return;
+    }
     try {
-      const res = await api<any>(`/api/api-keys/${id}/${action}`, { method: 'POST' });
+      const res = await feedback.run({ title: t('fb.rotating'), successTitle: t('fb.rotated') }, () => api<any>(`/api/api-keys/${id}/rotate`, { method: 'POST' }));
       if (res.key) setNewKey(res.key);
-      toast(action === 'rotate' ? (language === 'en-US' ? 'Rotated. The new key is shown once.' : '已旋转，新 key 仅显示一次') : (language === 'en-US' ? 'Revoked' : '已吊销'));
       await load();
-    } catch (err) {
-      toast((err as Error).message, 'error');
+    } catch {
+      // The run card already shows the error.
     }
   }
   function mutate(id: string, action: 'rotate' | 'revoke') {
@@ -1430,13 +1590,18 @@ function ApiKeys({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
 }
 
 function UserSettings({ toast, profile }: { toast: (s: string, k?: Toast['kind']) => void; profile: AccessProfile }) {
+  const feedback = useFeedback();
   const { t, language } = useI18n();
   const permissions = profile.permissions;
   const [form, setForm] = useState<any>(() => ({ default_visibility: normalizeVisibility('public', permissions.can_public_publish), default_expire_days: 0, default_max_views: 0, default_format: 'markdown', default_endpoint: BASE_URL, default_slug_mode: 'random' }));
   useEffect(() => {
     if (!permissions.can_api) return;
     api<{ item: any }>('/api/settings/cli')
-      .then((r) => r.item && setForm({ ...r.item, default_visibility: normalizeVisibility(r.item.default_visibility, permissions.can_public_publish) }))
+      .then((r) => r.item && setForm((cur: any) => ({
+        ...cur,
+        ...Object.fromEntries(Object.entries(r.item).filter(([, v]) => v !== undefined && v !== null)),
+        default_visibility: normalizeVisibility(r.item.default_visibility, permissions.can_public_publish),
+      })))
       .catch((e) => toast(e.message, 'error'));
   }, [permissions.can_api, permissions.can_public_publish]);
   useEffect(() => {
@@ -1448,16 +1613,15 @@ function UserSettings({ toast, profile }: { toast: (s: string, k?: Toast['kind']
   async function save() {
     try {
       const default_visibility = normalizeVisibility(form.default_visibility, permissions.can_public_publish);
-      await api('/api/settings/cli', { method: 'PATCH', body: JSON.stringify({ ...form, default_visibility }) });
-      toast(language === 'en-US' ? 'User settings saved' : '用户设置已保存');
-    } catch (err) {
-      toast((err as Error).message, 'error');
+      await feedback.run({ title: t('fb.saving'), successTitle: t('fb.settingsSaved') }, () => api('/api/settings/cli', { method: 'PATCH', body: JSON.stringify({ ...form, default_visibility }) }));
+    } catch {
+      // The run card already shows the error.
     }
   }
   const example = `curl -X POST "${form.default_endpoint || BASE_URL}/api/cli/upload-text" \\
   -H "Authorization: Bearer YOUR_API_KEY" \\
   -H "Content-Type: application/json" \\
-  -d '{"title":"note","content":"# hello","format":"${form.default_format}","visibility":"${form.default_visibility}","max_views":${form.default_max_views}}'`;
+  -d '{"title":"note","content":"# hello","format":"${form.default_format ?? 'markdown'}","visibility":"${form.default_visibility ?? 'public'}","max_views":${Number(form.default_max_views) || 0}}'`;
   if (!permissions.can_api) {
     return <section className="panel">
       <div className="panel-head"><h2>{t('nav.settings')}</h2></div>
@@ -1470,6 +1634,7 @@ function UserSettings({ toast, profile }: { toast: (s: string, k?: Toast['kind']
   }
   return (
     <section className="panel">
+      <div className="panel-head"><h2>{t('settings.cliDefaults')}</h2></div>
       <div className="options-grid">
         <Field label={t('settings.defaultVisibility')} className="status-field"><VisibilitySegment value={form.default_visibility} permissions={permissions} onChange={(default_visibility) => setForm({ ...form, default_visibility })} /></Field>
         <Field label={t('settings.defaultExpireDays')}><input type="number" min="0" value={form.default_expire_days} onChange={(e) => setForm({ ...form, default_expire_days: Number(e.target.value) })} /></Field>
@@ -1484,13 +1649,16 @@ function UserSettings({ toast, profile }: { toast: (s: string, k?: Toast['kind']
   );
 }
 
-function AdminPanel({ toast, permissions }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet }) {
+function adminTabs(t: (key: string) => string): Array<readonly [string, string]> {
+  return [['dashboard', t('admin.dashboard')], ['contents', t('admin.contents')], ['users', t('admin.users')], ['permissions', t('admin.permissions')], ['logs', t('admin.logs')], ['keys', t('admin.keys')], ['settings', t('admin.settings')]];
+}
+
+function AdminPanel({ toast, permissions, tab, onTab }: { toast: (s: string, k?: Toast['kind']) => void; permissions: PermissionSet; tab: string; onTab: (id: string) => void }) {
   const { t } = useI18n();
-  const [tab, setTab] = useState('dashboard');
-  const tabs = [['dashboard', t('admin.dashboard')], ['contents', t('admin.contents')], ['users', t('admin.users')], ['permissions', t('admin.permissions')], ['logs', t('admin.logs')], ['keys', t('admin.keys')], ['settings', t('admin.settings')]];
+  const tabs = adminTabs(t);
   return (
     <div className="stack">
-      <div className="tabs">{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
+      <div className="tabs">{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'on' : ''} onClick={() => onTab(id)}>{label}</button>)}</div>
       {tab === 'dashboard' && <AdminDashboard toast={toast} />}
       {tab === 'contents' && <AdminContents toast={toast} permissions={permissions} />}
       {tab === 'users' && <UserManagement toast={toast} />}
@@ -1724,6 +1892,7 @@ function permissionEnabled(group: PermissionGroup, key: AdminPermissionKey): boo
 }
 
 function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+  const feedback = useFeedback();
   const { t, language } = useI18n();
   const [items, setItems] = useState<AdminUserRow[]>([]);
   const [groups, setGroups] = useState<PermissionGroup[]>([]);
@@ -1762,12 +1931,11 @@ function UserManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => vo
     if (!selected) return;
     const groupId = selected.permission_group_id;
     try {
-      await api(`/api/admin/users/${encodeURIComponent(selected.username)}/group`, { method: 'PATCH', body: JSON.stringify({ group_id: groupId }) });
-      toast(language === 'en-US' ? 'Permission group assigned' : '权限组已分配');
+      await feedback.run({ title: t('fb.assigning'), successTitle: t('fb.assigned') }, () => api(`/api/admin/users/${encodeURIComponent(selected.username)}/group`, { method: 'PATCH', body: JSON.stringify({ group_id: groupId }) }));
       setSelected(null);
       await load();
-    } catch (err) {
-      toast((err as Error).message, 'error');
+    } catch {
+      // The run card already shows the error.
     }
   }
   return (
@@ -1829,6 +1997,8 @@ function draftFromGroup(group: PermissionGroup): PermissionDraft {
 }
 
 function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+  const feedback = useFeedback();
+  const undoDetail = useUndoDetail();
   const { t, language } = useI18n();
   const [groups, setGroups] = useState<PermissionGroup[]>([]);
   const [draft, setDraft] = useState<PermissionDraft | null>(null);
@@ -1857,25 +2027,25 @@ function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind'])
     if (quota === null) return toast(t('admin.invalidQuota'), 'error');
     const body = { name: draft.name.trim(), is_default: Boolean(draft.is_default), can_public_publish: Boolean(draft.can_public_publish), can_api: Boolean(draft.can_api), can_internal_access: Boolean(draft.can_internal_access), can_upload: Boolean(draft.can_upload), can_comment: Boolean(draft.can_comment), quota_bytes: quota };
     try {
-      await api(draft.id ? `/api/admin/permission-groups/${encodeURIComponent(draft.id)}` : '/api/admin/permission-groups', { method: draft.id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
-      toast(language === 'en-US' ? 'Permission group saved' : '权限组已保存');
+      await feedback.run({ title: t('fb.saving'), successTitle: t('fb.groupSaved') }, () => api(draft.id ? `/api/admin/permission-groups/${encodeURIComponent(draft.id)}` : '/api/admin/permission-groups', { method: draft.id ? 'PATCH' : 'POST', body: JSON.stringify(body) }));
       setDraft(null);
       await load();
-    } catch (err) {
-      toast((err as Error).message, 'error');
+    } catch {
+      // The run card already shows the error.
     }
   }
-  async function remove() {
+  function remove() {
     if (!deleteTarget || !replacementId) return;
-    try {
-      await api(`/api/admin/permission-groups/${encodeURIComponent(deleteTarget.id)}`, { method: 'DELETE', body: JSON.stringify({ replacement_group_id: replacementId }) });
-      toast(language === 'en-US' ? 'Permission group deleted' : '权限组已删除并完成重新分配');
-      setDeleteTarget(null);
-      setReplacementId('');
-      await load();
-    } catch (err) {
-      toast((err as Error).message, 'error');
-    }
+    const target = deleteTarget;
+    const replacement = replacementId;
+    feedback.confirmUndoable({
+      title: t('fb.groupDeleteTitle', { title: target.name }),
+      detail: undoDetail,
+      successTitle: t('fb.groupDeletedDone'),
+      commit: () => api(`/api/admin/permission-groups/${encodeURIComponent(target.id)}`, { method: 'DELETE', body: JSON.stringify({ replacement_group_id: replacement }) }),
+      onCommitted: () => { setReplacementId(''); void load(); },
+    });
+    setDeleteTarget(null);
   }
   return <section className="panel permission-management">
     <div className="panel-head"><div><h2>{t('admin.permissions')}</h2><p className="muted">{t('admin.permissionHint')}</p></div><button className="primary" onClick={() => setDraft(defaultPermissionDraft())}><Plus size={16} /> {t('admin.createGroup')}</button></div>
@@ -1898,11 +2068,13 @@ function PermissionManagement({ toast }: { toast: (s: string, k?: Toast['kind'])
       <Field label={t('admin.replacementGroup')}><select value={replacementId} onChange={(event) => setReplacementId(event.target.value)}>{groups.filter((group) => group.id !== deleteTarget.id).map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></Field>
       <div className="right"><button className="soft" onClick={() => setDeleteTarget(null)}>{t('common.cancel')}</button><button className="primary danger-fill" disabled={!replacementId} onClick={() => setDeleteConfirmation(true)}><Trash2 size={16} /> {t('admin.deleteGroup')}</button></div>
     </ModalShell>}
-    {deleteConfirmation && deleteTarget && <ConfirmModal open title={t('confirm.deleteGroupTitle')} message={t('confirm.deleteGroupMessage')} confirmLabel={t('admin.deleteGroup')} destructive onClose={() => setDeleteConfirmation(false)} onConfirm={async () => { setDeleteConfirmation(false); await remove(); setDeleteTarget(null); }} />}
+    {deleteConfirmation && deleteTarget && <ConfirmModal open title={t('confirm.deleteGroupTitle')} message={t('confirm.deleteGroupMessage')} confirmLabel={t('admin.deleteGroup')} destructive onClose={() => setDeleteConfirmation(false)} onConfirm={async () => { setDeleteConfirmation(false); remove(); }} />}
   </section>;
 }
 
 function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: string; title: string; kind: 'logs' | 'keys'; toast: (s: string, k?: Toast['kind']) => void }) {
+  const feedback = useFeedback();
+  const undoDetail = useUndoDetail();
   const { t, language } = useI18n();
   const [items, setItems] = useState<any[]>([]);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
@@ -1941,13 +2113,23 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
   };
   const showAction = kind === 'keys';
   async function executeKeyAction(row: any, action: 'rotate' | 'lock' | 'unlock' | 'revoke') {
+    const path = `/api/admin/api-keys/${encodeURIComponent(row.id)}/${action}`;
+    if (action === 'lock' || action === 'revoke') {
+      feedback.confirmUndoable({
+        title: t(action === 'lock' ? 'fb.lockTitle' : 'fb.revokeTitle', { title: row.remark || row.key_prefix || row.id }),
+        detail: undoDetail,
+        successTitle: t(action === 'lock' ? 'fb.lockedDone' : 'fb.revokedDone'),
+        commit: () => api<any>(path, { method: 'POST' }),
+        onCommitted: () => void load(),
+      });
+      return;
+    }
     try {
-      const result = await api<any>(`/api/admin/api-keys/${encodeURIComponent(row.id)}/${action}`, { method: 'POST' });
+      const result = await feedback.run({ title: t(action === 'rotate' ? 'fb.rotating' : 'fb.unlocking'), successTitle: t(action === 'rotate' ? 'fb.rotated' : 'fb.unlocked') }, () => api<any>(path, { method: 'POST' }));
       if (result.key) setNewKey(result.key);
-      toast(language === 'en-US' ? 'API key updated' : 'API Key 已更新');
       await load();
-    } catch (err) {
-      toast((err as Error).message, 'error');
+    } catch {
+      // The run card already shows the error.
     }
   }
   function keyAction(row: any, action: 'rotate' | 'lock' | 'unlock' | 'revoke') {
@@ -2009,6 +2191,8 @@ function ExpandableAdminTable({ endpoint, title, kind, toast }: { endpoint: stri
 }
 
 function AdminSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => void }) {
+  const feedback = useFeedback();
+  const undoDetail = useUndoDetail();
   const { t, language } = useI18n();
   const [item, setItem] = useState<any>(null);
   const [bg, setBg] = useState<any>(null);
@@ -2037,31 +2221,29 @@ function AdminSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => voi
     fd.append('file', file);
     fd.append('opacity', String(opacity));
     try {
-      const res = await api<{ item: any }>('/api/admin/background', { method: 'POST', body: fd });
+      const res = await feedback.run({ title: t('fb.uploadingBg'), successTitle: t('fb.bgUploaded') }, () => api<{ item: any }>('/api/admin/background', { method: 'POST', body: fd }));
       setBg(res.item);
       setFile(null);
-      toast(language === 'en-US' ? 'Background uploaded' : '背景图已上传');
-    } catch (err) {
-      toast((err as Error).message, 'error');
+    } catch {
+      // The run card already shows the error.
     }
   }
   async function saveOpacity(next = opacity) {
     try {
-      const res = await api<{ item: any }>('/api/admin/background', { method: 'PATCH', body: JSON.stringify({ opacity: next }) });
+      const res = await feedback.run({ title: t('fb.savingOpacity'), successTitle: t('fb.opacitySaved') }, () => api<{ item: any }>('/api/admin/background', { method: 'PATCH', body: JSON.stringify({ opacity: next }) }));
       setBg(res.item);
-      toast(language === 'en-US' ? 'Opacity saved' : '透明度已保存');
-    } catch (err) {
-      toast((err as Error).message, 'error');
+    } catch {
+      // The run card already shows the error.
     }
   }
-  async function clearBg() {
-    try {
-      await api('/api/admin/background', { method: 'DELETE' });
-      setBg(null);
-      toast(language === 'en-US' ? 'Background cleared' : '背景图已清除');
-    } catch (err) {
-      toast((err as Error).message, 'error');
-    }
+  function clearBg() {
+    feedback.confirmUndoable({
+      title: t('fb.clearBgTitle'),
+      detail: undoDetail,
+      successTitle: t('fb.bgClearedDone'),
+      commit: () => api('/api/admin/background', { method: 'DELETE' }),
+      onCommitted: () => setBg(null),
+    });
   }
   return (
     <div className="stack">
@@ -2085,7 +2267,7 @@ function AdminSettings({ toast }: { toast: (s: string, k?: Toast['kind']) => voi
         </div>
       </section>
       {(settingsLoading || backgroundLoading) && <QueryLoading />}
-      <ConfirmModal open={confirmClear} title={t('confirm.clearBackgroundTitle')} message={t('confirm.clearBackgroundMessage')} confirmLabel={t('admin.clear')} destructive onClose={() => setConfirmClear(false)} onConfirm={async () => { setConfirmClear(false); await clearBg(); }} />
+      <ConfirmModal open={confirmClear} title={t('confirm.clearBackgroundTitle')} message={t('confirm.clearBackgroundMessage')} confirmLabel={t('admin.clear')} destructive onClose={() => setConfirmClear(false)} onConfirm={() => { setConfirmClear(false); clearBg(); }} />
     </div>
   );
 }
@@ -2686,6 +2868,8 @@ function NoteItem({ note, mode, onReply, activeReply, clearReply, submit, canMan
 }
 
 function ShareNotesPanel({ item, password, adminPreview, toast }: { item: Content; password: string; adminPreview: boolean; toast: (s: string, k?: Toast['kind']) => void }) {
+  const feedback = useFeedback();
+  const undoDetail = useUndoDetail();
   const { t, language } = useI18n();
   const [notes, setNotes] = useState<ShareNote[]>([]);
   const [mode, setMode] = useState<'comment' | 'memo'>(item.visibility === 'private' ? 'memo' : 'comment');
@@ -2693,6 +2877,7 @@ function ShareNotesPanel({ item, password, adminPreview, toast }: { item: Conten
   const [error, setError] = useState('');
   const [replying, setReplying] = useState('');
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [pendingNoteIds, setPendingNoteIds] = useState<Set<string>>(() => new Set());
   const qs = () => {
     const params = new URLSearchParams();
     if (adminPreview) params.set('admin_preview', '1');
@@ -2717,23 +2902,36 @@ function ShareNotesPanel({ item, password, adminPreview, toast }: { item: Conten
       login();
       return;
     }
-    const res = await api<{ items: ShareNote[] }>(`/api/share/${item.slug}/notes${qs()}`, {
+    // Errors propagate to NoteComposer, which keeps the draft text.
+    const res = await feedback.run({ title: t(mode === 'memo' ? 'fb.memoSending' : 'fb.commentSending'), successTitle: t(mode === 'memo' ? 'fb.memoSaved' : 'fb.commentSent') }, () => api<{ items: ShareNote[] }>(`/api/share/${item.slug}/notes${qs()}`, {
       method: 'POST',
       headers: shareHeaders(password, item.share_ticket),
       body: JSON.stringify({ body, visibility, parent_id: parentId || null })
-    });
+    }));
     setNotes(res.items);
     setReplying('');
-    toast(mode === 'memo' ? (language === 'en-US' ? 'Memo saved' : '备忘已保存') : (language === 'en-US' ? 'Comment sent' : '评论已发送'));
   }
-  async function executeDeleteNote(noteId: string) {
-    const res = await api<{ items: ShareNote[] }>(`/api/share/${item.slug}/notes/${noteId}${qs()}`, { method: 'DELETE', headers: shareHeaders(password, item.share_ticket) });
-    setNotes(res.items);
-    toast(mode === 'memo' ? (language === 'en-US' ? 'Memo deleted' : '备忘已删除') : (language === 'en-US' ? 'Comment deleted' : '评论已删除'));
+  /** Hides the note at once; Undo restores it, and the DELETE runs only when the countdown ends. */
+  function executeDeleteNote(noteId: string) {
+    const removePending = () => setPendingNoteIds((prev) => { const next = new Set(prev); next.delete(noteId); return next; });
+    setPendingNoteIds((prev) => new Set(prev).add(noteId));
+    feedback.confirmUndoable({
+      title: t(mode === 'memo' ? 'fb.memoDeleteTitle' : 'fb.commentDeleteTitle'),
+      detail: undoDetail,
+      successTitle: t('fb.deletedTitle'),
+      commit: async () => {
+        const res = await api<{ items: ShareNote[] }>(`/api/share/${item.slug}/notes/${noteId}${qs()}`, { method: 'DELETE', headers: shareHeaders(password, item.share_ticket) });
+        setNotes(res.items);
+      },
+      onUndo: removePending,
+      onCommitted: removePending,
+      onError: removePending,
+    });
   }
   function deleteNote(noteId: string) {
     setPendingDelete(noteId);
   }
+  const visibleNotes = withoutPendingNotes(notes, pendingNoteIds);
   const canMemo = mode !== 'memo' || me?.username === item.owner_username;
   const canManageNotes = me?.username === item.owner_username;
   return (
@@ -2743,7 +2941,7 @@ function ShareNotesPanel({ item, password, adminPreview, toast }: { item: Conten
           <h2>{mode === 'memo' ? t('notes.memo') : t('notes.comments')}</h2>
           <p>{mode === 'memo' ? t('notes.memoHint') : t('notes.commentHint')}</p>
         </div>
-        <span>{notes.length}</span>
+        <span>{visibleNotes.length}</span>
       </div>
       {error && <div className="note-empty">{error}</div>}
       {mode === 'memo' && !canMemo ? (
@@ -2752,8 +2950,8 @@ function ShareNotesPanel({ item, password, adminPreview, toast }: { item: Conten
         <>
           <NoteComposer mode={mode} onSubmit={submit} disabled={mode === 'memo' && !canMemo} />
           <div className="notes-list">
-            {notes.map((note) => <NoteItem key={note.id} note={note} mode={mode} onReply={(target) => setReplying(target.id)} activeReply={replying} clearReply={() => setReplying('')} submit={submit} canManage={canManageNotes} onDelete={deleteNote} />)}
-            {!notes.length && !error && <div className="note-empty">{mode === 'memo' ? t('notes.emptyMemo') : t('notes.emptyComments')}</div>}
+            {visibleNotes.map((note) => <NoteItem key={note.id} note={note} mode={mode} onReply={(target) => setReplying(target.id)} activeReply={replying} clearReply={() => setReplying('')} submit={submit} canManage={canManageNotes} onDelete={deleteNote} />)}
+            {!visibleNotes.length && !error && <div className="note-empty">{mode === 'memo' ? t('notes.emptyMemo') : t('notes.emptyComments')}</div>}
           </div>
         </>
       )}
@@ -2938,7 +3136,19 @@ function FaceTransferPublicPage({ toast }: { toast: (text: string, kind?: 'ok' |
   );
 }
 
-function SsoCallbackLoading({ toasts }: { toasts: Toast[] }) {
+function AppBootLoading() {
+  return (
+    <div className="sso-loading-page" role="status" aria-live="polite">
+      <section className="sso-loading-card">
+        <div className="sso-loading-mark" aria-hidden="true"><BrandMark compact /></div>
+        <h1>ShareWorker</h1>
+        <div className="sso-loading-track" aria-hidden="true"><i /></div>
+      </section>
+    </div>
+  );
+}
+
+function SsoCallbackLoading() {
   const { t } = useI18n();
   return (
     <div className="sso-loading-page" role="status" aria-live="polite">
@@ -2949,68 +3159,116 @@ function SsoCallbackLoading({ toasts }: { toasts: Toast[] }) {
         <div className="sso-loading-track" aria-hidden="true"><i /></div>
         <div className="sso-loading-squares" aria-hidden="true"><i /><i /><i /><i /><i /></div>
       </section>
-      <Toasts items={toasts} />
     </div>
   );
 }
 
-function App() {
+function App({ onAuthed }: { onAuthed: (authed: boolean) => void }) {
   const { t } = useI18n();
-  const { toasts, push } = useToast();
+  const { toast } = useFeedback();
+  const { settings, update } = useTheme();
+  const route = useAppRoute();
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<AccessProfile | null>(null);
-  const [page, setPage] = useState('text');
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [landingBackground, setLandingBackground] = useState<any>(null);
-  const [dark, setDark] = useState(localStorage.getItem('theme') === 'dark');
-  useEffect(() => { document.documentElement.classList.toggle('dark', dark); localStorage.setItem('theme', dark ? 'dark' : 'light'); }, [dark]);
+  // Shows the loader instead of the landing page while a console URL is resolving or SSO is redirecting.
+  const [booting, setBooting] = useState(() => isAppPath(location.pathname) || (location.pathname === '/' && Boolean(token())));
+
   useEffect(() => {
-    if (location.pathname === '/sso-callback') {
-      const t = new URLSearchParams(location.search).get('token');
-      const returnTo = safeReturnTo(new URLSearchParams(location.search).get('return_to'), location.origin);
-      if (t) {
-        api<{ user: User; token: string }>('/api/sso-callback', { method: 'POST', body: JSON.stringify({ token: t }) })
+    const path = location.pathname;
+    if (path === '/sso-callback') {
+      const params = new URLSearchParams(location.search);
+      const ssoToken = params.get('token');
+      const safe = safeReturnTo(params.get('return_to'), location.origin);
+      const returnTo = safe === '/' ? '/app/text' : safe;
+      if (ssoToken) {
+        api<{ user: User; token: string }>('/api/sso-callback', { method: 'POST', body: JSON.stringify({ token: ssoToken }) })
           .then((r) => { localStorage.setItem('sso_token', r.token); location.href = returnTo; })
-          .catch((e) => push(e.message, 'error'));
+          .catch((e) => toast(e.message, 'error'));
       }
       return;
     }
-    if (location.pathname === '/') {
+    if (path === '/') {
       api<{ item: { landing_background?: any } }>('/api/public/settings').then((r) => setLandingBackground(r.item?.landing_background || null)).catch(() => {});
-      if (token()) api<{ user: User; group: string; permissions: PermissionSet; storage: AccessProfile['storage'] }>('/api/me').then(async (r) => {
+    }
+    if (path !== '/' && !isAppPath(path)) return;
+    if (token()) {
+      api<{ user: User; group: string; permissions: PermissionSet; storage: AccessProfile['storage'] }>('/api/me').then((r) => {
+        appSessionActive = true;
+        try { sessionStorage.removeItem(BOUNCE_KEY); } catch { /* storage blocked */ }
         setUser(r.user);
         setProfile({ group: r.group, permissions: r.permissions, storage: r.storage });
-      }).catch(() => setUser(null));
+        onAuthed(true);
+        if (location.pathname === '/') navigate({ page: 'text' }, { replace: true });
+        setBooting(false);
+      }).catch(() => {
+        // A rejected token was cleared by api(); console URLs then re-enter SSO silently.
+        if (isAppPath(location.pathname) && !token() && autoLogin()) return;
+        setBooting(false);
+      });
+    } else if (isAppPath(path)) {
+      if (!autoLogin()) setBooting(false);
     }
   }, []);
-  if (location.pathname.startsWith('/preview/')) return <><FilePreviewPage toast={push} /><Toasts items={toasts} /></>;
-  if (location.pathname.startsWith('/s/')) return <><ContentPreviewPage toast={push} /><Toasts items={toasts} /></>;
-  if (location.pathname === '/docs') return <><ApiDocsPage /><Toasts items={toasts} /></>;
-  if (location.pathname === '/face-transfer') return <><FaceTransferPublicPage toast={push} /><Toasts items={toasts} /></>;
-  if (location.pathname === '/sso-callback') return <SsoCallbackLoading toasts={toasts} />;
-  if (!user || !profile) return <><LandingPage background={landingBackground} /><Toasts items={toasts} /></>;
+
+  if (location.pathname.startsWith('/preview/')) return <FilePreviewPage toast={toast} />;
+  if (location.pathname.startsWith('/s/')) return <ContentPreviewPage toast={toast} />;
+  if (location.pathname === '/docs') return <ApiDocsPage />;
+  if (location.pathname === '/face-transfer') return <FaceTransferPublicPage toast={toast} />;
+  if (location.pathname === '/sso-callback') return <SsoCallbackLoading />;
+  if (!user || !profile) return booting ? <AppBootLoading /> : <LandingPage background={landingBackground} />;
+
   const permissions = profile.permissions || noPermissions;
-  const titleMap: Record<string, string> = { text: t('nav.publishText'), file: t('nav.publishFile'), face: t('nav.faceTransfer'), mine: t('nav.myContent'), keys: t('nav.apiKeys'), settings: t('nav.settings'), admin: t('nav.admin') };
+  const page = route.page;
+  const tabs = adminTabs(t);
+  const adminTabId = tabs.some(([id]) => id === route.sub) ? (route.sub as string) : 'dashboard';
+  const sectionLabel: Record<AppPage, string> = { text: t('nav.section.publish'), file: t('nav.section.publish'), face: t('nav.section.publish'), mine: t('nav.section.library'), keys: t('nav.section.developer'), settings: t('nav.section.account'), admin: t('nav.section.admin') };
+  const titleMap: Record<AppPage, string> = { text: t('nav.publishText'), file: t('nav.publishFile'), face: t('nav.faceTransfer'), mine: t('nav.myContent'), keys: t('nav.apiKeys'), settings: t('nav.settings'), admin: t('nav.admin') };
+  const adminSubtitle = page === 'admin' ? tabs.find(([id]) => id === adminTabId)?.[1] : undefined;
   return (
-    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
-      <Sidebar page={page} setPage={setPage} user={user} profile={profile} open={sidebarOpen} setOpen={setSidebarOpen} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} />
+    <div className={`app-shell ${settings.sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+      <Sidebar page={page} setPage={(next) => navigate({ page: next })} user={user} profile={profile} open={sidebarOpen} setOpen={setSidebarOpen} collapsed={settings.sidebarCollapsed} setCollapsed={(sidebarCollapsed) => update({ sidebarCollapsed })} />
       {sidebarOpen && <button type="button" className="sidebar-scrim" aria-label={t('nav.closeSidebar')} onClick={() => setSidebarOpen(false)} />}
       <main>
-        <Header title={titleMap[page]} onMenu={() => setSidebarOpen(true)} dark={dark} setDark={setDark} user={user} />
+        <Header section={sectionLabel[page]} title={titleMap[page]} subtitle={adminSubtitle} onMenu={() => setSidebarOpen(true)} user={user} />
         <div className="content">
-          {page === 'text' && <PublishText toast={push} permissions={permissions} />}
-          {page === 'file' && <PublishFile toast={push} username={user.username} permissions={permissions} />}
-          {page === 'face' && <FaceTransfer toast={push} />}
-          {page === 'mine' && <MyContents toast={push} permissions={permissions} />}
-          {page === 'keys' && <ApiKeys toast={push} />}
-          {page === 'settings' && <UserSettings toast={push} profile={profile} />}
-          {page === 'admin' && user.role === 'admin' && <AdminPanel toast={push} permissions={permissions} />}
+          {page === 'text' && <PublishText toast={toast} permissions={permissions} />}
+          {page === 'file' && <PublishFile toast={toast} username={user.username} permissions={permissions} />}
+          {page === 'face' && <FaceTransfer toast={toast} />}
+          {page === 'mine' && <MyContents toast={toast} permissions={permissions} />}
+          {page === 'keys' && <ApiKeys toast={toast} />}
+          {page === 'settings' && <><AppearanceSettings /><UserSettings toast={toast} profile={profile} /></>}
+          {page === 'admin' && user.role === 'admin' && <AdminPanel toast={toast} permissions={permissions} tab={adminTabId} onTab={(id) => navigate({ page: 'admin', sub: id })} />}
         </div>
       </main>
-      <Toasts items={toasts} />
     </div>
   );
 }
 
-createRoot(document.getElementById('root')!).render(<I18nProvider><App /></I18nProvider>);
+/** Feedback labels follow the active language; durations follow the account's appearance setting. */
+function FeedbackBridge({ children }: { children: React.ReactNode }) {
+  const { t } = useI18n();
+  const { settings } = useTheme();
+  const labels = useMemo<Partial<FeedbackLabels>>(() => ({
+    undo: t('feedback.undo'),
+    undone: t('feedback.undone'),
+    close: t('feedback.close'),
+    working: t('feedback.working'),
+    failed: t('feedback.failed'),
+  }), [t]);
+  return <FeedbackProvider durationMs={settings.feedbackDurationMs} labels={labels}>{children}</FeedbackProvider>;
+}
+
+function Root() {
+  const [authed, setAuthed] = useState(false);
+  return (
+    <ThemeProvider authed={authed}>
+      <FeedbackBridge>
+        <App onAuthed={setAuthed} />
+      </FeedbackBridge>
+    </ThemeProvider>
+  );
+}
+
+createRoot(document.getElementById('root')!).render(<I18nProvider><Root /></I18nProvider>);

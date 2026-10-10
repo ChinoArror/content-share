@@ -6,6 +6,7 @@ import { isUploadSessionReusable, isUploadSessionStale, UPLOAD_INACTIVITY_MS } f
 import { previewKind } from './preview-policy';
 import { ensureUserGroup, loadUserAccessProfile, reserveStorage } from './worker-permissions';
 import { PERMISSION_KEYS, PolicyError, type PermissionKey, type UserAccessProfile } from './permission-policy';
+import { mergeUiSettings, sanitizeUiSettings } from './ui-settings';
 
 type Env = {
   DB: D1Database;
@@ -501,8 +502,11 @@ async function verifySso(req: Request, env: Env, tokenOverride?: string): Promis
     verifyBody = {};
   }
   const source = verifyBody.user || verifyBody || {};
-  const username = String(source.username || payload.username || '').trim();
-  if (!username) throw new HttpError(403, 'auth-center token does not include username');
+  const uuid = String(source.uuid || source.sub || payload.uuid || payload.sub || '').trim();
+  const candidateUsername = String(source.username || payload.username || source.name || payload.name || '').trim() ||
+    (uuid ? `u_${uuid.slice(0, 12)}` : '');
+  if (!candidateUsername) throw new HttpError(403, 'auth-center token does not include username');
+  const username = await resolveInternalUsername(env.DB, candidateUsername, uuid);
   const roleRaw = String(source.role || payload.role || '').toLowerCase();
   const role: 'admin' | 'user' = roleRaw === 'admin' ? 'admin' : 'user';
   const avatarUrl = String(
@@ -521,11 +525,11 @@ async function verifySso(req: Request, env: Env, tokenOverride?: string): Promis
       ''
   ).trim();
   const user: User = {
-    id: String(source.uuid || payload.uuid || username),
-    uuid: String(source.uuid || payload.uuid || ''),
+    id: uuid || username,
+    uuid,
     user_id: Number(source.user_id || payload.user_id || 0) || undefined,
     username,
-    name: String(source.name || payload.name || username),
+    name: String(source.name || payload.name || candidateUsername),
     role,
     avatar_url: avatarUrl
   };
@@ -591,6 +595,31 @@ async function issueShareMediaCookie(env: Env, row: any, actor: string, adminPre
 
 function requireAdmin(user: User): void {
   if (user.role !== 'admin') throw new HttpError(403, 'Admin permission required');
+}
+
+async function loadUiSettingsRow(db: D1Database, username: string): Promise<{ stored: unknown; updated_at: string | null }> {
+  const row = await db.prepare('SELECT settings_json, updated_at FROM user_ui_settings WHERE username = ?1')
+    .bind(username)
+    .first<{ settings_json: string; updated_at: string }>();
+  let stored: unknown = {};
+  try {
+    stored = row?.settings_json ? JSON.parse(row.settings_json) : {};
+  } catch {
+    stored = {};
+  }
+  return { stored, updated_at: row?.updated_at ?? null };
+}
+
+// Users are keyed by auth-center uuid; usernames may be reused by a different account.
+// A known uuid keeps its existing internal username (stable across renames). A username
+// already held by another uuid gets a uuid suffix so the two accounts never merge.
+export async function resolveInternalUsername(db: D1Database, candidate: string, uuid: string): Promise<string> {
+  if (!uuid) return candidate;
+  const byUuid = await db.prepare('SELECT username, uuid FROM users WHERE uuid = ?1 LIMIT 1').bind(uuid).first<{ username: string; uuid: string | null }>();
+  if (byUuid?.username) return String(byUuid.username);
+  const byName = await db.prepare('SELECT uuid FROM users WHERE username = ?1 LIMIT 1').bind(candidate).first<{ uuid: string | null }>();
+  if (byName?.uuid && byName.uuid !== uuid) return `${candidate}#${uuid.slice(0, 8)}`;
+  return candidate;
 }
 
 async function upsertUser(db: D1Database, user: User): Promise<void> {
@@ -1742,6 +1771,28 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
         available_bytes: Math.max(0, profile.quota_bytes - profile.used_bytes - profile.reserved_bytes),
       },
     });
+  }
+
+  if (path === '/api/me/ui-settings' && method === 'GET') {
+    const user = await verifySso(req, env);
+    const row = await loadUiSettingsRow(env.DB, user.username);
+    return json({ ok: true, item: sanitizeUiSettings(row.stored), updated_at: row.updated_at });
+  }
+
+  if (path === '/api/me/ui-settings' && method === 'PUT') {
+    const user = await verifySso(req, env);
+    const body = await readJson<unknown>(req);
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new HttpError(400, 'UI settings body must be an object');
+    if (JSON.stringify(body).length > 4096) throw new HttpError(400, 'UI settings body is too large');
+    const row = await loadUiSettingsRow(env.DB, user.username);
+    const item = mergeUiSettings(row.stored, body);
+    const t = new Date().toISOString();
+    await env.DB.prepare(
+      'INSERT INTO user_ui_settings (username, settings_json, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(username) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at'
+    )
+      .bind(user.username, JSON.stringify(item), t)
+      .run();
+    return json({ ok: true, item, updated_at: t });
   }
 
   if (path === '/api/contents' && method === 'GET') {
