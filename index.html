@@ -6,6 +6,11 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="theme-color" content="#e45132" />
     <title>ShareWorker</title>
+    <script>
+      if (location.protocol === 'http:' && location.hostname === 'content.aryuki.cn') {
+        location.replace(`https://${location.host}${location.pathname}${location.search}${location.hash}`);
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

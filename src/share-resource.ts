@@ -11,3 +11,10 @@ export function classifyShareResourceError(status: number, code = ''): ShareReso
   }
   return 'unavailable';
 }
+
+export class ShareResourceRequestError extends Error {
+  constructor(public readonly failure: ShareResourceFailure) {
+    super('Share resource request failed');
+    this.name = 'ShareResourceRequestError';
+  }
+}

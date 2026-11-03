@@ -12,6 +12,7 @@ import qrBgMinimalUrl from './assets/qr-bg-minimal.png';
 import qrBgPunkUrl from './assets/qr-bg-punk.png';
 import apiDocsMarkdown from '../ApiDocs.md?raw';
 import { FaceTransfer } from './face-transfer';
+import { localOfficeFormat, OfficePreview } from './office-preview';
 import { BrowserUploadQueue, createFetchApiRequest, IndexedDbUploadPersistence, UploadRequestError, type UploadTask } from './upload-client';
 import { ExpiryDatePicker } from './expiry-date-picker';
 import { mimeTypeForArchivePath, previewKind, type PreviewKind } from './preview-policy';
@@ -34,8 +35,8 @@ import {
   withAllowedVisibility,
 } from './admin-display';
 import { classifyShareAccessError, type ShareAccessPresentation } from './share-access';
-import { classifyShareResourceError, shareResourceMode, type ShareResourceFailure } from './share-resource';
-import { buildSsoLoginUrl, safeReturnTo } from './sso-redirect';
+import { classifyShareResourceError, ShareResourceRequestError, shareResourceMode, type ShareResourceFailure } from './share-resource';
+import { accountsOriginForContent, buildSsoLoginUrl, safeReturnTo } from './sso-redirect';
 import { FeedbackProvider, useFeedback, type FeedbackLabels } from './app/feedback';
 import { AppearanceSettings } from './app/appearance-settings';
 import { Select, rangeFill } from './app/select';
@@ -143,7 +144,7 @@ type ShareNote = {
   replies?: ShareNote[];
 };
 
-const SSO_URL = 'https://accounts.aryuki.com';
+const SSO_URL = accountsOriginForContent(typeof location === 'undefined' ? '' : location.origin);
 const APP_ID = 'content-share';
 const BASE_URL = 'https://content.aryuki.com';
 const noPermissions: PermissionSet = {
@@ -224,13 +225,6 @@ function shareHeaders(password: string, shareTicket = ''): HeadersInit | undefin
   return [...headers.keys()].length ? headers : undefined;
 }
 
-class ShareResourceRequestError extends Error {
-  constructor(public readonly failure: ShareResourceFailure) {
-    super('Share resource request failed');
-    this.name = 'ShareResourceRequestError';
-  }
-}
-
 async function shareResourceFailure(response: Response): Promise<ShareResourceFailure> {
   let code = '';
   try {
@@ -248,8 +242,8 @@ async function fetchShareResourceBlob(url: string, password: string): Promise<Bl
   return response.blob();
 }
 
-// Same authorization path as the pdf.js fallback: password-protected shares use the blob fetch, others use cookies or media tickets.
-async function fetchPdfBytes(url: string, password: string, mediaTicket?: string | null): Promise<ArrayBuffer> {
+// Shared by the PDF and Office viewers (same authorization path as the pdf.js fallback): password-protected shares use the blob fetch, others use cookies or media tickets.
+async function fetchPreviewBytes(url: string, password: string, mediaTicket?: string | null): Promise<ArrayBuffer> {
   if (shareResourceMode(password, mediaTicket) === 'protected-blob') {
     return (await fetchShareResourceBlob(url, password)).arrayBuffer();
   }
@@ -942,21 +936,29 @@ function OptionsGrid({ form, setForm, permissions, showDownloadSetting = false }
   );
 }
 
-function UploadFloating({ state, onClose }: { state: UploadProgress; onClose: () => void }) {
+function UploadFloating({ state, tasks, onCancel, onClose }: { state: UploadProgress; tasks: UploadTask[]; onCancel: (id: string) => void; onClose: () => void }) {
   const { t, language } = useI18n();
+  const [expanded, setExpanded] = useState(false);
   if (!state.visible) return null;
+  const transferring = tasks.some((task) => task.status === 'uploading' && !task.awaitingActivation);
+  const busy = tasks.some((task) => task.status === 'uploading' || task.awaitingActivation);
   return (
-    <div className="upload-float">
+    <div className={`upload-float${expanded ? ' expanded' : ''}`}>
+      <button type="button" className="upload-float-orb" aria-expanded={expanded} aria-label={language === 'en-US' ? 'Show upload tasks' : '展开上传任务'} onClick={() => setExpanded((value) => !value)}><Upload size={22} /><span>{state.remaining}</span></button>
+      <div className="upload-float-panel">
       <div className="panel-head">
         <h2>{t('upload.queue')}</h2>
-        {(state.progress >= 100 || state.failed) && <button className="icon" onClick={onClose} aria-label={t('upload.closeStatus')}><X size={16} /></button>}
+        <button type="button" className="icon upload-float-collapse" onClick={() => setExpanded(false)} aria-label={language === 'en-US' ? 'Collapse upload tasks' : '收起上传任务'}><X size={16} /></button>
+        {(state.progress >= 100 || state.failed) && !busy && <button className="icon upload-float-dismiss" onClick={onClose} aria-label={t('upload.closeStatus')}><X size={16} /></button>}
       </div>
       <strong className="file-name" title={state.fileName}>{state.fileName}</strong>
       <span>{state.stage} · {t('upload.remaining', { count: state.remaining })}</span>
       <div className="progress"><i style={{ width: `${state.progress}%` }} /></div>
-      {(state.speed || state.eta) && (
-        <small>{state.speed ? `${fmtBytes(state.speed)}/s` : ''}{state.speed && state.eta ? ' · ' : ''}{state.eta ? `${language === 'en-US' ? 'ETA ' : '预计剩余 '}${fmtEta(state.eta)}` : ''}</small>
+      {(transferring || state.speed || state.eta) && (
+        <small>{state.speed ? `${fmtBytes(state.speed)}/s` : '— /s'} · {language === 'en-US' ? 'ETA ' : '预计剩余 '}{state.eta ? fmtEta(state.eta) : '—'}</small>
       )}
+      <div className="upload-float-tasks">{tasks.map((task) => <div className="upload-float-task" key={task.id}><span className="file-name" title={task.name}>{task.name}</span><small>{task.awaitingActivation && task.status !== 'failed' ? (language === 'en-US' ? 'confirming' : '确认中') : task.status}</small>{task.status !== 'complete' && task.status !== 'cancelling' && !task.awaitingActivation && <button type="button" className="soft" onClick={() => onCancel(task.id)}>{language === 'en-US' ? 'Cancel' : '取消'}</button>}</div>)}</div>
+      </div>
     </div>
   );
 }
@@ -1126,7 +1128,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
   const [uploadTasks, setUploadTasks] = useState<UploadTask[]>([]);
   const [progress, setProgress] = useState<UploadProgress>({ visible: false, stage: '', fileName: '', remaining: 0, progress: 0 });
   const queueRef = useRef<BrowserUploadQueue | null>(null);
-  const sampleRef = useRef({ at: Date.now(), loaded: 0, speed: 0 });
+  const sampleRef = useRef({ at: Date.now(), loaded: 0, speed: 0, lastProgressAt: Date.now() });
   async function load() {
     setLoading(true);
     try {
@@ -1148,26 +1150,34 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
   function syncUploadProgress(changed?: UploadTask) {
     const tasks = queueRef.current?.getTasks() || (changed ? [changed] : []);
     setUploadTasks(tasks);
-    if (!tasks.length) return;
+    if (!tasks.length) { setProgress({ visible: false, stage: '', fileName: '', remaining: 0, progress: 0 }); return; }
     const total = tasks.reduce((sum, task) => sum + task.size, 0);
     const loaded = tasks.reduce((sum, task) => sum + task.progress.loaded, 0);
     const at = Date.now();
+    if (loaded > sampleRef.current.loaded) sampleRef.current.lastProgressAt = at;
     const elapsed = (at - sampleRef.current.at) / 1000;
     let speed = sampleRef.current.speed;
     if (elapsed >= 0.35) {
       const instant = Math.max(0, loaded - sampleRef.current.loaded) / elapsed;
       speed = speed ? speed * 0.65 + instant * 0.35 : instant;
-      sampleRef.current = { at, loaded, speed };
+      sampleRef.current = { ...sampleRef.current, at, loaded, speed };
     }
     const remaining = tasks.filter((task) => task.status !== 'complete').length;
     const failed = tasks.some((task) => task.status === 'failed');
-    const current = changed || tasks.find((task) => task.status === 'uploading') || tasks[tasks.length - 1];
-    const stage = failed
+    const transferring = tasks.some((task) => task.status === 'uploading' && !task.awaitingActivation);
+    const stalled = transferring && at - sampleRef.current.lastProgressAt > 5000;
+    if (stalled) { speed = 0; sampleRef.current.speed = 0; }
+    const current = tasks.find((task) => task.status === 'uploading' && !task.awaitingActivation)
+      || tasks.find((task) => task.awaitingActivation)
+      || tasks.find((task) => task.status === 'failed')
+      || changed || tasks[tasks.length - 1];
+    const stage = current.status === 'failed'
       ? current.error || t('upload.failed')
+      : current.awaitingActivation && !transferring ? t('upload.confirming')
       : current.status === 'initiating'
         ? (language === 'en-US' ? 'Creating secure upload session' : '正在创建安全上传会话')
         : current.status === 'uploading'
-          ? current.mode === 'multipart' ? `${t('upload.inProgress')} ${current.completedParts.length + 1}` : `${t('upload.inProgress')} R2`
+          ? stalled ? t('upload.waitingResponse') : current.mode === 'multipart' ? `${t('upload.inProgress')} ${current.completedParts.length + 1}` : `${t('upload.inProgress')} R2`
           : current.status === 'complete' ? t('upload.complete') : t('upload.waiting');
     setProgress({
       visible: true,
@@ -1175,8 +1185,8 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
       fileName: current.name,
       remaining,
       progress: total ? Math.min(100, Math.round((loaded / total) * 100)) : 0,
-      speed,
-      eta: speed > 0 ? Math.max(0, total - loaded) / speed : undefined,
+      speed: transferring && !stalled && speed > 0 ? speed : undefined,
+      eta: transferring && !stalled && speed > 0 ? Math.max(0, current.size - current.progress.loaded) / speed : undefined,
       failed
     });
   }
@@ -1189,10 +1199,28 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
     });
   }
 
+  const hasActiveTransfer = uploadTasks.some((task) => task.status === 'uploading' && !task.awaitingActivation);
+  useEffect(() => {
+    if (!hasActiveTransfer) return;
+    const timer = window.setInterval(() => syncUploadProgress(), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveTransfer, language]);
+
   async function clearCompletedTasks() {
     const queue = queueRef.current!;
     for (const task of queue.getTasks().filter((item) => item.status === 'complete')) await queue.remove(task.id);
     setUploadTasks(queue.getTasks());
+  }
+
+  async function cancelUploadTask(id: string) {
+    try {
+      const cancelled = await queueRef.current!.cancel(id);
+      syncUploadProgress();
+      if (!cancelled) toast(language === 'en-US' ? 'This upload is already being finalized.' : '此上传已进入完成确认阶段');
+    } catch (error) {
+      toast((error as Error).message, 'error');
+      syncUploadProgress();
+    }
   }
 
   useEffect(() => {
@@ -1277,7 +1305,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
   async function upload() {
     if (!files.length) return toast(language === 'en-US' ? 'Choose at least one file' : '请选择至少一个文件', 'error');
     setBusy(true);
-    sampleRef.current = { at: Date.now(), loaded: 0, speed: 0 };
+    sampleRef.current = { at: Date.now(), loaded: 0, speed: 0, lastProgressAt: Date.now() };
     setProgress({ visible: true, stage: language === 'en-US' ? 'Preparing secure upload' : '准备安全直传', fileName: files[0].name, remaining: files.length, progress: 0 });
     const queue = queueRef.current!;
     let added: UploadTask[] = [];
@@ -1299,10 +1327,15 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
         toast(language === 'en-US' ? 'Direct upload credentials are unavailable; compatibility upload completed.' : '直传凭证尚未配置，已使用兼容模式完成上传');
       }
       const addedIds = new Set(added.map((task) => task.id));
+      if (!publishedUrl && !queue.getTasks().some((task) => addedIds.has(task.id))) return;
       const failed = queue.getTasks().filter((task) => addedIds.has(task.id) && task.status === 'failed');
       if (failed.length) {
         const first = failed[0];
         throw new UploadRequestError(0, first.error || t('upload.failed'), first.errorCode, first.errorDetails);
+      }
+      if (queue.getTasks().some((task) => addedIds.has(task.id) && task.status !== 'complete')) {
+        setProgress((previous) => ({ ...previous, visible: true, stage: t('upload.pending'), speed: undefined, eta: undefined }));
+        return;
       }
       if (!progress.visible || progress.progress < 100) {
         setProgress({ visible: true, stage: language === 'en-US' ? 'Transfer complete; Queue is confirming' : '传输完成，Queue 正在确认', fileName: files[files.length - 1].name, remaining: 0, progress: 100 });
@@ -1339,7 +1372,7 @@ function PublishFile({ toast, username, permissions }: { toast: (s: string, k?: 
         <button className="primary" onClick={upload} disabled={busy}><Upload size={16} /> {t('file.startUpload')}</button>
       </section>
       <ContentTable title={t('content.recentFiles')} items={recent} toast={toast} refresh={load} compact permissions={permissions} loading={loading} />
-      <UploadFloating state={progress} onClose={() => setProgress({ visible: false, stage: '', fileName: '', remaining: 0, progress: 0 })} />
+      <UploadFloating state={progress} tasks={uploadTasks} onCancel={(id) => void cancelUploadTask(id)} onClose={() => setProgress({ visible: false, stage: '', fileName: '', remaining: 0, progress: 0 })} />
     </div>
   );
 }
@@ -2768,6 +2801,18 @@ function ZipPagePreview({ info }: { info: PreviewInfo }) {
   );
 }
 
+function PreviewImage({ src, alt, embedded = false }: { src: string; alt: string; embedded?: boolean }) {
+  const { t } = useI18n();
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  return (
+    <div className={`image-viewer${embedded ? ' image-viewer-embedded' : ''}`}>
+      {status === 'loading' && <span role="status" aria-live="polite">{t('preview.loading')}</span>}
+      {status === 'error' && <span role="alert">{t('preview.resourceLoadFailed')}</span>}
+      <img src={src} alt={alt} className={embedded ? 'file-preview image-preview' : undefined} hidden={status !== 'ready'} onLoad={() => setStatus('ready')} onError={() => setStatus('error')} />
+    </div>
+  );
+}
+
 function PreviewCanvas({ info, password = '', onPasswordRequired, toast }: { info: PreviewInfo; password?: string; onPasswordRequired?: () => void; toast?: (s: string, k?: Toast['kind']) => void }) {
   const { t } = useI18n();
   const previewable = ['image', 'video', 'audio', 'pdf', 'html', 'text', 'zip'].includes(info.kind);
@@ -2780,7 +2825,7 @@ function PreviewCanvas({ info, password = '', onPasswordRequired, toast }: { inf
   const name = info.filename;
   return (
     <>
-      {info.kind === 'image' && <img src={src} alt={name} />}
+      {info.kind === 'image' && <PreviewImage key={src} src={src} alt={name} />}
       {info.kind === 'video' && <VideoPlayer src={src} />}
       {info.kind === 'audio' && <audio src={src} controls />}
       {info.kind === 'pdf' && (
@@ -2788,15 +2833,16 @@ function PreviewCanvas({ info, password = '', onPasswordRequired, toast }: { inf
           variant="embedded"
           fileName={name}
           allowDownload={downloadsAllowed(info)}
-          loadBuffer={() => fetchPdfBytes(info.preview_url, password, info.media_ticket)}
+          loadBuffer={() => fetchPreviewBytes(info.preview_url, password, info.media_ticket)}
           renderPdfJs={() => <PdfCanvasPreview info={{ ...info, preview_url: src }} password={password} onPasswordRequired={onPasswordRequired} />}
         />
       )}
       {info.kind === 'html' && <HtmlPageFrame title={name} sourceUrl={src} />}
       {info.kind === 'text' && <iframe sandbox="" src={src} title={name} />}
-      {info.kind === 'office' && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
+      {info.kind === 'office' && localOfficeFormat(name) && <OfficePreview filename={name} previewUrl={src} password={password} loadBuffer={() => fetchPreviewBytes(info.preview_url, password, info.media_ticket)} onPasswordRequired={onPasswordRequired} />}
+      {info.kind === 'office' && !localOfficeFormat(name) && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
       {info.kind === 'zip' && <ZipPagePreview info={{ ...info, preview_url: src }} />}
-      {info.kind === 'office' && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{downloadsAllowed(info) ? t('preview.downloadLocal') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
+      {info.kind === 'office' && !localOfficeFormat(name) && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{downloadsAllowed(info) ? t('preview.downloadLocal') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
       {info.kind === 'download' && <section className="panel narrow"><h1>{t('preview.unsupportedTitle')}</h1><p>{downloadsAllowed(info) ? t('preview.downloadLocal') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download} password={password} mediaTicket={info.media_ticket} filename={name} onPasswordRequired={onPasswordRequired}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
     </>
   );
@@ -2819,10 +2865,11 @@ function AttachmentPreview({ attachment, password, adminPreview, allowDownload, 
         {allowDownload && <DownloadButton url={download} className="soft download-btn attachment-download" password={password} mediaTicket={info.media_ticket} filename={attachment.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton>}
       </div>
       {previewable && (resource.loading || resource.failure) && <ShareResourceState loading={resource.loading} failure={resource.failure} onRetry={resource.retry} onPasswordRequired={onPasswordRequired} />}
-      {previewable && !resource.loading && !resource.failure && kind === 'image' && <img className="file-preview image-preview" src={preview} alt={attachment.filename} />}
+      {previewable && !resource.loading && !resource.failure && kind === 'image' && <PreviewImage key={preview} src={preview} alt={attachment.filename} embedded />}
       {previewable && !resource.loading && !resource.failure && kind === 'video' && <VideoPlayer className="file-preview" src={preview} />}
       {previewable && !resource.loading && !resource.failure && kind === 'audio' && <audio className="audio-preview" controls src={preview} />}
       {previewable && !resource.loading && !resource.failure && kind === 'text' && <iframe sandbox="" className="file-preview frame-preview" src={preview} title={attachment.filename} />}
+      {kind === 'office' && localOfficeFormat(attachment.filename) && <OfficePreview filename={attachment.filename} previewUrl={info.preview_url} password={password} loadBuffer={() => fetchPreviewBytes(info.preview_url, password, info.media_ticket)} onPasswordRequired={onPasswordRequired} />}
       {kind === 'download' && (
         <div className="preview-actions">
           <p className="muted">{allowDownload ? t('preview.downloadable') : t('preview.downloadDisabled')}</p>
@@ -2856,8 +2903,8 @@ function FilePreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) => v
         <LanguageSwitcher />
         {downloadsAllowed(info) && <DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton>}
       </header>
-      <main className={`preview-main ${info.kind === 'pdf' ? 'pdf-preview-main' : ''}`}>
-        {info.kind === 'image' && <img src={src} alt={name} />}
+      <main className={`preview-main ${info.kind === 'pdf' ? 'pdf-preview-main' : ''} ${info.kind === 'office' && localOfficeFormat(name) ? 'office-preview-main' : ''}`}>
+        {info.kind === 'image' && <PreviewImage key={src} src={src} alt={name} />}
         {info.kind === 'video' && <VideoPlayer src={src} />}
         {info.kind === 'audio' && <audio src={src} controls />}
         {info.kind === 'pdf' && (
@@ -2865,15 +2912,16 @@ function FilePreviewPage({ toast }: { toast: (s: string, k?: Toast['kind']) => v
             variant="page"
             fileName={name}
             allowDownload={downloadsAllowed(info)}
-            loadBuffer={() => fetchPdfBytes(info.preview_url, '', info.media_ticket)}
+            loadBuffer={() => fetchPreviewBytes(info.preview_url, '', info.media_ticket)}
             renderPdfJs={() => <PdfCanvasPreview info={info} />}
           />
         )}
         {info.kind === 'html' && <HtmlPageFrame title={name} sourceUrl={src} />}
         {info.kind === 'text' && <iframe sandbox="" src={src} title={name} />}
-        {info.kind === 'office' && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
+        {info.kind === 'office' && localOfficeFormat(name) && <OfficePreview filename={name} previewUrl={src} loadBuffer={() => fetchPreviewBytes(info.preview_url, '', info.media_ticket)} />}
+        {info.kind === 'office' && !localOfficeFormat(name) && info.office_embed_url && <iframe sandbox="allow-scripts allow-forms allow-same-origin allow-popups" referrerPolicy="no-referrer" src={info.office_embed_url} title={name} />}
         {info.kind === 'zip' && <ZipPagePreview info={info} />}
-        {info.kind === 'office' && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{downloadsAllowed(info) ? t('preview.downloadLocal') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
+        {info.kind === 'office' && !localOfficeFormat(name) && !info.office_embed_url && <section className="panel narrow"><h1>{t('preview.officeUnsupported')}</h1><p>{downloadsAllowed(info) ? t('preview.downloadLocal') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
         {info.kind === 'download' && <section className="panel narrow"><h1>{t('preview.unsupportedTitle')}</h1><p>{downloadsAllowed(info) ? t('preview.unsupported') : t('preview.downloadDisabled')}</p>{downloadsAllowed(info) && <DownloadButton url={download}><Download size={16} /> {t('common.download')}</DownloadButton>}</section>}
       </main>
     </div>
@@ -2889,6 +2937,7 @@ function SharePreviewPage({ item, password, adminPreview, onPasswordRequired, to
   useEffect(() => { setSelected(firstTarget); }, [item.id, firstTarget]);
   const selectedAttachment = attachments.find((a) => a.id === selected) || (!item.text_content ? attachments[0] : undefined);
   const showText = selected === 'text' || (!selectedAttachment && !!item.text_content);
+  const hasPicker = attachments.length + (item.text_content ? 1 : 0) > 1;
   const info = selectedAttachment ? { ...attachmentPreviewInfo(selectedAttachment, adminPreview), allow_download: downloadsAllowed(item) } : null;
   const backQs = new URLSearchParams();
   if (adminPreview) backQs.set('admin_preview', '1');
@@ -2896,15 +2945,18 @@ function SharePreviewPage({ item, password, adminPreview, onPasswordRequired, to
   const backUrl = `/s/${item.slug}${backQs.toString() ? `?${backQs}` : ''}`;
   return (
     <div className="preview-page share-preview-page">
-      <header className="preview-topbar share-preview-topbar">
+      <header className={`preview-topbar share-preview-topbar${hasPicker ? ' has-picker' : ''}`}>
         <a className="soft back-link" href={backUrl} aria-label={language === 'en-US' ? 'Back' : '返回'}><ArrowLeft size={18} /><span>{language === 'en-US' ? 'Back' : '返回'}</span></a>
         <div className="preview-title">
           <strong className="file-name">{showText ? item.title : info?.filename}</strong>
           <span>{item.visibility} / {item.type} / {fmtBytes(info?.size || item.file_size)}</span>
         </div>
         <LanguageSwitcher />
-        {(attachments.length + (item.text_content ? 1 : 0)) > 1 && (
+        {hasPicker && (
           <Select
+            className="preview-file-picker"
+            menuWidth="content"
+            ariaLabel={language === 'en-US' ? 'Choose preview file' : '选择预览文件'}
             value={showText ? 'text' : selectedAttachment?.id || ''}
             onChange={(next) => setSelected(next)}
             options={[
@@ -2915,10 +2967,10 @@ function SharePreviewPage({ item, password, adminPreview, onPasswordRequired, to
         )}
         {info ? (downloadsAllowed(item) && <DownloadButton className="primary preview-download" url={info.download_url} password={password} mediaTicket={info.media_ticket} filename={info.filename} onPasswordRequired={onPasswordRequired} onResourceError={(failure) => { if (failure !== 'password') toast(t('preview.resourceLoadFailed'), 'error'); }}><Download size={16} /> {t('common.download')}</DownloadButton>) : <button className="soft preview-copy-action" onClick={() => navigator.clipboard.writeText(location.href).then(() => toast(t('common.copied')))}>{t('common.copy')}</button>}
       </header>
-      <main className={`preview-main ${showText ? 'text-preview-main' : ''} ${info?.kind === 'pdf' ? 'pdf-preview-main' : ''}`}>
+      <main className={`preview-main ${showText ? 'text-preview-main' : ''} ${info?.kind === 'pdf' ? 'pdf-preview-main' : ''} ${info && info.kind === 'office' && localOfficeFormat(info.filename) ? 'office-preview-main' : ''}`}>
         {showText ? (
           <TextPreviewBox html={renderTextHtml(item.format, item.text_content || '')} rawText={item.text_content || ''} />
-        ) : info ? <PreviewCanvas info={info} password={password} onPasswordRequired={onPasswordRequired} toast={toast} /> : <section className="panel narrow">{t('preview.noPreview')}</section>}
+        ) : info ? <PreviewCanvas key={selectedAttachment?.id} info={info} password={password} onPasswordRequired={onPasswordRequired} toast={toast} /> : <section className="panel narrow">{t('preview.noPreview')}</section>}
       </main>
     </div>
   );

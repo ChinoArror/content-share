@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { buildSsoLoginUrl, currentReturnTo, safeReturnTo } from './sso-redirect';
+import { accountsOriginForContent, buildSsoLoginUrl, currentReturnTo, safeReturnTo } from './sso-redirect';
 
 describe('SSO return paths', () => {
+  it('uses the matching Accounts domain for the exact content .cn origin', () => {
+    expect(accountsOriginForContent('https://content.aryuki.cn')).toBe('https://accounts.aryuki.cn');
+    expect(accountsOriginForContent('https://content.aryuki.com')).toBe('https://accounts.aryuki.com');
+    expect(accountsOriginForContent('https://content.aryuki.cn.evil.test')).toBe('https://accounts.aryuki.com');
+  });
   it('preserves the current same-origin pathname, query, and hash', () => {
     expect(currentReturnTo({ pathname: '/s/abc', search: '?file=1', hash: '#comments' })).toBe('/s/abc?file=1#comments');
   });

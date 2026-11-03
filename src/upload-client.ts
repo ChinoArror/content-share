@@ -2,7 +2,7 @@ import { buildUploadFingerprint } from './upload-resume';
 import { MAX_UPLOAD_SIZE } from './transfer-policy';
 
 export type UploadMode = 'single' | 'multipart';
-export type UploadTaskStatus = 'queued' | 'initiating' | 'uploading' | 'paused' | 'complete' | 'failed';
+export type UploadTaskStatus = 'queued' | 'initiating' | 'uploading' | 'paused' | 'complete' | 'failed' | 'cancelling';
 const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 
 export interface UploadPartPlan {
@@ -16,6 +16,7 @@ export interface UploadPartPlan {
 
 export interface UploadPlan {
   client_id: string;
+  content_id?: string;
   session_id: string;
   attachment_id: string;
   mode: UploadMode;
@@ -31,7 +32,7 @@ export interface UploadPlan {
 }
 
 export interface ApiRequestOptions {
-  method: 'GET' | 'POST';
+  method: 'GET' | 'POST' | 'DELETE';
   path: string;
   body?: unknown;
 }
@@ -44,6 +45,7 @@ export interface XhrLike {
   onload: ((event: ProgressEvent<EventTarget>) => void) | null;
   onerror: ((event: ProgressEvent<EventTarget>) => void) | null;
   ontimeout: ((event: ProgressEvent<EventTarget>) => void) | null;
+  onabort?: ((event: ProgressEvent<EventTarget>) => void) | null;
   upload: {
     onprogress: ((event: ProgressEvent<EventTarget>) => void) | null;
   };
@@ -70,6 +72,7 @@ export interface UploadProgress {
 export interface UploadTask {
   id: string;
   clientId: string;
+  contentId?: string;
   name: string;
   type: string;
   size: number;
@@ -127,11 +130,13 @@ interface TaskState extends UploadTask {
 }
 
 interface InitiateResponse {
+  content_id?: string;
   files?: UploadPlan[];
   plans?: UploadPlan[];
 }
 
 interface UploadStatusResponse {
+  content_id?: string;
   status?: string;
   session_status?: string;
   content_status?: string;
@@ -254,6 +259,9 @@ export function createFetchApiRequest(fetcher: typeof fetch = fetch): ApiRequest
 
 export class BrowserUploadQueue {
   private readonly tasks = new Map<string, TaskState>();
+  private readonly metadataOnlyTasks = new Set<string>();
+  private readonly cancelling = new Set<string>();
+  private readonly activeXhrs = new Map<string, Set<XhrLike>>();
   private readonly api: ApiRequest;
   private readonly xhrFactory: XhrFactory;
   private readonly persistence: UploadPersistence;
@@ -328,6 +336,7 @@ export class BrowserUploadQueue {
             path: `/api/uploads/${encodeURIComponent(task.sessionId)}/status`
           });
           const status = unwrapItem(statusResponse);
+          if (status.content_id) task.contentId = status.content_id;
           if (Array.isArray(status.parts)) {
             task.completedParts = normalizeCompletedParts([...task.completedParts, ...status.parts]);
             this.updateProgress(task);
@@ -377,6 +386,38 @@ export class BrowserUploadQueue {
     await this.persistence.remove(taskId);
   }
 
+  async cancel(taskId: string): Promise<boolean> {
+    const task = this.requireTask(taskId);
+    if (task.status === 'complete' || task.awaitingActivation) return false;
+    const previousStatus = task.status;
+    this.cancelling.add(taskId);
+    task.status = 'cancelling';
+    this.notify(task);
+    for (const xhr of this.activeXhrs.get(taskId) ?? []) xhr.abort();
+    try {
+      await this.runPromise?.catch(() => undefined);
+      if ((task.status as UploadTaskStatus) === 'complete' || task.awaitingActivation) {
+        if ((task.status as UploadTaskStatus) !== 'complete') { task.status = 'paused'; await this.persist(task); this.notify(task); }
+        return false;
+      }
+      if (task.sessionId) await this.api({ method: 'DELETE', path: `/api/uploads/${encodeURIComponent(task.sessionId)}` });
+      await this.remove(taskId);
+      return true;
+    } catch (error) {
+      task.status = previousStatus === 'uploading' || previousStatus === 'initiating' ? 'paused' : previousStatus;
+      await this.persist(task);
+      this.notify(task);
+      throw error;
+    } finally {
+      this.cancelling.delete(taskId);
+      this.activeXhrs.delete(taskId);
+    }
+  }
+
+  private assertNotCancelling(task: TaskState): void {
+    if (this.cancelling.has(task.id)) throw new Error('Upload cancelled');
+  }
+
   async run(): Promise<void> {
     if (!this.runPromise) {
       this.runPromise = this.runInternal().finally(() => {
@@ -389,12 +430,44 @@ export class BrowserUploadQueue {
   private async runInternal(): Promise<void> {
     await this.initiateQueuedTasks();
     const runnable = [...this.tasks.values()].filter((task) =>
-      (task.awaitingActivation || task.file) && !task.needsFileReselection && task.status !== 'complete'
+      (task.awaitingActivation || task.file) && !this.cancelling.has(task.id) && !task.needsFileReselection && task.status !== 'complete'
     );
     await runWithConcurrency(runnable, this.maxConcurrentFiles, async (task) => {
       try {
+        this.assertNotCancelling(task);
         await this.uploadTask(task);
       } catch (error) {
+        if (this.cancelling.has(task.id)) return;
+        if (await this.reconcileCompletedSession(task)) return;
+        task.status = 'failed';
+        assignTaskError(task, error);
+        await this.persist(task);
+        this.notify(task);
+      }
+    });
+    // Content becomes active only after every attachment has been uploaded.
+    // Waiting inside the transfer pool would hold its slots and starve later files.
+    if (this.cancelling.size) return;
+    const blocked = [...this.tasks.values()].filter((task) => task.status === 'failed'
+      || (task.needsFileReselection && !task.awaitingActivation));
+    const failedGroups = new Set(blocked.map((task) => task.contentId).filter((id): id is string => Boolean(id)));
+    const failedWithoutGroup = blocked.some((task) => !task.contentId);
+    const awaiting = [...this.tasks.values()].filter((task) => task.awaitingActivation && task.status !== 'complete'
+      && (task.contentId ? !failedGroups.has(task.contentId) : !failedWithoutGroup));
+    await runWithConcurrency(awaiting, this.maxConcurrentFiles, async (task) => {
+      try {
+        task.status = 'uploading';
+        await this.persist(task);
+        this.notify(task);
+        await this.waitForServerCompletion(task);
+        task.awaitingActivation = false;
+        task.status = 'complete';
+        task.needsFileReselection = false;
+        task.plan = undefined;
+        await this.persist(task);
+        this.notify(task);
+      } catch (error) {
+        if (this.cancelling.has(task.id)) return;
         task.status = 'failed';
         assignTaskError(task, error);
         await this.persist(task);
@@ -435,12 +508,15 @@ export class BrowserUploadQueue {
           throw new Error(`Upload plan missing for ${task.name}`);
         }
         this.assignPlan(task, plan);
+        if (!Array.isArray(response) && response.content_id) task.contentId = response.content_id;
+        if (this.cancelling.has(task.id)) continue;
         task.status = 'paused';
         await this.persist(task);
         this.notify(task);
       }
     } catch (error) {
       for (const task of queued) {
+        if (this.cancelling.has(task.id)) continue;
         task.status = 'failed';
         assignTaskError(task, error);
         await this.persist(task);
@@ -451,24 +527,19 @@ export class BrowserUploadQueue {
   }
 
   private async uploadTask(task: TaskState): Promise<void> {
+    this.assertNotCancelling(task);
     if (task.awaitingActivation) {
-      task.status = 'uploading';
+      task.status = 'paused';
       task.error = undefined;
       task.errorCode = undefined;
       task.errorDetails = undefined;
-      await this.persist(task);
-      this.notify(task);
-      await this.waitForServerCompletion(task);
-      task.awaitingActivation = false;
-      task.status = 'complete';
-      task.needsFileReselection = false;
-      task.plan = undefined;
       await this.persist(task);
       this.notify(task);
       return;
     }
     if (!task.file) throw new Error('File must be selected before upload can resume');
     if (!task.plan) await this.renewPlan(task);
+    this.assertNotCancelling(task);
     task.status = 'uploading';
     task.error = undefined;
     task.errorCode = undefined;
@@ -477,20 +548,15 @@ export class BrowserUploadQueue {
     this.notify(task);
     if (task.mode === 'single') {
       const etag = await this.uploadWithRetry(task, task.file, undefined);
+      this.assertNotCancelling(task);
       task.progress = { loaded: task.size, total: task.size };
       await this.complete(task, etag ? [] : []);
     } else {
       await this.uploadMultipart(task);
+      this.assertNotCancelling(task);
       await this.complete(task, task.completedParts);
     }
     task.awaitingActivation = true;
-    await this.persist(task);
-    this.notify(task);
-    await this.waitForServerCompletion(task);
-    task.awaitingActivation = false;
-    task.status = 'complete';
-    task.needsFileReselection = false;
-    task.plan = undefined;
     await this.persist(task);
     this.notify(task);
   }
@@ -503,10 +569,12 @@ export class BrowserUploadQueue {
       const pending = (window.parts ?? []).filter((part) => !completed.has(part.part_number));
       const windowAfter = partWindowStart(window);
       await runWithConcurrency(pending, this.maxConcurrentParts, async (part) => {
+        this.assertNotCancelling(task);
         const file = task.file;
         if (!file) throw new Error('File must be selected before upload can resume');
         const body = file.slice(part.start, part.end, file.type);
         const etag = await this.uploadWithRetry(task, body, part.part_number, windowAfter);
+        this.assertNotCancelling(task);
         if (!etag) throw new Error(`Multipart upload did not return an ETag for part ${part.part_number}`);
         const completedPart = { part_number: part.part_number, etag, size: part.size };
         await this.api({
@@ -530,6 +598,7 @@ export class BrowserUploadQueue {
     let retryCount = 0;
     let renewed = false;
     while (true) {
+      this.assertNotCancelling(task);
       const destination = this.destinationFor(task, partNumber);
       try {
         return await this.sendXhr(task, body, partNumber, destination.url, destination.headers);
@@ -557,6 +626,10 @@ export class BrowserUploadQueue {
   ): Promise<string | null> {
     return new Promise((resolve, reject) => {
       const xhr = this.xhrFactory();
+      const active = this.activeXhrs.get(task.id) ?? new Set<XhrLike>();
+      active.add(xhr);
+      this.activeXhrs.set(task.id, active);
+      const done = () => { active.delete(xhr); if (!active.size) this.activeXhrs.delete(task.id); };
       xhr.open('PUT', url, true);
       for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
       xhr.upload.onprogress = (event) => {
@@ -571,14 +644,17 @@ export class BrowserUploadQueue {
         this.notify(task);
       };
       xhr.onload = () => {
+        done();
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve(cleanEtag(xhr.getResponseHeader('etag')));
         } else {
           reject(new UploadRequestError(xhr.status, `Upload request failed with ${xhr.status}`));
         }
       };
-      xhr.onerror = () => reject(new UploadRequestError(0, 'Network error while uploading'));
-      xhr.ontimeout = () => reject(new UploadRequestError(0, 'Upload request timed out'));
+      xhr.onerror = () => { done(); reject(new UploadRequestError(0, 'Network error while uploading')); };
+      xhr.ontimeout = () => { done(); reject(new UploadRequestError(0, 'Upload request timed out')); };
+      xhr.onabort = () => { done(); reject(new Error('Upload cancelled')); };
+      if (this.cancelling.has(task.id)) { xhr.abort(); return; }
       xhr.send(body);
     });
   }
@@ -598,11 +674,13 @@ export class BrowserUploadQueue {
   private async waitForServerCompletion(task: TaskState): Promise<void> {
     if (!task.sessionId) throw new Error('Upload session is missing');
     for (let attempt = 0; attempt < 60; attempt += 1) {
+      this.assertNotCancelling(task);
       const response = await this.api<UploadStatusResponse | { item: UploadStatusResponse }>({
         method: 'GET',
         path: `/api/uploads/${encodeURIComponent(task.sessionId)}/status`
       });
       const status = unwrapItem(response);
+      if (status.content_id) task.contentId = status.content_id;
       if (contentIsActive(status)) return;
       const terminalStatus = [status.session_status, status.status, status.content_status]
         .find((candidate) => candidate === 'failed' || candidate === 'cancelled' || candidate === 'expired');
@@ -612,6 +690,29 @@ export class BrowserUploadQueue {
       await this.sleep(1000);
     }
     throw new Error('Upload validation timed out; the task was kept for recovery');
+  }
+
+  private async reconcileCompletedSession(task: TaskState): Promise<boolean> {
+    if (!task.sessionId) return false;
+    try {
+      const response = await this.api<UploadStatusResponse | { item: UploadStatusResponse }>({
+        method: 'GET', path: `/api/uploads/${encodeURIComponent(task.sessionId)}/status`
+      });
+      const status = unwrapItem(response);
+      if (status.content_id) task.contentId = status.content_id;
+      if (!sessionIsFinalized(status) && !contentIsActive(status)) return false;
+      task.progress = { loaded: task.size, total: task.size };
+      task.awaitingActivation = true;
+      task.status = 'paused';
+      task.error = undefined;
+      task.errorCode = undefined;
+      task.errorDetails = undefined;
+      await this.persist(task);
+      this.notify(task);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async fetchPartWindow(task: TaskState, after: number): Promise<UploadPlan> {
@@ -650,6 +751,7 @@ export class BrowserUploadQueue {
 
   private assignPlan(task: TaskState, plan: UploadPlan): void {
     validatePlan(plan, task.size);
+    if (plan.content_id) task.contentId = plan.content_id;
     task.sessionId = plan.session_id;
     task.attachmentId = plan.attachment_id;
     task.mode = plan.mode;
@@ -686,6 +788,7 @@ export class BrowserUploadQueue {
     const record: Record<string, unknown> = {
       id: task.id,
       client_id: task.clientId,
+      content_id: task.contentId,
       name: task.name,
       type: task.type,
       size: task.size,
@@ -704,8 +807,16 @@ export class BrowserUploadQueue {
       metadata: task.metadata,
       updated_at: this.clock()
     };
-    if (task.file && task.status !== 'complete') record.file_blob = task.file;
-    await this.persistence.save(record);
+    if (task.file && task.status !== 'complete' && !this.metadataOnlyTasks.has(task.id)) record.file_blob = task.file;
+    try {
+      await this.persistence.save(record);
+    } catch (error) {
+      const message = typeof error === 'object' && error !== null && 'message' in error ? String(error.message) : '';
+      if (!record.file_blob || !/Error preparing Blob\/File data to be stored in object store/i.test(message)) throw error;
+      delete record.file_blob;
+      await this.persistence.save(record);
+      this.metadataOnlyTasks.add(task.id);
+    }
   }
 
   private snapshot(task: TaskState): UploadTask {
@@ -786,6 +897,7 @@ function deserializeTask(record: Record<string, unknown>): TaskState | null {
   return {
     id: record.id,
     clientId: record.client_id,
+    contentId: typeof record.content_id === 'string' ? record.content_id : undefined,
     name: record.name,
     type: record.type,
     size: record.size,
@@ -863,7 +975,10 @@ function runWithConcurrency<T>(items: readonly T[], limit: number, work: (item: 
       await work(item);
     }
   });
-  return Promise.all(workers).then(() => undefined);
+  return Promise.allSettled(workers).then((results) => {
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failure) throw failure.reason;
+  });
 }
 
 function isTransientStatus(status: number): boolean {

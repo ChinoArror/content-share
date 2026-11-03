@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@raptorqr/core": "^0.1.1",
+    "@silurus/ooxml": "0.89.7",
     "aws4fetch": "^1.0.20",
     "dompurify": "^3.4.13",
     "fflate": "^0.8.3",

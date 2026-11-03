@@ -459,6 +459,57 @@ describe('route-level business permissions', () => {
     await expect(errorBody(download)).resolves.toMatchObject({ code: 'DOWNLOAD_DISABLED' });
   });
 
+  it('streams an internal Office preview while download is disabled', async () => {
+    const db = testDb({
+      content: contentRow({ type: 'file', visibility: 'internal', allow_download: 0 }),
+      attachment: attachmentRow({ filename: 'report.docx', content_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
+    });
+    const testEnv = env(db);
+    const bytes = new Uint8Array([80, 75, 3, 4]);
+    vi.mocked(testEnv.BUCKET.get).mockResolvedValue({
+      body: new Blob([bytes]).stream(),
+      size: bytes.length,
+      httpEtag: 'test-etag',
+      writeHttpMetadata: () => {},
+    } as unknown as R2ObjectBody);
+    const ctx = { waitUntil() {} } as unknown as ExecutionContext;
+    const metadata = await worker.fetch(request('/api/attachments/att_1/preview-info'), testEnv, ctx);
+    expect(metadata.status).toBe(200);
+    await expect(metadata.json()).resolves.toMatchObject({ item: { kind: 'office', allow_download: false } });
+    const preview = await worker.fetch(request('/api/attachments/att_1/preview'), testEnv, ctx);
+    expect(preview.status).toBe(200);
+    expect(new Uint8Array(await preview.arrayBuffer())).toEqual(bytes);
+    const download = await worker.fetch(request('/api/attachments/att_1/download'), testEnv, ctx);
+    expect(download.status).toBe(403);
+    await expect(errorBody(download)).resolves.toMatchObject({ code: 'DOWNLOAD_DISABLED' });
+  });
+
+  it('streams an internal PDF preview while download is disabled', async () => {
+    const db = testDb({
+      content: contentRow({ type: 'file', visibility: 'internal', allow_download: 0 }),
+      attachment: attachmentRow({ filename: 'report.pdf', content_type: 'application/pdf' }),
+    });
+    const testEnv = env(db);
+    const bytes = new Uint8Array([37, 80, 68, 70, 45]);
+    vi.mocked(testEnv.BUCKET.get).mockResolvedValue({
+      body: new Blob([bytes]).stream(),
+      size: bytes.length,
+      httpEtag: 'test-etag',
+      writeHttpMetadata: () => {},
+    } as unknown as R2ObjectBody);
+    const ctx = { waitUntil() {} } as unknown as ExecutionContext;
+    const metadata = await worker.fetch(request('/api/attachments/att_1/preview-info'), testEnv, ctx);
+    expect(metadata.status).toBe(200);
+    await expect(metadata.json()).resolves.toMatchObject({ item: { kind: 'pdf', allow_download: false } });
+    const preview = await worker.fetch(request('/api/attachments/att_1/preview'), testEnv, ctx);
+    expect(preview.status).toBe(200);
+    expect(preview.headers.get('content-disposition')).toMatch(/^inline;/);
+    expect(new Uint8Array(await preview.arrayBuffer())).toEqual(bytes);
+    const download = await worker.fetch(request('/api/attachments/att_1/download'), testEnv, ctx);
+    expect(download.status).toBe(403);
+    await expect(errorBody(download)).resolves.toMatchObject({ code: 'DOWNLOAD_DISABLED' });
+  });
+
   it('persists the owner download setting through content edits', async () => {
     const db = testDb({ content: contentRow({ type: 'file' }) });
     const response = await invoke(db, '/api/contents/cnt_1', {

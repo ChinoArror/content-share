@@ -1,5 +1,9 @@
 type LocationParts = Pick<Location, 'pathname' | 'search' | 'hash'>;
 
+export function accountsOriginForContent(origin: string): string {
+  return origin === 'https://content.aryuki.cn' ? 'https://accounts.aryuki.cn' : 'https://accounts.aryuki.com';
+}
+
 export function currentReturnTo(locationParts: LocationParts): string {
   const pathname = locationParts.pathname.startsWith('/') ? locationParts.pathname : '/';
   return `${pathname}${locationParts.search || ''}${locationParts.hash || ''}`;

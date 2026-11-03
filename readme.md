@@ -2,6 +2,10 @@
 
 # Content Share
 
+Safari may reject storing a selected File in IndexedDB with an error while preparing Blob/File data. The upload queue retries that specific failure with a metadata-only checkpoint while retaining the selected file in memory. If the page is reloaded before completion, select the original file again to resume. Storage quota and other persistence errors still surface to the user. Upload tasks can be cancelled before server finalization: the browser aborts active transfers, then the Worker cancels the upload session and removes its R2 object. Completed and finalizing uploads cannot be cancelled. On mobile, the upload queue starts as a bottom-right floating button that expands into the task list; reduced-motion settings disable its animation.
+
+The app also supports `content.aryuki.cn` through ESA and the signed `proxy-router` Worker. See [ESA proxy setup](docs/esa-cn-proxy.md).
+
 Content Share is a Cloudflare Workers based content publishing and file sharing app for `content.aryuki.com`. The frontend is served by Workers Assets, the backend runs in the same Worker, structured data is stored in Cloudflare D1, files are stored only in Cloudflare R2, and upload activation is coordinated through Cloudflare Queues.
 
 ## Features
@@ -17,6 +21,7 @@ Content Share is a Cloudflare Workers based content publishing and file sharing 
 - Online preview for common file types: images, audio, video, text, PDF through PDF.js, Office documents through Office web embedding when public, and direct HTML pages in a sandboxed iframe with source-code and fullscreen controls.
 - ZIP archives remain download-first. On the preview page, viewers can explicitly try to open an archive's `index.html` or another HTML entry; archive-relative assets are temporarily mapped to Blob URLs and archives without a usable page show a clear download message.
 - Browser uploads use short-lived, object-scoped R2 URLs: files through 16 MiB use one PUT, 16 MiB to 100 MiB files use 8 MiB parts, and larger files up to 5 GiB use 64 MiB parts with IndexedDB queue persistence and real byte progress.
+- A multi-file upload transfers every file before waiting for the shared content record to become active. Previously, the first two completed transfers occupied both browser transfer slots while waiting for activation that required the remaining files; the browser then reported validation timeouts even though R2 and the Worker eventually completed the files. A lost R2 response is reconciled against the session status before marking a task failed. During server confirmation, the queue shows a confirmation stage and hides transfer speed and ETA instead of leaving stale estimates on screen. Multipart sizing and server-side access checks are unchanged.
 - Resumable uploads use a SHA-256 file identity fingerprint made from metadata plus the first and last 1 MiB. The Worker resumes only an owner-scoped matching unfinished session, refreshes `last_activity_at` with progress heartbeats, and cleans multipart/staging remnants after 30 minutes without activity.
 - Preview remains behind Worker permission and Range checks. New direct-upload attachments download through a 60-second read-only R2 URL after Worker authorization; legacy objects safely fall back to Worker streaming.
 - Internal/private media uses a short-lived HttpOnly browser cookie issued after share authorization, so native video playback and download navigation can pass Worker access checks without exposing the auth-center JWT in the URL. QuickTime `.mov` files are offered to the browser's native video player; playback still depends on codec support.
@@ -46,6 +51,7 @@ Important environment variables:
 - `SSO_URL=https://accounts.aryuki.com`
 - `SSO_APP_ID=content-share`
 - `PUBLIC_BASE_URL=https://content.aryuki.com`
+- `CONTENT_PROXY_ORIGIN_SECRET` is a Worker Secret shared with the proxy Worker to select the `.cn` public base for signed requests.
 - `ADMIN_CONTACT_EMAIL=` optional administrator address used by protected-share contact actions; leave empty to hide that action
 - `R2_ACCOUNT_ID=...`
 - `R2_BUCKET_NAME=content-share-save`
@@ -53,6 +59,9 @@ Important environment variables:
 The following values must be Worker Secrets, never plaintext variables or committed files:
 
 - `MEDIA_TICKET_SECRET`
+- `CONTENT_PROXY_ORIGIN_SECRET`
+- `ADOBE_PDF_CLIENT_ID` (Adobe PDF Embed Client ID registered for `content.aryuki.com`)
+- `ADOBE_PDF_CLIENT_ID_CN` (Adobe PDF Embed Client ID registered for `content.aryuki.cn`)
 - `R2_UPLOAD_ACCESS_KEY_ID`
 - `R2_UPLOAD_SECRET_ACCESS_KEY`
 - `R2_DOWNLOAD_ACCESS_KEY_ID`
@@ -201,6 +210,10 @@ console.log(await res.json());
 ```
 
 ## Development Notes
+
+### HTTP entry on the ESA `.cn` hostname
+
+An HTTP visit to `content.aryuki.cn` was observed returning HTML without an HTTPS redirect. In Edge, the HTTP main bundle then failed with `ERR_CONTENT_DECODING_FAILED`, leaving an empty app root; HTTPS loaded normally. The HTML entry now redirects that hostname to the same HTTPS path, query, and fragment before the module bundle loads. This also covers a browser profile that remembers the HTTP URL. Keep an ESA edge HTTP-to-HTTPS redirect enabled when the edge configuration is available; it protects direct API and asset requests as well as page navigation. The HTML redirect is a page-level recovery path, not a replacement for the edge rule.
 
 - Do not add S3, WebDAV, mount management, mount explorer, or multi-storage configuration. This app stores files only in R2.
 - Do not add frontend-only permission checks. All sensitive decisions must happen in `src/worker.ts`.

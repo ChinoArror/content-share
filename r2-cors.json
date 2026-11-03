@@ -3,7 +3,8 @@
     {
       "allowed": {
         "origins": [
-          "https://content.aryuki.com"
+          "https://content.aryuki.com",
+          "https://content.aryuki.cn"
         ],
         "methods": [
           "GET",

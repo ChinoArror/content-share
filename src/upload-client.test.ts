@@ -18,6 +18,34 @@ function makeFile(name: string, bytes: number, type = 'application/octet-stream'
   return blob;
 }
 
+it('keeps a metadata checkpoint when Safari cannot persist a selected File', async () => {
+  const records: Record<string, unknown>[] = [];
+  const persistence: UploadPersistence = {
+    loadAll: async () => records,
+    save: async (record) => {
+      if (record.file_blob) throw new DOMException('Error preparing Blob/File data to be stored in object store', 'UnknownError');
+      records.splice(0, records.length, record);
+    },
+    remove: async () => {},
+  };
+  const queue = new BrowserUploadQueue({ persistence });
+  await expect(queue.enqueue([{ file: makeFile('safari.txt', 4) }])).resolves.toHaveLength(1);
+  expect(records[0]).not.toHaveProperty('file_blob');
+  const restored = await new BrowserUploadQueue({ persistence }).restore();
+  expect(restored.tasks[0].needsFileReselection).toBe(true);
+});
+
+it('cancels a queued task without creating a server session', async () => {
+  const persistence = new MemoryPersistence();
+  const api = vi.fn(async () => { throw new Error('Unexpected API request'); });
+  const queue = new BrowserUploadQueue({ persistence, api });
+  const [task] = await queue.enqueue([{ file: makeFile('cancel.txt', 4) }]);
+  expect(await queue.cancel(task.id)).toBe(true);
+  expect(queue.getTasks()).toHaveLength(0);
+  expect(persistence.recordsForTest()).toHaveLength(0);
+  expect(api).not.toHaveBeenCalled();
+});
+
 class MemoryPersistence implements UploadPersistence {
   private readonly records = new Map<string, Record<string, unknown>>();
   private readonly removed: string[] = [];
@@ -97,7 +125,7 @@ class FakeXhr implements XhrLike {
   body: XMLHttpRequestBodyInit | null = null;
   headers: Record<string, string> = {};
 
-  constructor(private readonly result: { status?: number; etag?: string; networkError?: boolean }) {}
+  constructor(private readonly result: { status?: number; etag?: string; networkError?: boolean; networkErrorUrl?: string }) {}
 
   open(method: string, url: string) {
     this.method = method;
@@ -117,7 +145,7 @@ class FakeXhr implements XhrLike {
     const total = body instanceof Blob ? body.size : 1;
     this.upload.onprogress?.({ lengthComputable: true, loaded: total, total } as ProgressEvent<EventTarget>);
     queueMicrotask(() => {
-      if (this.result.networkError) {
+      if (this.result.networkError || (this.result.networkErrorUrl && this.url.includes(this.result.networkErrorUrl))) {
         this.onerror?.();
         return;
       }
@@ -135,6 +163,28 @@ function apiFrom(handler: (request: ApiRequestOptions) => unknown | Promise<unkn
 
 describe('BrowserUploadQueue', () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it('waits for initiation and deletes the server session when cancelled', async () => {
+    const persistence = new MemoryPersistence();
+    const requests: string[] = [];
+    let release!: (value: unknown) => void;
+    const initiating = new Promise<unknown>((resolve) => { release = resolve; });
+    const queue = new BrowserUploadQueue({ persistence, api: apiFrom((request) => {
+      requests.push(`${request.method} ${request.path}`);
+      if (request.path === '/api/uploads/initiate') return initiating;
+      return { ok: true };
+    }) });
+    const [task] = await queue.enqueue([{ file: makeFile('cancel-race.txt', 4), clientId: 'cancel-race' }]);
+    const running = queue.run();
+    await vi.waitFor(() => expect(requests).toContain('POST /api/uploads/initiate'));
+    const cancelling = queue.cancel(task.id);
+    release({ files: [{ client_id: 'cancel-race', session_id: 'cancel-session', attachment_id: 'cancel-attachment', mode: 'single', size: 4, upload_url: 'https://signed.example/cancel', headers: {} }] });
+    await running;
+    expect(await cancelling).toBe(true);
+    expect(requests).toContain('DELETE /api/uploads/cancel-session');
+    expect(queue.getTasks()).toHaveLength(0);
+    expect(persistence.recordsForTest()).toHaveLength(0);
+  });
 
   it('uploads a single-file plan with byte progress and finalizes it', async () => {
     const requests: ApiRequestOptions[] = [];
@@ -715,6 +765,99 @@ describe('BrowserUploadQueue', () => {
     expect(persistence.recordsForTest()[0]).not.toHaveProperty('file_blob');
   });
 
+  it('starts every file transfer before waiting for shared content activation', async () => {
+    let completedTransfers = 0;
+    let earlyStatusChecks = 0;
+    const queue = new BrowserUploadQueue({
+      maxConcurrentFiles: 2,
+      sleep: async () => undefined,
+      api: apiFrom((request) => {
+        if (request.path === '/api/uploads/initiate') return {
+          files: ['one', 'two', 'three'].map((name) => ({
+            client_id: name, session_id: `session-${name}`, attachment_id: `attachment-${name}`,
+            mode: 'single', size: 1, upload_url: `https://signed.example/${name}`, headers: {}
+          }))
+        };
+        if (request.path.endsWith('/complete')) completedTransfers += 1;
+        if (request.path.endsWith('/status')) {
+          if (completedTransfers < 3) earlyStatusChecks += 1;
+          return { item: { session_status: 'completed', content_status: completedTransfers === 3 ? 'active' : 'processing' } };
+        }
+        return { ok: true };
+      }),
+      xhrFactory: () => new FakeXhr({ etag: 'etag' })
+    });
+
+    await queue.enqueue(['one', 'two', 'three'].map((name) => ({ file: makeFile(`${name}.pdf`, 1), clientId: name })));
+    await queue.run();
+
+    expect(completedTransfers).toBe(3);
+    expect(earlyStatusChecks).toBe(0);
+    expect(queue.getTasks().map((task) => task.status)).toEqual(['complete', 'complete', 'complete']);
+  });
+
+  it('recovers when R2 stored a file but the upload response was lost', async () => {
+    let statusChecks = 0;
+    const queue = new BrowserUploadQueue({
+      maxRetries: 0,
+      api: apiFrom((request) => {
+        if (request.path === '/api/uploads/initiate') return {
+          files: [{ client_id: 'lost-response', session_id: 'session-lost', attachment_id: 'attachment-lost', mode: 'single', size: 2, upload_url: 'https://signed.example/lost', headers: {} }]
+        };
+        if (request.path.endsWith('/status')) {
+          statusChecks += 1;
+          return { item: { session_status: 'completed', content_status: statusChecks > 1 ? 'active' : 'processing' } };
+        }
+        return { ok: true };
+      }),
+      xhrFactory: () => new FakeXhr({ networkError: true })
+    });
+
+    await queue.enqueue([{ file: makeFile('lost-response.pdf', 2), clientId: 'lost-response' }]);
+    await queue.run();
+
+    expect(statusChecks).toBeGreaterThanOrEqual(2);
+    expect(queue.getTasks()[0]).toMatchObject({ status: 'complete', needsFileReselection: false });
+  });
+
+  it('confirms a new batch even when an older unrelated task fails', async () => {
+    const persistence = new MemoryPersistence();
+    const oldFile = makeFile('old.pdf', 1);
+    await persistence.save({
+      id: 'old-task', client_id: 'old', content_id: 'content-old', name: oldFile.name, type: oldFile.type,
+      size: oldFile.size, last_modified: oldFile.lastModified, session_id: 'session-old',
+      attachment_id: 'attachment-old', mode: 'single', status: 'failed',
+      completed_parts: [], progress: { loaded: 0, total: 1 }, file_blob: oldFile
+    });
+    const queue = new BrowserUploadQueue({
+      persistence,
+      maxRetries: 0,
+      xhrFactory: () => new FakeXhr({ networkErrorUrl: '/old', etag: 'etag-new' }),
+      api: apiFrom((request) => {
+        if (request.path === '/api/uploads/initiate') return {
+          content_id: 'content-new',
+          files: [{ client_id: 'new', session_id: 'session-new', attachment_id: 'attachment-new', mode: 'single', size: 1, upload_url: 'https://signed.example/new', headers: {} }]
+        };
+        if (request.path.endsWith('/renew')) return {
+          item: { content_id: 'content-old', session_id: 'session-old', attachment_id: 'attachment-old', mode: 'single', size: 1, upload_url: 'https://signed.example/old', headers: {} }
+        };
+        if (request.path.endsWith('/status')) return {
+          item: request.path.includes('session-new')
+            ? { session_status: 'completed', content_status: 'active' }
+            : { session_status: 'pending', content_status: 'processing' }
+        };
+        return { ok: true };
+      })
+    });
+
+    await queue.restore();
+    await queue.enqueue([{ file: makeFile('new.pdf', 1), clientId: 'new' }]);
+    await queue.run();
+
+    expect(queue.getTasks().find((task) => task.clientId === 'new')?.status).toBe('complete');
+    expect(queue.getTasks().find((task) => task.clientId === 'old')?.status).toBe('failed');
+  });
+
   it('restores finalized processing content without clearing its durable file', async () => {
     const persistence = new MemoryPersistence();
     const file = makeFile('activation-pending.bin', 1);
@@ -763,6 +906,25 @@ describe('BrowserUploadQueue', () => {
     expect(statusChecks).toBe(2);
     expect(queue.getTasks()[0].status).toBe('complete');
     expect(persistence.recordsForTest()[0]).not.toHaveProperty('file_blob');
+  });
+
+  it('does not request the original file after the server completed an earlier timed-out task', async () => {
+    const persistence = new MemoryPersistence();
+    await persistence.save({
+      id: 'task-server-complete', client_id: 'server-complete', name: 'document.pdf', type: 'application/pdf',
+      size: 2, last_modified: 1_700_000_000_000, session_id: 'session-server-complete',
+      attachment_id: 'attachment-server-complete', mode: 'single', status: 'failed',
+      awaiting_activation: true, completed_parts: [], progress: { loaded: 2, total: 2 }
+    });
+    const queue = new BrowserUploadQueue({
+      persistence,
+      api: apiFrom(() => ({ item: { session_status: 'completed', content_status: 'active' } }))
+    });
+
+    const restored = await queue.restore();
+
+    expect(restored.needsFileReselection).toEqual([]);
+    expect(restored.tasks[0]).toMatchObject({ status: 'complete', needsFileReselection: false });
   });
 
   it('restores a locally persisted File when IndexedDB supports structured cloning it', async () => {

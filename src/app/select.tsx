@@ -17,11 +17,13 @@ export interface SelectProps<T extends string> {
   onChange: (value: T) => void;
   ariaLabel?: string;
   className?: string;
+  menuWidth?: 'trigger' | 'content';
   placeholder?: string;
   disabled?: boolean;
 }
 
 const MENU_MAX_HEIGHT = 280;
+const CONTENT_MENU_MAX_WIDTH = 720;
 const ROW_HEIGHT = 32;
 const VIEWPORT_MARGIN = 8;
 const MENU_GAP = 6;
@@ -34,12 +36,16 @@ export function rangeFill(value: number, min: number, max: number): string {
 
 type MenuPosition = { left: number; width: number; maxHeight: number; top?: number; bottom?: number };
 
-function measure(trigger: HTMLElement, optionCount: number): MenuPosition {
+function measure(trigger: HTMLElement, optionCount: number, labels: string[], menuWidth: 'trigger' | 'content'): MenuPosition {
   const rect = trigger.getBoundingClientRect();
   const viewportWidth = window.innerWidth;
   const viewportHeight = window.innerHeight;
-  const width = Math.min(rect.width, viewportWidth - VIEWPORT_MARGIN * 2);
-  const left = Math.min(Math.max(rect.left, VIEWPORT_MARGIN), Math.max(VIEWPORT_MARGIN, viewportWidth - VIEWPORT_MARGIN - width));
+  const context = menuWidth === 'content' ? document.createElement('canvas').getContext('2d') : null;
+  if (context) context.font = `14px ${window.getComputedStyle(trigger).fontFamily}`;
+  const labelWidth = context ? Math.max(0, ...labels.map((label) => context.measureText(label).width)) + 52 : rect.width;
+  const width = Math.min(Math.max(rect.width, labelWidth), menuWidth === 'content' ? CONTENT_MENU_MAX_WIDTH : viewportWidth, viewportWidth - VIEWPORT_MARGIN * 2);
+  const preferredLeft = menuWidth === 'content' ? rect.right - width : rect.left;
+  const left = Math.min(Math.max(preferredLeft, VIEWPORT_MARGIN), Math.max(VIEWPORT_MARGIN, viewportWidth - VIEWPORT_MARGIN - width));
   const wanted = Math.min(MENU_MAX_HEIGHT, optionCount * ROW_HEIGHT + 10);
   const spaceBelow = viewportHeight - rect.bottom - VIEWPORT_MARGIN - MENU_GAP;
   const spaceAbove = rect.top - VIEWPORT_MARGIN - MENU_GAP;
@@ -51,7 +57,7 @@ function measure(trigger: HTMLElement, optionCount: number): MenuPosition {
     : { left, width, maxHeight, top: rect.bottom + MENU_GAP };
 }
 
-export function Select<T extends string>({ value, options, onChange, ariaLabel, className = '', placeholder = '', disabled = false }: SelectProps<T>) {
+export function Select<T extends string>({ value, options, onChange, ariaLabel, className = '', menuWidth = 'trigger', placeholder = '', disabled = false }: SelectProps<T>) {
   const id = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -66,14 +72,14 @@ export function Select<T extends string>({ value, options, onChange, ariaLabel, 
   const enabledIndexes = options.map((option, index) => (option.disabled ? -1 : index)).filter((index) => index >= 0);
 
   function reposition() {
-    if (triggerRef.current) setPosition(measure(triggerRef.current, options.length));
+    if (triggerRef.current) setPosition(measure(triggerRef.current, options.length, options.map((option) => option.label), menuWidth));
   }
 
   function openMenu() {
     if (disabled) return;
     const start = selectedIndex >= 0 && !options[selectedIndex].disabled ? selectedIndex : enabledIndexes[0] ?? -1;
     setActive(start);
-    if (triggerRef.current) setPosition(measure(triggerRef.current, options.length));
+    if (triggerRef.current) setPosition(measure(triggerRef.current, options.length, options.map((option) => option.label), menuWidth));
     setOpen(true);
   }
 
@@ -192,6 +198,7 @@ export function Select<T extends string>({ value, options, onChange, ariaLabel, 
         role="combobox"
         className={`cs-select-trigger${open ? ' open' : ''}${className ? ` ${className}` : ''}`}
         aria-label={ariaLabel}
+        title={selected?.label}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
@@ -204,7 +211,7 @@ export function Select<T extends string>({ value, options, onChange, ariaLabel, 
         <ChevronDown size={16} className="cs-select-chevron" aria-hidden="true" />
       </button>
       {open && position && createPortal(
-        <div ref={menuRef} id={listId} role="listbox" className="cs-select-menu" aria-label={ariaLabel} style={menuStyle}>
+        <div ref={menuRef} id={listId} role="listbox" className={`cs-select-menu${menuWidth === 'content' ? ' content-width' : ''}`} aria-label={ariaLabel} style={menuStyle}>
           {options.map((option, index) => {
             const isSelected = index === selectedIndex;
             const classes = ['cs-select-option', isSelected ? 'selected' : '', index === active ? 'active' : ''].filter(Boolean).join(' ');

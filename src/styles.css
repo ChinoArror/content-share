@@ -1093,6 +1093,26 @@ input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 3px colo
   -webkit-backdrop-filter: blur(20px);
   box-shadow: var(--shadow-float);
 }
+.upload-float-panel { display: grid; gap: 8px; }
+.upload-float-orb, .upload-float-collapse { display: none; }
+.upload-float-tasks { display: grid; gap: 6px; max-height: 180px; overflow-y: auto; }
+.upload-float-task { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.upload-float-task .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-float-task .soft { padding: 5px 8px; min-height: 32px; }
+@media (max-width: 700px) {
+  .upload-float { width: 58px; height: 58px; padding: 0; border-radius: 50%; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); overflow: hidden; }
+  .upload-float.expanded { width: min(360px, calc(100vw - 32px)); height: auto; max-height: min(60vh, 420px); padding: 16px; border-radius: 16px; }
+  .upload-float-orb { display: flex; align-items: center; justify-content: center; gap: 3px; width: 58px; height: 58px; border: 0; color: var(--foreground); background: transparent; }
+  .upload-float.expanded .upload-float-orb { display: none; }
+  .upload-float-panel { display: none; opacity: 0; transform: translateY(8px); }
+  .upload-float.expanded .upload-float-panel { display: grid; opacity: 1; transform: translateY(0); animation: upload-panel-enter .25s ease both; }
+  .upload-float-collapse { display: inline-flex; }
+  .upload-float-dismiss { display: none; }
+  .upload-float-task .soft { min-height: 36px; padding: 0 4px; border: 0; background: transparent; color: var(--destructive); font-size: 12px; }
+  .upload-float-task .soft:hover { background: color-mix(in oklab, var(--destructive) 9%, transparent); }
+}
+@keyframes upload-panel-enter { from { opacity: 0; transform: translateY(8px) scale(.97); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (prefers-reduced-motion: reduce) { .upload-float, .upload-float-panel { transition: none !important; animation: none !important; } }
 .upload-float .panel-head { margin: 0; flex-direction: row; align-items: center; }
 .upload-float strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .upload-float span { color: var(--muted-foreground); font-size: 13px; }
@@ -1464,6 +1484,11 @@ table.compact td, table.compact th { padding-left: 10px; padding-right: 10px; }
 .attachment-download:hover { border-color: color-mix(in oklab, var(--primary) 45%, var(--border)); color: var(--primary); }
 .file-preview { width: 100%; max-width: 100%; border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); background: var(--card); }
 .image-preview { max-height: 70dvh; object-fit: contain; }
+.image-viewer { width: 100%; height: 100%; min-height: 220px; display: grid; place-items: center; color: var(--muted-foreground); }
+.image-viewer img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.image-viewer img[hidden] { display: none; }
+.image-viewer-embedded { height: auto; min-height: 180px; }
+.image-viewer-embedded img { max-height: 70dvh; }
 .frame-preview { min-height: 520px; }
 .audio-preview { width: 100%; }
 .preview-actions { display: grid; gap: 10px; }
@@ -1555,12 +1580,14 @@ table.compact td, table.compact th { padding-left: 10px; padding-right: 10px; }
 .pdf-page { width: fit-content; max-width: 100%; display: grid; gap: 8px; justify-items: end; }
 .pdf-page span { color: var(--muted-foreground); font-size: 12px; }
 .pdf-page canvas { max-width: 100%; height: auto !important; background: var(--paper); border: 1px solid var(--border); box-shadow: var(--shadow-card); }
-.share-preview-topbar { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+.share-preview-page { grid-template-rows: auto minmax(0, 1fr); }
+.share-preview-topbar { grid-template-columns: auto minmax(0, 1fr) auto auto; min-height: 62px; padding-top: 8px; padding-bottom: 8px; }
+.share-preview-topbar.has-picker { grid-template-columns: auto minmax(0, 1fr) auto minmax(180px, min(720px, 46vw)) auto; }
 .share-preview-topbar .back-link { min-height: 36px; color: var(--foreground); }
 .preview-title { min-width: 0; display: grid; gap: 2px; }
 .preview-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .preview-title span { color: var(--muted-foreground); white-space: nowrap; font-size: 13px; }
-.share-preview-topbar select { width: min(260px, 22vw); min-height: 36px; padding: 0 10px; }
+.share-preview-topbar .preview-file-picker { width: 100%; min-height: 36px; }
 .share-preview-main { background: var(--background); }
 .text-preview-main { padding: 20px; place-items: start center; }
 .text-preview-main .text-preview-box { width: min(980px, 100%); }
@@ -1891,12 +1918,12 @@ iframe.received-preview { object-fit: initial; }
   .share-access-language { top: 12px; right: 12px; }
   .password-row { grid-template-columns: 1fr; }
   .share-preview-page { grid-template-rows: auto minmax(0, 1fr); }
-  .share-preview-topbar { grid-template-columns: 40px minmax(0, 1fr) 40px; grid-template-rows: 40px auto auto auto; gap: 8px; padding: 10px; }
+  .share-preview-topbar, .share-preview-topbar.has-picker { grid-template-columns: 40px minmax(0, 1fr) 40px; grid-template-rows: 40px auto auto auto; gap: 8px; padding: 10px; }
   .share-preview-topbar .back-link { grid-column: 1; grid-row: 1; width: 40px; min-height: 40px; padding: 0; border-radius: var(--radius); justify-content: center; }
   .share-preview-topbar .back-link span { display: none; }
   .share-preview-topbar .preview-title { grid-column: 1 / -1; grid-row: 2; }
   .share-preview-topbar .language-toggle { grid-column: 3; grid-row: 1; width: 40px; min-width: 40px; height: 40px; min-height: 40px; padding: 0; border-radius: var(--radius); }
-  .share-preview-topbar select { grid-column: 1 / -1; grid-row: 3; width: 100%; }
+  .share-preview-topbar .preview-file-picker { grid-column: 1 / -1; grid-row: 3; width: 100%; }
   .share-preview-topbar .preview-download, .share-preview-topbar .preview-copy-action { grid-column: 1 / -1; grid-row: 4; width: 100%; min-height: 44px; }
   .face-transfer-title { align-items: stretch; flex-direction: column; }
   .face-mode { width: 100%; }
@@ -2060,6 +2087,9 @@ button.cs-select-trigger:disabled { opacity: .55; }
   box-shadow: 0 1px 2px rgb(0 0 0 / .06), 0 16px 36px -18px rgb(0 0 0 / .5);
   animation: cs-select-in .12s ease-out;
 }
+.cs-select-menu.content-width { overflow-x: auto; }
+.cs-select-menu.content-width .cs-select-option { width: max-content; min-width: 100%; box-sizing: border-box; }
+.cs-select-menu.content-width .cs-select-label { overflow: visible; text-overflow: clip; }
 @keyframes cs-select-in { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
 .cs-select-option {
   min-height: 32px;
@@ -2228,4 +2258,20 @@ html, body { overflow-x: hidden; }
   .preview-page:not(.share-preview-page) { grid-template-rows: auto minmax(0, 1fr); }
   .preview-page > .preview-topbar:not(.share-preview-topbar) { grid-template-columns: minmax(0, 1fr) auto auto; gap: 4px 10px; min-height: 62px; height: auto; padding-top: 8px; padding-bottom: 8px; }
   .preview-page > .preview-topbar:not(.share-preview-topbar) > span { grid-column: 1 / -1; grid-row: 2; font-size: 12px; }
+}
+
+/* ---- round 5: office preview (client-side DOCX / PPTX / XLSX) ---- */
+/* Full-page /preview/:id and share preview: the viewer fills the grid row, like the PDF viewer. */
+.office-preview-main { display: flex; flex-direction: column; overflow: hidden; place-items: unset; }
+.office-preview-main > .office-preview { flex: 1 1 0; min-height: 0; height: auto; border: 0; border-radius: 0; }
+
+/* Share details card: a bounded panel, 78dvh up to 960px, shorter on phones. */
+.office-preview { position: relative; width: 100%; min-width: 0; height: min(78dvh, 960px); min-height: 420px; display: flex; flex-direction: column; overflow: hidden; background: var(--muted-surface); }
+.office-preview-host { flex: 1 1 0; width: 100%; min-width: 0; min-height: 0; overflow: auto; }
+.office-preview-status { position: absolute; z-index: 2; inset: 0; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 12px; padding: 20px; color: var(--muted-foreground); background: color-mix(in oklab, var(--card) 94%, transparent); text-align: center; }
+.office-preview-status p { margin: 0; }
+.office-preview-status button { min-height: 36px; display: inline-flex; align-items: center; gap: 8px; }
+.attachment-card .office-preview { border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); }
+@media (max-width: 560px) {
+  .attachment-card .office-preview { height: 65dvh; }
 }

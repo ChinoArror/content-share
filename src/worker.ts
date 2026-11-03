@@ -7,6 +7,7 @@ import { previewKind } from './preview-policy';
 import { ensureUserGroup, loadUserAccessProfile, reserveStorage } from './worker-permissions';
 import { PERMISSION_KEYS, PolicyError, type PermissionKey, type UserAccessProfile } from './permission-policy';
 import { mergeUiSettings, sanitizeUiSettings } from './ui-settings';
+import { signedContentOrigin } from './proxy-origin';
 import {
   backgroundKeys,
   backgroundKeysOf,
@@ -32,8 +33,10 @@ type Env = {
   SSO_APP_ID: string;
   MEDIA_TICKET_SECRET: string;
   PUBLIC_BASE_URL: string;
+  CONTENT_PROXY_ORIGIN_SECRET?: string;
   ADMIN_CONTACT_EMAIL?: string;
   ADOBE_PDF_CLIENT_ID?: string;
+  ADOBE_PDF_CLIENT_ID_CN?: string;
   R2_ACCOUNT_ID?: string;
   R2_BUCKET_NAME?: string;
   R2_UPLOAD_ACCESS_KEY_ID?: string;
@@ -112,7 +115,7 @@ type UploadPartRecord = {
   completed_at: string;
 };
 
-const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' };
+const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'private, no-store' };
 const ALLOWED_VISIBILITY = new Set(['public', 'internal', 'private']);
 const ALLOWED_FORMAT = new Set(['plain', 'markdown']);
 const ALLOWED_STATUS = new Set(['active', 'expired', 'deleted', 'processing']);
@@ -134,7 +137,7 @@ function json(data: unknown, status = 200, extraHeaders?: HeadersInit): Response
 }
 
 function noContent(): Response {
-  return new Response(null, { status: 204 });
+  return new Response(null, { status: 204, headers: { 'cache-control': 'private, no-store' } });
 }
 
 function now(): string {
@@ -209,8 +212,8 @@ function decodeJwtPayload(token: string): Record<string, unknown> {
   }
 }
 
-function publicBase(env: Env, req: Request): string {
-  return env.PUBLIC_BASE_URL || new URL(req.url).origin;
+async function publicBase(env: Env, req: Request): Promise<string> {
+  return await signedContentOrigin(req, env.CONTENT_PROXY_ORIGIN_SECRET) || env.PUBLIC_BASE_URL || new URL(req.url).origin;
 }
 
 // Cleans a user-supplied slug. Returns '' when nothing usable is left (no random fallback).
@@ -1114,7 +1117,7 @@ async function createTextContent(env: Env, req: Request, owner: string, input: a
       .run();
     await reserveContentStorage(env, owner, contentId, finalTextSize);
     await activateReservedContent(env, contentId, finalTextSize, 0);
-    return json({ ok: true, url: `${publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
+    return json({ ok: true, url: `${await publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
   } catch (error) {
     await rollbackUploadSetup(env, contentId);
     throw error;
@@ -1194,7 +1197,7 @@ async function createUploadContent(env: Env, req: Request, owner: string, form: 
     await reserveContentStorage(env, owner, contentId, requestedBytes);
     await putAttachments(env, contentId, owner, files, objectKeys);
     await env.UPLOAD_QUEUE.send({ type: 'finalize-upload', contentId, owner });
-    return json({ ok: true, queued: true, url: `${publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
+    return json({ ok: true, queued: true, url: `${await publicBase(env, req)}/s/${slug}`, slug, content_id: contentId, source });
   } catch (error) {
     await rollbackUploadSetup(env, contentId, [], objectKeys);
     throw error;
@@ -1304,7 +1307,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       resumed: true,
       content_id: reusable.content.id,
       slug: reusable.content.slug,
-      url: `${publicBase(env, req)}/s/${reusable.content.slug}`,
+      url: `${await publicBase(env, req)}/s/${reusable.content.slug}`,
       files: plans
     }, 200);
   }
@@ -1411,7 +1414,7 @@ async function createDirectUploadContent(env: Env, req: Request, owner: string, 
       direct: true,
       content_id: contentId,
       slug,
-      url: `${publicBase(env, req)}/s/${slug}`,
+      url: `${await publicBase(env, req)}/s/${slug}`,
       files: plans
     }, 201);
   } catch (error) {
@@ -1862,8 +1865,9 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   if (path === '/api/public/pdf-embed-config' && method === 'GET') {
-    const clientId = env.ADOBE_PDF_CLIENT_ID?.trim().replace(/^\{|\}$/g, '') || null;
-    return json({ ok: true, client_id: clientId }, 200, { 'cache-control': 'public, max-age=300' });
+    const isCn = await signedContentOrigin(req, env.CONTENT_PROXY_ORIGIN_SECRET) === 'https://content.aryuki.cn';
+    const clientId = (isCn ? env.ADOBE_PDF_CLIENT_ID_CN : env.ADOBE_PDF_CLIENT_ID)?.trim().replace(/^\{|\}$/g, '') || null;
+    return json({ ok: true, client_id: clientId });
   }
 
   if (path === '/api/public/admin-contact' && method === 'GET') {
@@ -2090,6 +2094,9 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     }
 
     if (!action && method === 'DELETE') {
+      if (session.status === 'completed') {
+        throw new HttpError(409, 'Completed uploads cannot be cancelled');
+      }
       await cleanupUploadObjects(env, { sessions: [session], objectKeys: [session.object_key] });
       const t = now();
       await env.DB.batch([
@@ -2297,7 +2304,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     const suffix = qs.toString() ? `?${qs}` : '';
     const previewPath = `/api/attachments/${att.id}/preview${suffix}`;
     const downloadPath = `/api/attachments/${att.id}/download${suffix}`;
-    const absolutePreviewUrl = `${publicBase(env, req)}${previewPath}`;
+    const absolutePreviewUrl = `${await publicBase(env, req)}${previewPath}`;
     const kind = previewKind(att.filename, att.content_type);
     const response = json({
       ok: true,
@@ -2399,7 +2406,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     const currentEtag = normalizeEtag(att.etag);
     const requestedEtag = normalizeEtag(req.headers.get('if-none-match'));
     if (currentEtag && requestedEtag === currentEtag) {
-      return new Response(null, { status: 304, headers: { etag: `"${currentEtag}"`, 'cache-control': 'private, no-cache' } });
+      return new Response(null, { status: 304, headers: { etag: `"${currentEtag}"`, 'cache-control': 'private, no-store' } });
     }
     const obj = method === 'HEAD'
       ? await env.BUCKET.head(att.object_key)
@@ -2421,7 +2428,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
     headers.set('content-length', String(range?.length || obj.size));
     headers.set('content-disposition', attachmentDisposition(att.filename, disposition));
     headers.set('etag', obj.httpEtag);
-    headers.set('cache-control', 'private, no-cache');
+    headers.set('cache-control', 'private, no-store');
     headers.set('accept-ranges', 'bytes');
     headers.set('x-content-type-options', 'nosniff');
     if (mode === 'preview') {
@@ -2491,7 +2498,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
         numberField(body.default_expire_days),
         numberField(body.default_max_views),
         ALLOWED_FORMAT.has(body.default_format) ? body.default_format : 'markdown',
-        publicBase(env, req),
+        await publicBase(env, req),
         'random',
         now()
       )
@@ -2835,7 +2842,7 @@ async function handleApi(req: Request, env: Env, ctx: ExecutionContext): Promise
       ok: true,
       item: {
         worker: 'content-share',
-        domain: publicBase(env, req),
+        domain: await publicBase(env, req),
         storage: 'Cloudflare R2 only',
         database: 'Cloudflare D1',
         queue: 'content-share-upload-queue',
@@ -2991,7 +2998,7 @@ export default {
         return new Response(object.body, {
           headers: {
             'content-type': object.httpMetadata?.contentType || 'application/octet-stream',
-            'cache-control': 'public, max-age=300'
+            'cache-control': 'private, no-store'
           }
         });
       }
